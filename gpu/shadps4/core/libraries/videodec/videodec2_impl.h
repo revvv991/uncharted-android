@@ -21,6 +21,10 @@ struct VdecStageTimes {
 };
 VdecStageTimes TakeVdecStageTimes();
 
+/// BB_GAME_RES (WxH): the games read decoded movie frames at their display size, so frames are
+/// fitted (aspect kept, black bars) into a canvas of that size. 0 when the game runs at 1920x1080.
+void GameResolution(s32& width, s32& height);
+
 class VdecDecoder {
 public:
     VdecDecoder(const OrbisVideodec2DecoderConfigInfo& configInfo,
@@ -38,10 +42,13 @@ private:
     /// bbport: the size frames are handed to the game in (see OutputSize).
     void OutputSize(const AVFrame& frame, s32& width, s32& height, s32& content_width,
                     s32& content_height);
+    /// The frame fitted into the game's display size (frame is consumed), or the frame itself.
+    AVFrame* FitToDisplay(AVFrame* frame);
 
 private:
     AVCodecContext* m_codec_context = nullptr;
     SwsContext* m_sws_context = nullptr;
+    SwsContext* m_fit_context = nullptr;
     /// g2-arm64: the converted frame, kept (ConvertNV12Frame hands out references to it), and
     /// the picture size its black border was filled for.
     AVFrame* m_nv12_frame = nullptr;

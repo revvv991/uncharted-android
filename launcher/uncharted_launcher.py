@@ -31,13 +31,16 @@ FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trophies  # noqa: E402  (scripts/trophies.py: the games' trophy lists)
+import uncharted_i18n
+
 DATA_DIR = Path(os.environ.get('BB_DATA_DIR', PORT_DIR))
 CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'uncharted-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.6'
+VERSION = '0.3.9'
 RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
 RELEASES_PAGE = 'https://github.com/Supermedo/uncharted_pc/releases/latest'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'
@@ -62,14 +65,27 @@ PRESENT_MODES = [('Mailbox', 'Mailbox (low latency, no tearing)'), ('Fifo', 'FIF
                  ('FifoRelaxed', 'FIFO Relaxed'), ('Immediate', 'Immediate (tearing)')]
 # The display rate the games run at (BB_VBLANK_HZ): they time gameplay with the real clock, and
 # the prerecorded cutscenes keep 60 frames per second at every setting.
-FRAME_RATES = [('60', '60 FPS (as on PS4)'), ('120', '120 FPS'), ('144', '144 FPS (experimental)'),
+FRAME_RATES = [('30', '30 FPS'), ('60', '60 FPS (as on PS4)'), ('120', '120 FPS'), ('144', '144 FPS (experimental)'),
                ('165', '165 FPS (experimental)'), ('240', '240 FPS (experimental)')]
-# The games render 1920x1080; the window (or the screen in fullscreen) gets that image scaled
-# to its size: FSR 1 (EASU) or bilinear, then RCAS sharpening (BB_RCAS_ATTENUATION, lower
-# is sharper).
+# The window (or the screen in fullscreen) shows the game's picture at its size: FSR 1 (EASU) or
+# bilinear when the picture is smaller, then RCAS sharpening (BB_RCAS_ATTENUATION, lower is sharper).
 WINDOW_SIZES = [('1280x720', '1280 × 720'), ('1600x900', '1600 × 900'),
-                ('1920x1080', "1920 × 1080 (the games' own)"), ('2560x1440', '2560 × 1440'),
-                ('3840x2160', '3840 × 2160 (4K)')]
+                ('1920x1080', '1920 × 1080'), ('2560x1440', '2560 × 1440'),
+                ('3840x2160', '3840 × 2160 (4K)'), ('2560x1080', '2560 × 1080 (21:9)'),
+                ('3440x1440', '3440 × 1440 (21:9)'), ('3840x1600', '3840 × 1600 (21:9)'),
+                ('5120x1440', '5120 × 1440 (32:9)')]
+# The size the games themselves render and show (BB_GAME_RES: run.py, src/runtime_display.c): a real
+# higher resolution, not an enlarged 1080p picture. The height here and the shape below make the
+# width; the games keep their memory for it, so the sizes stop where it runs out.
+RENDER_HEIGHTS = [('1080', "1080p (the games' own)"), ('1440', '1440p'), ('1620', '1620p'), ('2160', '2160p (4K)')]
+ASPECTS = [('16:9', "16:9 (the games' own)"), ('21:9', '21:9 ultrawide'), ('32:9', '32:9 super ultrawide'),
+           ('window', "The shape of the window or screen")]
+ASPECT_RATIOS = {'16:9': 16 / 9, '21:9': 64 / 27, '32:9': 32 / 9}
+# Widths the screens of these shapes really have at each height (21:9 is 64:27 at 1080p and 43:18 at 1440p).
+SCREEN_WIDTHS = {('21:9', 1080): 2560, ('21:9', 1440): 3440, ('21:9', 1600): 3840, ('21:9', 1620): 3840,
+                 ('21:9', 2160): 5120, ('32:9', 1080): 3840, ('32:9', 1440): 5120, ('32:9', 2160): 7680}
+MAX_RENDER_PIXELS = 5_800_000   # what the games' GPU memory holds: 3200x1800 starts, 4K does not (docs/resolution.md)
+SPEAKERS = [('auto', 'Automatic (the Windows speaker setup)'), ('2', 'Stereo'), ('6', '5.1 surround'), ('8', '7.1 surround')]
 SCALERS = [('fsr1', 'FSR 1 (AMD FidelityFX, sharp)'), ('bilinear', 'Smooth (bilinear)')]
 SHARPENING = [('off', 'Off'), ('1000', 'Low'), ('500', 'Medium'), ('250', 'High'), ('0', 'Maximum')]
 # Temporal anti-aliasing at the games' 1920x1080 (BB_UPSCALER): it takes the scene before the
@@ -77,10 +93,14 @@ SHARPENING = [('off', 'Off'), ('1000', 'Low'), ('500', 'Medium'), ('250', 'High'
 ANTI_ALIASING = [('off', "Off (the game's own)"), ('taa', 'TAA'), ('fsr3', 'AMD FSR 3.1 (Native AA)'),
                  ('fsr4', 'AMD FSR 4 (Native AA)'), ('dlss', 'NVIDIA DLSS (DLAA, GeForce RTX)')]
 FSR411 = ('fsr411', 'AMD FSR 4.1.1 (Native AA)')
+XESS = ('xess', 'Intel XeSS (Native AA, any GPU)')
 AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')]
 # Frames generated between two of the game's (BB_FRAME_GEN, BB_FRAME_GEN_MULTIPLIER).
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
                     ('dlss', 'NVIDIA DLSS Frame Generation (GeForce RTX 40/50)')]
+BUTTON_PROMPTS = [('auto', 'Automatic (follows the device you used last)'),
+                  ('keyboard', 'Keyboard and mouse keys'), ('xbox', 'Xbox buttons'),
+                  ('0', "PlayStation buttons (the game's own)")]
 FRAME_GEN_MULTIPLIERS = [('2', '2× (one generated frame)'), ('3', '3× (DLSS on GeForce RTX 50)'),
                          ('4', '4× (DLSS on GeForce RTX 50)')]
 # Controls (input.ini, read by the game: src/runtime_pad.c). Actions with their PS4 names, the
@@ -128,23 +148,88 @@ TK_KEYS = {'space': 'Space', 'Return': 'Return', 'Escape': 'Escape', 'Tab': 'Tab
            'KP_Insert': 'Keypad 0', 'KP_End': 'Keypad 1', 'KP_Down': 'Keypad 2', 'KP_Next': 'Keypad 3',
            'KP_Left': 'Keypad 4', 'KP_Begin': 'Keypad 5', 'KP_Right': 'Keypad 6', 'KP_Home': 'Keypad 7',
            'KP_Up': 'Keypad 8', 'KP_Prior': 'Keypad 9'}
+# Tk on Windows names numpad keys like the main ones ("8", "plus"), only the keycode tells them apart (#224).
+WIN_NUMPAD = {**{0x60 + n: f'Keypad {n}' for n in range(10)},
+              0x6A: 'Keypad *', 0x6B: 'Keypad +', 0x6D: 'Keypad -', 0x6E: 'Keypad .', 0x6F: 'Keypad /'}
 MOUSE_SENS_MIN, MOUSE_SENS_MAX = 0.1, 10.0  # the Controls page slider (the game's default pace is 1)
+# Fixes page: fixes that cost speed, so they run only where they help unless the player picks.
+# key -> (title, hint, {choice: {variable: value}}); 'auto' sets nothing (the game's own default).
+FIXES = {
+    'fix_u2_gpu_results': (
+        'Exact GPU results (Uncharted 2)',
+        'Explosions, vehicle damage and the convoy of chapter 21 read results of GPU work back. '
+        'Automatic: on in Uncharted 2 only. Costs speed in busy scenes.',
+        {'on': {'BB_GPU_MERGE': '0'}, 'off': {'BB_GPU_MERGE': '1'}}),
+    'fix_u2_mesh': (
+        'Mesh raycaster copies (Uncharted 2)',
+        'Fixes "iSubMesh < m_numSubMeshInstances" after checkpoints. Automatic: on in Uncharted 2 only. '
+        'In Uncharted 3\'s Cartagena square it cost 94 to 54 FPS.',
+        {'on': {'BB_SCALAR_COPY64_SYNC': '2', 'BB_SCALAR_COPY64_DEFER': '1'},
+         'off': {'BB_SCALAR_COPY64_SYNC': '0', 'BB_SCALAR_COPY64_DEFER': '0'}}),
+    'fix_tiny_readback': (
+        'Aim and turret focus (Uncharted 2)',
+        'Enemies stay in focus when aiming. Automatic: on in Uncharted 2 only; elsewhere it costs about 13%.',
+        {'on': {'BB_TINY_READBACK': '1'}, 'off': {'BB_TINY_READBACK': '0'}}),
+    'fix_small_buffers': (
+        'Brightness flicker fix',
+        'Copies small GPU results back every frame (auto exposure). Automatic: off; it halved the frame '
+        'rate in Uncharted 3\'s Cartagena square.',
+        {'on': {'BB_READBACK_SMALL_BUFFERS': '1'}, 'off': {'BB_READBACK_SMALL_BUFFERS': '0'}}),
+    'fix_vram': (
+        'Small video memory mode',
+        'Keeps 4-8 GB graphics cards inside their video memory. Automatic: on for cards up to 8 GB.',
+        {'on': {'BB_VRAM_LEGACY': '0'}, 'off': {'BB_VRAM_LEGACY': '1'}}),
+    'fix_job_sleep': (
+        'Idle game workers sleep',
+        'Frees CPU cores while the game\'s workers wait. Automatic: on for CPUs with up to 8 threads; '
+        'on bigger CPUs it cost about 8%.',
+        {'on': {'BB_JOB_SLEEP': '1'}, 'off': {'BB_JOB_SLEEP': '0'}}),
+    'fix_thread_prio': (
+        'PS4 thread priorities',
+        'Game threads get the priorities they have on PS4. Automatic: on.',
+        {'on': {'BB_THREAD_PRIO': '1'}, 'off': {'BB_THREAD_PRIO': '0'}}),
+}
+FIX_CHOICES = [('auto', 'Automatic'), ('on', 'On'), ('off', 'Off')]
+
 # Insert opens the in-game settings menu; Left Alt frees the mouse cursor.
 RESERVED_KEYS = {'Insert': 'Insert opens the in-game settings menu.',
                  'Alt_L': 'Left Alt frees the mouse cursor while held.'}
 
-APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_u3': '', 'user_dir': '', 'start': 'u1', 'language': '1', 'player_name': '',
+APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_u3': '', 'user_dir': '', 'start': 'u1', 'language': '1', 'ui_language': '', 'player_name': '',
                 'fullscreen': False, 'present_mode': 'Mailbox', 'frame_rate': '60', 'show_fps': False,
-                'window_size': '1920x1080', 'scaler': 'fsr1', 'sharpening': '500',
+                'window_size': '1920x1080', 'render_height': '1080', 'aspect': '16:9', 'speakers': 'auto', 'scaler': 'fsr1', 'sharpening': '500',
                 'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
                 'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
-                'pad_invert_y': False, 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True}
+                'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {}, 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1', 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
+                **{key: 'auto' for key in FIXES},
+                **{f'{game}_infinite_{cheat}': False for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')}}
+
+
+UI_LANGUAGE = 'en'
 
 
 def _(text):
-    """Translations come later; every text goes through here."""
-    return text
+    """Translate launcher text, keeping English as the fallback."""
+    return uncharted_i18n.translate(UI_LANGUAGE, text)
+
+
+def _run_problem_priority(line):
+    if line.startswith(('STOP:', 'GPU crash:')):
+        return 3
+    if line.startswith(('ERROR', 'Fault:', 'No eboot.bin', 'No big', 'Set BB_GAME_DIR',
+                        'bb-probe.exe not found')):
+        return 2
+    if 'failed' in line and not line.startswith('GPU ['):
+        return 1
+    return 0
+
+
+def select_run_problem(current, output):
+    """Keep the most useful diagnostic emitted before the game exits."""
+    line = output.strip()
+    line_priority = _run_problem_priority(line)
+    return line if line_priority and line_priority >= _run_problem_priority(current) else current
 
 
 # ---------------------------------------------------------------------------------------------
@@ -264,6 +349,45 @@ def mouse_sensitivity(s):
         return '1.00'
 
 
+def vibration_strength(s):
+    """Saved vibration percentage, clamped at the launcher/runtime boundary."""
+    try:
+        return min(100, max(0, int(float(s.get('pad_vibration_strength', 100)))))
+    except (TypeError, ValueError):
+        return 100
+
+
+def controller_probe_path():
+    """The packaged or development loader, which also provides the lightweight controller probe."""
+    configured = os.environ.get('BB_PROBE')
+    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / 'bb-probe.exe',
+                                                               PORT_DIR / 'out' / 'bb-probe.exe']
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def controller_probe_environment(probe):
+    """Development builds find SDL beside MSYS2; packages already keep it beside bb-probe."""
+    env = dict(os.environ)
+    if not (probe.parent / 'SDL3.dll').is_file():
+        clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
+        if clang64.is_dir():
+            env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
+    return env
+
+
+def parse_controller_probe(text):
+    """Parse bb-probe's deliberately small key=value controller response."""
+    values = {}
+    for line in text.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            values[key.strip()] = value.strip()
+    return {'connected': values.get('connected') == '1',
+            'name': values.get('name', ''),
+            'rumble': values.get('rumble') == '1',
+            'tested': values.get('tested') == '1'}
+
+
 def side_buttons():
     """(Mouse 4, Mouse 5) held right now: the system's XBUTTON1 / XBUTTON2 (virtual keys 5 and 6)."""
     try:
@@ -298,6 +422,14 @@ def fsr411_assets():
         (folder / 'fsr4_411').is_dir() for folder in (PORT_DIR, DATA_DIR))
 
 
+def xess_available():
+    """Intel XeSS needs Intel's libxess.dll next to bb-probe.exe (packaging/windows/fetch_xess.sh)."""
+    override = os.environ.get('BB_XESS_DLL')
+    if override:
+        return Path(override).is_file()
+    return any((PORT_DIR / folder / 'libxess.dll').is_file() for folder in ('bin', 'out'))
+
+
 def input_ini_path():
     return Path(os.environ.get('BB_INPUT_CONFIG', DATA_DIR / 'input.ini'))
 
@@ -310,7 +442,9 @@ def write_input_ini(s):
              f"mouse_look={1 if s.get('mouse_look', True) else 0}",
              f"mouse_sensitivity={mouse_sensitivity(s)}",
              f"mouse_invert_y={1 if s.get('mouse_invert_y') else 0}",
-             f"pad_invert_y={1 if s.get('pad_invert_y') else 0}"]
+             f"pad_invert_y={1 if s.get('pad_invert_y') else 0}",
+             f"pad_vibration={1 if s.get('pad_vibration', True) else 0}",
+             f"pad_vibration_strength={vibration_strength(s)}"]
     lines += [f'key.{action}={keys.get(action, "")}' for action in DEFAULT_KEYS]
     lines += [f'pad.{action}={pad.get(action, "none")}' for action in DEFAULT_PAD]
     path = input_ini_path()
@@ -319,12 +453,47 @@ def write_input_ini(s):
     return path
 
 
+def screen_size():
+    """(width, height) of the main display in pixels, or None."""
+    try:
+        user32 = ctypes.windll.user32
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+    except (AttributeError, OSError):
+        return None
+
+
+def parse_size(text):
+    try:
+        width, height = (int(part) for part in str(text).lower().replace('×', 'x').split('x'))
+    except ValueError:
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def game_resolution(s, screen=None):
+    """The size the games render at, 'WxH' (even numbers, the pixel count within what their GPU memory holds), or ''
+    for their own 1920x1080."""
+    height = int(s.get('render_height') or 1080) if str(s.get('render_height') or '1080').isdigit() else 1080
+    shape = s.get('aspect') or '16:9'
+    if shape == 'window':
+        size = screen if s.get('fullscreen') else parse_size(s.get('window_size'))
+        size = size or screen or (1920, 1080)
+        ratio = size[0] / size[1]
+    else:
+        ratio = ASPECT_RATIOS.get(shape, 16 / 9)
+    ratio = min(max(ratio, 1.0), 4.0)
+    for height in sorted({height, 2160, 1800, 1620, 1440, 1260, 1080, 900, 720}, reverse=True):
+        if height > int(s.get('render_height') or 1080) if str(s.get('render_height') or '1080').isdigit() else height > 1080:
+            continue
+        width = SCREEN_WIDTHS.get((shape, height)) or int(round(height * ratio / 2)) * 2
+        if width * height <= MAX_RENDER_PIXELS:   # the next smaller height of the same shape
+            break
+    return '' if (width, height) == (1920, 1080) else f'{width}x{height}'
+
+
 def game_environment(s, start=None):
     env = dict(os.environ)
-    try:
-        env['BB_INPUT_CONFIG'] = str(write_input_ini(s))
-    except OSError:
-        pass
+    env['BB_INPUT_CONFIG'] = str(write_input_ini(s))
     start = start or s['start']
     # The collection folder; with none, the folder of the game started. A game with a folder of its own
     # (Game page) is taken from it, also when another game of the collection starts it.
@@ -342,6 +511,16 @@ def game_environment(s, start=None):
     env['BB_PRESENT_MODE'] = s['present_mode']
     env['BB_VBLANK_HZ'] = str(s.get('frame_rate') or '60')
     env['BB_WINDOW_SIZE'] = str(s.get('window_size') or '1920x1080')
+    if str(s.get('speakers') or 'auto') != 'auto':
+        env['BB_SPEAKERS'] = str(s['speakers'])
+    resolution = game_resolution(s, screen_size())
+    if resolution:
+        env['BB_GAME_RES'] = resolution
+    window = parse_size(s.get('window_size'))
+    if not s.get('fullscreen') and resolution and window and s.get('aspect', '16:9') != '16:9':
+        shape = parse_size(resolution)
+        # A window of another shape than the picture would show bars: keep its height, take the picture's width.
+        env['BB_WINDOW_SIZE'] = f'{round(window[1] * shape[0] / shape[1] / 2) * 2}x{window[1]}'
     env['BB_FSR1'] = '1' if s.get('scaler', 'fsr1') == 'fsr1' else '0'
     sharpening = str(s.get('sharpening') or 'off')
     env['BB_RCAS'] = '0' if sharpening == 'off' else '1'
@@ -351,6 +530,11 @@ def game_environment(s, start=None):
     env['BB_FSR_SHARPNESS'] = str(s.get('aa_sharpness') or '0')
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
+    for key, (_title, _hint, choices) in FIXES.items():
+        env.update(choices.get(str(s.get(key) or 'auto'), {}))
+    env['BB_BUTTON_PROMPTS'] = str(s.get('button_prompts') or 'auto')
+    env['BB_CHEATS'] = ','.join(f'{game}:{cheat}' for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')
+                                if s.get(f'{game}_infinite_{cheat}'))
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -372,15 +556,20 @@ COLORS = {'surface': SURFACE, 'card': CARD, 'card_hi': CARD_HI, 'line': LINE, 't
           'button': '#25272b', 'button_hi': '#30333a'}
 # Sidebar icons (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10).
 NAV_ICONS = {'play': '\ue768', 'game': '\ue7fc', 'display': '\ue7f4', 'controls': '\ue765',
-             'advanced': '\ue713', 'log': '\ue8a5'}
+             'cheats': '\ue945', 'fixes': '\ue90f', 'trophies': '\ue734', 'advanced': '\ue713', 'log': '\ue8a5'}
+# Trophy grades as the console colours them (the platinum cool white-blue, the rest metal).
+TROPHY_COLORS = {'P': '#9fd0f5', 'G': GOLD, 'S': '#cfd3da', 'B': '#cf8548'}
 RUST, RUST_HI = GOLD, GOLD_HI
 
 
 class Launcher:
     def __init__(self, root, tk, ttk, filedialog, messagebox):
+        global UI_LANGUAGE
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
         self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+        UI_LANGUAGE = uncharted_i18n.language_code(self.app.get('ui_language', ''))
+        self.configure_art()
         self.vars = {}
         self.process = self.job = None
         self.entered, self.last_problem, self.stopping = False, '', False
@@ -402,6 +591,7 @@ class Launcher:
         self.show('play')
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
+        root.after(150, self.detect_controller)
         if self.app.get('check_updates', True):
             threading.Thread(target=self.check_update, daemon=True).start()
 
@@ -521,7 +711,7 @@ class Launcher:
             self.vars[key] = v
         return self.vars[key]
 
-    def choice(self, parent, key, options, width=36):
+    def choice(self, parent, key, options, width=36, on_change=None):
         var = self.var(key)
         values = [v for v, _t in options]
         box = self.ttk.Combobox(parent, values=[_(t) for _v, t in options], state='readonly', width=width)
@@ -531,7 +721,11 @@ class Launcher:
         def show(*_args):
             box.current(values.index(var.get()) if var.get() in values else 0)
         show()
-        box.bind('<<ComboboxSelected>>', lambda _e: var.set(values[box.current()]))
+        def selected(_event):
+            var.set(values[box.current()])
+            if on_change:
+                on_change()
+        box.bind('<<ComboboxSelected>>', selected)
         var.trace_add('write', show)
         return box
 
@@ -616,6 +810,137 @@ class Launcher:
             var.trace_add('write', lambda *_a: on_change())
         return self.row(parent, title, holder, hint)
 
+    def image_path(self, title, current=''):
+        """Choose and validate a local image."""
+        chosen = self.filedialog.askopenfilename(
+            title=title, initialdir=str(Path(current).parent) if current else str(PORT_DIR),
+            filetypes=[(_('Image files'), '*.png *.jpg *.jpeg *.webp *.ico'), (_('All files'), '*.*')])
+        if not chosen:
+            return ''
+        try:
+            from PIL import Image
+            with Image.open(chosen) as image:
+                image.verify()
+        except (OSError, ValueError) as error:
+            self.messagebox.showerror(NAME, _('This image could not be opened: {}').format(error))
+            return ''
+        return str(Path(chosen))
+
+    def enable_image_drop(self, widget, callback):
+        """Accept Explorer file drops when tkinterdnd2 is bundled; clicking always remains available."""
+        try:
+            from tkinterdnd2 import DND_FILES
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind('<<Drop>>', lambda event: callback(self.root.tk.splitlist(event.data)[0]))
+        except (ImportError, self.tk.TclError, AttributeError, IndexError):
+            pass
+
+    def edit_art(self, key, title, size, crop_key, initial_path=None, initial_crop=None):
+        """Preview, position and save one local image without copying it into the project."""
+        from PIL import Image, ImageTk
+        import uncharted_art
+
+        window = self.tk.Toplevel(self.root)
+        window.title(title)
+        window.configure(bg=PANEL)
+        window.transient(self.root)
+        window.grab_set()
+        window.resizable(False, False)
+        path = self.tk.StringVar(value=self.app.get(key, '') if initial_path is None else initial_path)
+        saved = (self.app.setdefault('art_crops', {}).get(crop_key, {})
+                 if initial_crop is None else initial_crop)
+        result = {'value': None}
+        zoom = self.tk.DoubleVar(value=float(saved.get('zoom', 1.0)))
+        focus_x = self.tk.DoubleVar(value=float(saved.get('x', 0.5)))
+        focus_y = self.tk.DoubleVar(value=float(saved.get('y', 0.5)))
+        preview_w = self.px(560)
+        preview_h = max(self.px(180), round(preview_w * size[1] / size[0]))
+        if preview_h > self.px(390):
+            preview_h = self.px(390)
+            preview_w = round(preview_h * size[0] / size[1])
+        shell = self.tk.Frame(window, bg=PANEL)
+        shell.pack(padx=self.px(24), pady=self.px(22))
+        self.tk.Label(shell, text=title, bg=PANEL, fg=TEXT, font=self.font_title).pack(anchor='w')
+        self.tk.Label(shell, text=_('Drag an image here or click Choose image.'), bg=PANEL, fg=MUTED,
+                      font=self.font_ui).pack(anchor='w', pady=(2, self.px(12)))
+        canvas = self.tk.Canvas(shell, width=preview_w, height=preview_h, bg=BG, highlightthickness=2,
+                                highlightbackground=GOLD_DIM, bd=0, cursor='hand2')
+        canvas.pack()
+        preview = {'photo': None}
+
+        def redraw(*_args):
+            canvas.delete('all')
+            try:
+                with Image.open(path.get()) as source:
+                    crop = {'zoom': zoom.get(), 'x': focus_x.get(), 'y': focus_y.get()}
+                    image = uncharted_art.crop_image(source.convert('RGB'), (preview_w, preview_h), crop)
+                preview['photo'] = ImageTk.PhotoImage(image)
+                canvas.create_image(0, 0, image=preview['photo'], anchor='nw')
+            except (OSError, ValueError, self.tk.TclError):
+                preview['photo'] = None
+                canvas.create_text(preview_w // 2, preview_h // 2, text=_('Choose image'), fill=MUTED,
+                                   font=self.font_ui_md)
+            canvas.create_rectangle(1, 1, preview_w - 2, preview_h - 2, outline=GOLD, width=2)
+
+        def choose(candidate=''):
+            chosen = candidate or self.image_path(title, path.get())
+            if chosen:
+                try:
+                    with Image.open(chosen) as image:
+                        image.verify()
+                except (OSError, ValueError) as error:
+                    self.messagebox.showerror(NAME, _('This image could not be opened: {}').format(error))
+                    return
+                path.set(str(Path(chosen)))
+                redraw()
+
+        controls = self.tk.Frame(shell, bg=PANEL)
+        controls.pack(fill='x', pady=(self.px(14), 0))
+        for row, (label, variable, start, end, step) in enumerate((
+                (_('Zoom'), zoom, 1.0, 3.0, 0.01), (_('Horizontal position'), focus_x, 0.0, 1.0, 0.01),
+                (_('Vertical position'), focus_y, 0.0, 1.0, 0.01))):
+            self.tk.Label(controls, text=label, bg=PANEL, fg=TEXT, font=self.font_ui,
+                          width=20, anchor='w').grid(row=row, column=0, sticky='w', pady=2)
+            scale = self.tk.Scale(controls, variable=variable, from_=start, to=end, resolution=step,
+                                  orient='horizontal', showvalue=False, length=self.px(380), bg=PANEL,
+                                  fg=TEXT, troughcolor=CARD_HI, activebackground=GOLD, highlightthickness=0,
+                                  command=redraw)
+            scale.grid(row=row, column=1, sticky='ew', pady=2)
+        buttons = self.tk.Frame(shell, bg=PANEL)
+        buttons.pack(fill='x', pady=(self.px(16), 0))
+        self.pill(buttons, _('Choose image'), choose, background=PANEL).pack(side='left')
+
+        def restore():
+            path.set('')
+            zoom.set(1.0)
+            focus_x.set(0.5)
+            focus_y.set(0.5)
+            redraw()
+
+        self.pill(buttons, _('Restore'), restore, kind='ghost', background=PANEL).pack(side='left', padx=(6, 0))
+        self.pill(buttons, _('Cancel'), window.destroy, kind='ghost', background=PANEL).pack(side='right')
+
+        def save():
+            result['value'] = (path.get(), {'zoom': zoom.get(), 'x': focus_x.get(), 'y': focus_y.get()})
+            window.destroy()
+
+        self.pill(buttons, _('Save changes'), save, kind='primary', background=PANEL).pack(side='right', padx=(0, 6))
+        canvas.bind('<Button-1>', lambda _event: choose())
+        self.enable_image_drop(canvas, choose)
+        for variable in (path, zoom, focus_x, focus_y):
+            variable.trace_add('write', redraw)
+        redraw()
+        window.bind('<Escape>', lambda _event: window.destroy())
+        window.wait_window()
+        return result['value']
+
+    def edit_launcher_art(self, key, title, size, crop_key, initial_path=None):
+        result = self.edit_art(key, title, size, crop_key, initial_path=initial_path)
+        if not result:
+            return
+        self.app[key], self.app.setdefault('art_crops', {})[crop_key] = result
+        self.change_art()
+
     def page(self, name, title, subtitle):
         tk = self.tk
         outer = tk.Frame(self.content, bg=SURFACE)
@@ -684,11 +1009,12 @@ class Launcher:
         tk.Label(side, text=_('by {}').format(AUTHOR), bg=BG, fg=TEXT, font=self.font_ui_md,
                  anchor='w', wraplength=brand_wrap, justify='left').pack(anchor='w', padx=18, pady=(10, 0))
         tk.Label(side, text=_('version {}').format(VERSION), bg=BG, fg='#5c564c', font=self.font_ui_sm,
-                 anchor='w').pack(anchor='w', padx=18, pady=(1, 16))
-        tk.Frame(side, bg=LINE, height=1).pack(fill='x', padx=18, pady=(0, 14))
+                 anchor='w').pack(anchor='w', padx=18, pady=(1, 0))
+        tk.Frame(side, bg=LINE, height=1).pack(fill='x', padx=18, pady=(16, 14))
         self.nav, self.nav_pills, self.nav_icons, self.nav_marks, self.current_page = {}, {}, {}, {}, None
-        for name, title in (('play', _('Play')), ('game', _('Game')), ('display', _('Display')),
-                            ('controls', _('Controls')), ('advanced', _('Advanced')), ('log', _('Log'))):
+        for name, title in (('play', _('Play')), ('game', _('Game')), ('cheats', _('Cheats')), ('display', _('Display')),
+                            ('controls', _('Controls')), ('fixes', _('Fixes')), ('trophies', _('Trophies')), ('advanced', _('Advanced')),
+                            ('log', _('Log'))):
             row = tk.Frame(side, bg=BG, cursor='hand2')
             row.pack(fill='x', padx=(0, 12), pady=2)
             mark = tk.Frame(row, bg=BG, width=self.px(3))
@@ -746,6 +1072,9 @@ class Launcher:
         self.build_game()
         self.build_display()
         self.build_controls()
+        self.build_fixes()
+        self.build_trophies()
+        self.build_cheats()
         self.build_advanced()
         self.build_log()
         self.refresh()
@@ -784,6 +1113,10 @@ class Launcher:
             self._nav_style(n, active=(n == name))
         if name == 'play':
             self.refresh()
+        elif name == 'trophies':
+            self.trophy_info.clear()  # the game folder or the language may have changed
+            self.trophy_state = None
+            self.render_trophies()
 
     def build_play(self):
         tk, ttk = self.tk, self.ttk
@@ -792,6 +1125,9 @@ class Launcher:
         self.hero = tk.Canvas(page, height=self.px(260), bg=SURFACE, highlightthickness=0, bd=0)
         self.hero.pack(fill='x')
         self.hero.bind('<Configure>', self._sync_hero_height)
+        self.hero.bind('<Button-1>', lambda _e: self.edit_launcher_art(
+            'art_banner', _('Collection banner'), (1600, 450), 'banner'))
+        self.enable_image_drop(self.hero, lambda path: self.quick_art('art_banner', 'banner', path))
         shell = tk.Frame(page, bg=SURFACE)
         shell.pack(fill='both', expand=True, padx=self.px(22), pady=(self.px(6), self.px(10)))
         head = tk.Frame(shell, bg=SURFACE)
@@ -812,6 +1148,7 @@ class Launcher:
             card.bind('<Double-Button-1>', lambda _e, k=key: (self.var('start').set(k), self.play()))
             card.bind('<Enter>', lambda _e, k=key: self._card_hover(k))
             card.bind('<Leave>', lambda _e, k=key: self._card_hover(None))
+            self.enable_image_drop(card, lambda path, k=key: self.quick_art(f'art_{k}', k, path))
             self.cards[key] = card
         cards.bind('<Configure>', self.fit_posters)
         tk.Frame(shell, bg=SURFACE, height=1).pack(fill='x', padx=self.px(22), pady=(self.px(4), self.px(8)))
@@ -891,12 +1228,21 @@ class Launcher:
             card.create_image(x, 0, image=image, anchor='nw')
         else:
             card.create_rectangle(0, 0, w, h, fill=CARD, outline=LINE)
+        if hot:
+            label = _('Change image')
+            box_w = max(self.px(108), len(label) * self.px(7))
+            card.create_rectangle(w - box_w - self.px(12), self.px(12), w - self.px(12), self.px(42),
+                                  fill='#111214', outline=GOLD_DIM, tags='edit_art')
+            card.create_text(w - box_w // 2 - self.px(12), self.px(27), text=label, fill=TEXT,
+                             font=self.font_ui_sm, tags='edit_art')
+            card.tag_bind('edit_art', '<Button-1>', lambda _e, k=key: self.edit_launcher_art(
+                f'art_{k}', _('Change image'), (600, 900), k))
 
     def _sync_hero_height(self, _event=None):
         """Keep the header at the banner's 16:9 aspect ratio."""
         c = self.hero
         w = max(c.winfo_width(), 400)
-        h = max(self.px(180), min(self.px(280), int(w * 576 / 1024)))
+        h = max(self.px(160), min(self.px(230), int(w * 450 / 1600)))
         if int(c['height']) != h:
             c.configure(height=h)
         self.draw_hero()
@@ -909,13 +1255,14 @@ class Launcher:
         start = self.var('start').get()
         title, subtitle = next((t, sub) for k, t, sub, _e in GAMES if k == start)
         game_dir = game_folder(self.current(), start)
-        key = (w, h, start, game_dir)
+        key = (w, h, start, game_dir, self.app.get('art_banner', ''))
         if self.banner_key != key:
             self.banner_key = key
             # The collection banner when this machine has it (launcher art is not distributed),
             # otherwise the background art of the player's own dump.
             self.banner_scaled = self.photo_collection_banner(w, h) or \
-                self.scaled_art(Path(game_dir or '.') / 'sce_sys' / 'pic1.png', w)
+                self.scaled_art(Path(game_dir or '.') / 'sce_sys' / 'pic1.png', w) or \
+                self.photo_hero(start, w, h)
             self.cover_image = None
         if self.banner_scaled:
             c.create_image(w // 2, h // 2, image=self.banner_scaled)
@@ -927,6 +1274,9 @@ class Launcher:
                       font=self.font_brand_sm)
         c.create_text(w - self.px(24), h - self.px(14), text=f'{_(title)}  ·  {_(subtitle)}',
                       anchor='se', fill='#f6f1e6', font=self.font_brand_md)
+        label = _('Change image')
+        c.create_text(w - self.px(24), self.px(18), text=label, anchor='ne', fill='#d6c9ae',
+                      font=self.font_ui_sm)
 
     def photo_collection_banner(self, width, height):
         try:
@@ -1013,19 +1363,28 @@ class Launcher:
             hint += ' ' + _('Your display runs at {} Hz.').format(refresh)
         self.row(f, _('Frame rate'), self.choice(f, 'frame_rate', FRAME_RATES, 34), hint)
         self.section(f, _('Resolution'))
+        self.row(f, _('Render resolution'), self.choice(f, 'render_height', RENDER_HEIGHTS, 34),
+                 _('The size the games draw at, so a 1440p or 4K screen gets a sharper picture, not an enlarged '
+                   '1080p one. It needs more graphics memory and a faster GPU; the games\' GPU memory limits the '
+                   'largest size.'))
+        self.row(f, _('Aspect ratio'), self.choice(f, 'aspect', ASPECTS, 34),
+                 _('Ultrawide screens: the games draw a wider view (more at the sides) instead of stretching the '
+                   '16:9 picture. "The shape of the window or screen" follows the window size below, or the '
+                   'screen in fullscreen.'))
         self.row(f, _('Window size'), self.choice(f, 'window_size', WINDOW_SIZES, 34),
-                 _('The games render at 1920 × 1080. A larger window, or fullscreen on a 1440p or 4K '
-                   'screen, gets the image upscaled to fit.'))
+                 _('The window the picture is shown in; fullscreen uses the screen. A picture of another size is '
+                   'scaled to fit (FSR 1 below when it is enlarged).'))
         self.row(f, _('Upscaling'), self.choice(f, 'scaler', SCALERS, 34),
                  _('FSR 1 keeps edges sharp when the image is enlarged; bilinear is softer.'))
         self.row(f, _('Sharpening'), self.choice(f, 'sharpening', SHARPENING, 34),
                  _('AMD RCAS after FSR 1 (only while the image is enlarged).'))
         self.section(f, _('Anti-aliasing'))
-        modes = ANTI_ALIASING + ([FSR411] if fsr411_assets() else [])
+        modes = ANTI_ALIASING + ([FSR411] if fsr411_assets() else []) + ([XESS] if xess_available() else [])
         self.row(f, _('Anti-aliasing'), self.choice(f, 'anti_aliasing', modes, 34),
                  _('Temporal anti-aliasing at the games\' 1920 × 1080, with their own motion vectors: '
                    'smoother edges and less shimmering than the games\' own. DLSS needs a GeForce RTX; '
-                   'FSR 4 runs best on a Radeon RX 7000/9000 or a GeForce RTX 40/50.'))
+                   'FSR 4 runs best on a Radeon RX 7000/9000 or a GeForce RTX 40/50. '
+                   'Intel XeSS runs on any GPU (best on Intel Arc).'))
         self.row(f, _('Anti-aliasing sharpness'), self.choice(f, 'aa_sharpness', AA_SHARPNESS, 34))
         self.section(f, _('Frame generation'))
         hint = _('Frames made between two of the game\'s, for smoother motion: 60 FPS shows as 120. '
@@ -1039,6 +1398,11 @@ class Launcher:
                  _('FSR 3 makes one frame (2×). DLSS makes up to three on a GeForce RTX 50 (4×), '
                    'one on an RTX 40.'))
         self.check(f, 'show_fps', _('Show the FPS counter'))
+        self.section(f, _('Audio'))
+        self.row(f, _('Speakers'), self.choice(f, 'speakers', SPEAKERS, 34),
+                 _('What the games are told the speakers are, which sets the choices in their Audio Output '
+                   'menu (stereo, 5.1, 7.1). Automatic follows the Windows speaker configuration of the '
+                   'default playback device; set it to 5.1 or 7.1 when the games only offer stereo.'))
 
     def build_controls(self):
         f = self.page('controls', _('Controls'),
@@ -1056,6 +1420,12 @@ class Launcher:
                  _('How far the camera turns for a mouse movement; 1.00 is the default. Drag the slider or '
                    'type a number (0.1 to 10) for a faster turn.'))
         self.check(f, 'mouse_invert_y', _('Invert the mouse vertically'))
+
+        self.section(f, _('Button pictures'))
+        self.row(f, _('Show in the game'), self.choice(f, 'button_prompts', BUTTON_PROMPTS, 40),
+                 _('The pictures of buttons in menus and hints. Automatic shows your keys while you use '
+                   'the keyboard or mouse, Xbox buttons after an Xbox (or other) controller, and the '
+                   'PlayStation buttons after a PlayStation controller.'))
 
         self.section(f, _('Keyboard and mouse buttons'))
         self.note(f, _('Click a box, then press a key or a mouse button (the wheel counts too). '
@@ -1101,6 +1471,27 @@ class Launcher:
         holder = self.tk.Frame(card, bg=CARD)
         holder.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(12, 0))
         self.pill(holder, _('Default controller buttons'), self.reset_pad).pack(side='left')
+
+        self.section(f, _('Vibration'))
+        self.controller_name = self.ttk.Label(self.target(f), text=_('Detecting…'))
+        self.row(f, _('Controller'), self.controller_name)
+        self.controller_status = self.ttk.Label(self.target(f), text=_('Checking vibration support…'),
+                                                style='Muted.TLabel')
+        self.row(f, _('Status'), self.controller_status)
+        self.check(f, 'pad_vibration', _('Controller vibration'),
+                   _('The setting applies the next time the game starts.'))
+        self.row(f, _('Vibration intensity'),
+                 Slider(self.tk, self.target(f), self.var('pad_vibration_strength'), 0, 100, 5,
+                        COLORS, self.px, self.font_ui_md, fmt='{:.0f}', width=300, suffix='%'))
+        card = self.target(f)
+        holder = self.tk.Frame(card, bg=CARD)
+        holder.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(12, 0))
+        self.controller_refresh_button = self.pill(holder, _('Detect controller'), self.detect_controller)
+        self.controller_refresh_button.pack(side='left')
+        self.controller_test_button = self.pill(holder, _('Test vibration'),
+                                                lambda: self.detect_controller(test=True))
+        self.controller_test_button.pack(side='left', padx=(8, 0))
+        self.controller_test_button.configure(state='disabled')
 
     def key_list(self, action):
         value = (self.app.get('key_bindings') or {}).get(action, DEFAULT_KEYS[action])
@@ -1176,7 +1567,8 @@ class Launcher:
         if sym in RESERVED_KEYS:
             self.status.configure(text=_(RESERVED_KEYS[sym]), fg=GOLD)
             return 'break'
-        name = TK_KEYS.get(sym)
+        name = WIN_NUMPAD.get(event.keycode) if sys.platform == 'win32' else None
+        name = name or TK_KEYS.get(sym)
         if not name and len(sym) == 1 and sym.isalnum():
             name = sym.upper()
         if not name and sym.startswith('F') and sym[1:].isdigit():
@@ -1209,8 +1601,185 @@ class Launcher:
         for action, var in self.pad_vars.items():
             var.set(DEFAULT_PAD[action])
 
+    def build_fixes(self):
+        f = self.page('fixes', _('Fixes'), _('Fixes that cost speed. Automatic turns each one on only where it '
+                                             'helps; change one only when you see its problem.'))
+        for key, (title, hint, _choices) in FIXES.items():
+            self.row(f, _(title), self.choice(f, key, FIX_CHOICES, 16), _(hint))
+
+    # ---- trophies ----------------------------------------------------------------------------
+    def build_trophies(self):
+        tk = self.tk
+        f = self.page('trophies', _('Trophies'),
+                      _("The games' own trophy lists. A trophy shows here, and as a notice in the game, "
+                        'when you earn it.'))
+        self.trophy_game = self.app.get('trophy_game') if self.app.get('trophy_game') in dict(
+            (k, 1) for k, _t, _s, _e in GAMES) else GAMES[0][0]
+        self.trophy_filter = 'all'
+        self.trophy_icons, self.trophy_state, self.trophy_info = {}, None, {}
+        bar = tk.Frame(f, bg=SURFACE)
+        bar.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(0, self.px(10)))
+        self.trophy_tabs = {}
+        for key, title, _sub, _exe in GAMES:
+            button = self.pill(bar, title, lambda k=key: self.set_trophy_game(k), background=SURFACE,
+                               padding=(16, 7))
+            button.pack(side='left', padx=(0, 8))
+            self.trophy_tabs[key] = button
+        self.trophy_filters = {}
+        for name, title in (('locked', _('Locked')), ('earned', _('Earned')), ('all', _('All'))):
+            button = self.pill(bar, title, lambda n=name: self.set_trophy_filter(n), background=SURFACE,
+                               padding=(14, 7))
+            button.pack(side='right', padx=(8, 0))
+            self.trophy_filters[name] = button
+        self.trophy_summary = tk.Label(f, text='', bg=SURFACE, fg=MUTED, font=self.font_ui, anchor='w',
+                                       justify='left')
+        self.trophy_summary.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(0, self.px(10)))
+        self.trophy_body = tk.Frame(f, bg=SURFACE)
+        self.trophy_body.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we')
+        self.root.after(1500, self.poll_trophies)
+
+    def trophy_user_dir(self):
+        return Path(self.var('user_dir').get().strip() or DATA_DIR / 'user')
+
+    def trophy_info_for(self, key):
+        """The trophy list of one game (texts in the console language), made from its trophy pack in
+        the game folder when it is not there yet; None without a pack."""
+        s = self.current()
+        folder = game_folder(s, key)
+        if not folder:
+            return None
+        stem = next(exe for k, _t, _s, exe in GAMES if k == key)
+        out = DATA_DIR / 'out' / Path(stem).stem.split('-')[0] / 'trophy'
+        own = bool(str(s.get(f'game_dir_{key}') or '').strip())
+        language = str(s.get('language') or '1')
+        try:
+            trophies.prepare(folder, key, out, int(language) if language.isdigit() else 1, own)
+        except Exception:  # a broken pack must not break the launcher
+            return None
+        info = trophies.read_cache(out)
+        if info:
+            info['folder'] = out
+        return info
+
+    def trophy_icon(self, info, number, size, earned):
+        """The trophy's icon from the cache folder (dimmed while it is locked)."""
+        name = (info['npcommid'], number, size, earned)
+        if name not in self.trophy_icons:
+            image = None
+            try:
+                from PIL import Image, ImageEnhance, ImageTk
+                with Image.open(info['folder'] / f'TROP{number:03d}.PNG') as source:
+                    icon = source.convert('RGBA').resize((size, size), Image.LANCZOS)
+                if not earned:
+                    icon = ImageEnhance.Brightness(ImageEnhance.Color(icon).enhance(0.15)).enhance(0.55)
+                image = ImageTk.PhotoImage(icon)
+            except (ImportError, OSError):
+                pass
+            self.trophy_icons[name] = image
+        return self.trophy_icons[name]
+
+    @staticmethod
+    def mark_pill(button, on):
+        kind = 'primary' if on else 'secondary'
+        if button.kind != kind:
+            button.kind = kind
+            button.draw()
+
+    def set_trophy_game(self, key):
+        self.trophy_game, self.trophy_state = key, None
+        self.app['trophy_game'] = key
+        self.render_trophies()
+
+    def set_trophy_filter(self, name):
+        self.trophy_filter, self.trophy_state = name, None
+        self.render_trophies()
+
+    def render_trophies(self, force=False):
+        """Redraws the list of the chosen game when what it shows changed."""
+        key = self.trophy_game
+        info = self.trophy_info.get(key)
+        if info is None or force:
+            info = self.trophy_info[key] = self.trophy_info_for(key) or False
+        unlocked = trophies.read_unlocks(self.trophy_user_dir(), info['npcommid']) if info else {}
+        state = (key, self.trophy_filter, tuple(sorted(unlocked.items())), bool(info))
+        for k, button in self.trophy_tabs.items():
+            self.mark_pill(button, k == key)
+        for name, button in self.trophy_filters.items():
+            self.mark_pill(button, name == self.trophy_filter)
+        if state == self.trophy_state:
+            return
+        self.trophy_state = state
+        tk = self.tk
+        for child in self.trophy_body.winfo_children():
+            child.destroy()
+        if not info:
+            self.trophy_summary.configure(text='')
+            self.note_in(self.trophy_body, _('No trophy list for this game. Set the game folder on the Game page '
+                                             '(it needs sce_sys/trophy/trophy0N.trp).'))
+            return
+        progress = trophies.progress(info, unlocked)
+        grades = '   '.join(f"{_(trophies.GRADE_NAMES[g])} {progress['earned'][g]}/{progress['total'][g]}"
+                            for g in 'PGSB' if progress['total'][g])
+        self.trophy_summary.configure(
+            text=f"{info['title']}\n{progress['count']} of {len(info['trophies'])} earned · {progress['percent']}%"
+                 f'   ·   {grades}')
+        shown = 0
+        size = self.px(52)
+        for number, grade, hidden, name, detail in info['trophies']:
+            when = unlocked.get(number)
+            if (self.trophy_filter == 'earned') != (when is not None) and self.trophy_filter != 'all':
+                continue
+            shown += 1
+            if hidden and when is None:
+                name, detail = _('Hidden trophy'), _('Keep playing to find out how to earn it.')
+            card = tk.Frame(self.trophy_body, bg=CARD, highlightthickness=1, highlightbackground=LINE)
+            card.pack(fill='x', pady=(0, 6))
+            icon = self.trophy_icon(info, number, size, when is not None)
+            if icon:
+                tk.Label(card, image=icon, bg=CARD).pack(side='left', padx=(10, 12), pady=8)
+            side = tk.Frame(card, bg=CARD)
+            side.pack(side='right', padx=(10, 16))
+            color = TROPHY_COLORS.get(grade, MUTED) if when is not None else MUTED
+            tk.Label(side, text=_(trophies.GRADE_NAMES.get(grade, 'Bronze')), bg=CARD, fg=color,
+                     font=('Segoe UI Semibold', 9)).pack(anchor='e')
+            tk.Label(side, text=time.strftime('%d %b %Y', time.localtime(when)) if when is not None else _('Locked'),
+                     bg=CARD, fg=MUTED, font=self.font_ui_sm).pack(anchor='e', pady=(2, 0))
+            middle = tk.Frame(card, bg=CARD)
+            middle.pack(side='left', fill='x', expand=True, pady=8)
+            tk.Label(middle, text=name, bg=CARD, fg=TEXT if when is not None else MUTED, anchor='w',
+                     font=self.font_ui_md).pack(anchor='w')
+            tk.Label(middle, text=detail, bg=CARD, fg=MUTED, font=self.font_ui_sm, justify='left', anchor='w',
+                     wraplength=self.px(520)).pack(anchor='w', pady=(1, 0))
+        if not shown:
+            self.note_in(self.trophy_body, _('Nothing here yet.') if self.trophy_filter == 'earned'
+                         else _('Every trophy is earned.'))
+
+    def note_in(self, parent, text):
+        self.tk.Label(parent, text=text, bg=SURFACE, fg=MUTED, font=self.font_ui, anchor='w', justify='left',
+                      wraplength=self.px(640)).pack(anchor='w', pady=(8, 0))
+
+    def poll_trophies(self):
+        """Every 1.5 s while the page is open: the game writes an unlock as it happens."""
+        if self.current_page == 'trophies':
+            try:
+                self.render_trophies()
+            except Exception:
+                pass
+        self.root.after(1500, self.poll_trophies)
+
+    def build_cheats(self):
+        f = self.page('cheats', _('Cheats'), _('Each cheat only affects its own game; changes apply when the game starts.'))
+        for game, title, subtitle, _exe in GAMES:
+            self.section(f, f'{title} · {subtitle}')
+            self.check(f, f'{game}_infinite_health', _('Infinite Health'))
+            self.check(f, f'{game}_infinite_ammo', _('Infinite Ammo'))
+
     def build_advanced(self):
         f = self.page('advanced', _('Advanced'), _('Maintenance and options for testing.'))
+        self.section(f, _('Launcher language'), top=2)
+        self.row(f, _('Interface language'),
+                 self.choice(f, 'ui_language', uncharted_i18n.LANGUAGES, 24, self.change_ui_language),
+                 _('This changes only the launcher. The game language is selected on the Game page.'))
         self.check(f, 'close_on_play', _('Close the launcher when the game starts'))
         extra = self.ttk.Entry(f, textvariable=self.var('extra_env'), width=60)
         self.row(f, _('Environment'), extra, _('Extra variables for the game, NAME=value separated by spaces.'))
@@ -1283,6 +1852,57 @@ class Launcher:
         self.draw_hero()
 
     # ---- actions -----------------------------------------------------------------------------
+    def change_ui_language(self):
+        """Save and rebuild every label as soon as the interface language changes."""
+        global UI_LANGUAGE
+        page = self.current_page or 'advanced'
+        self.collect()
+        UI_LANGUAGE = uncharted_i18n.language_code(self.app['ui_language'])
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.vars = {}
+        self.build()
+        self.show(page)
+        self.refresh()
+        if self.process:
+            self.play_button.configure(state='disabled')
+            self.stop_button.configure(state='normal')
+
+    def configure_art(self):
+        import uncharted_art
+        uncharted_art.set_custom_art({
+            'collection_banner.jpg': self.app.get('art_banner', ''),
+            'u1.jpg': self.app.get('art_u1', ''),
+            'u2.jpg': self.app.get('art_u2', ''),
+            'u3.jpg': self.app.get('art_u3', ''),
+        }, {
+            'collection_banner.jpg': self.app.get('art_crops', {}).get('banner', {}),
+            'u1.jpg': self.app.get('art_crops', {}).get('u1', {}),
+            'u2.jpg': self.app.get('art_crops', {}).get('u2', {}),
+            'u3.jpg': self.app.get('art_crops', {}).get('u3', {}),
+        })
+
+    def quick_art(self, key, crop_key, path):
+        """Open a dropped image in the same crop editor used by click selection."""
+        try:
+            from PIL import Image
+            with Image.open(path) as image:
+                image.verify()
+        except (OSError, ValueError) as error:
+            self.messagebox.showerror(NAME, _('This image could not be opened: {}').format(error))
+            return
+        size = (1600, 450) if key == 'art_banner' else (600, 900)
+        title = _('Collection banner') if key == 'art_banner' else _('Change image')
+        self.edit_launcher_art(key, title, size, crop_key, str(Path(path)))
+
+    def change_art(self):
+        """Apply local artwork immediately while keeping the original as fallback."""
+        self.collect()
+        self.configure_art()
+        self.banner_key = self.banner_scaled = None
+        self.card_images = {}
+        self.refresh()
+
     def collect(self):
         for key, v in self.vars.items():
             self.app[key] = v.get()
@@ -1294,6 +1914,62 @@ class Launcher:
             set_ini('show_fps', '1' if self.app['show_fps'] else '0')
         except OSError:
             pass
+
+    def detect_controller(self, test=False):
+        """Detect or briefly rumble the first SDL gamepad without starting the game renderer."""
+        if self.process:
+            self.controller_status.configure(text=_('Unavailable while the game is running.'))
+            return
+        probe = controller_probe_path()
+        if not probe:
+            self.controller_name.configure(text=_('Not available'))
+            self.controller_status.configure(text=_('bb-probe.exe was not found.'))
+            return
+        self.controller_refresh_button.configure(state='disabled')
+        self.controller_test_button.configure(state='disabled')
+        self.controller_status.configure(text=_('Testing…') if test else _('Detecting…'))
+        strength = vibration_strength(self.current())
+
+        def work():
+            command = [str(probe), '--controller-test', str(strength)] if test \
+                else [str(probe), '--controller-info']
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
+                                        errors='replace', timeout=5, env=controller_probe_environment(probe),
+                                        creationflags=NO_WINDOW)
+                if result.returncode:
+                    raise OSError(result.stderr.strip() or _('controller probe failed'))
+                info, error = parse_controller_probe(result.stdout), ''
+            except (OSError, subprocess.TimeoutExpired) as failure:
+                info, error = None, str(failure)
+            self.ui_calls.put(lambda: self.show_controller(info, error, test))
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_controller(self, info, error, test):
+        if self.process:
+            self.controller_refresh_button.configure(state='disabled')
+            self.controller_test_button.configure(state='disabled')
+            self.controller_status.configure(text=_('Unavailable while the game is running.'))
+            return
+        self.controller_refresh_button.configure(state='normal')
+        if error:
+            self.controller_name.configure(text=_('Not available'))
+            self.controller_status.configure(text=_('Could not detect the controller: {}').format(error[:120]))
+            return
+        if not info['connected']:
+            self.controller_name.configure(text=_('No controller detected'))
+            self.controller_status.configure(text=_('Connect a controller, then detect again.'))
+            return
+        self.controller_name.configure(text=info['name'] or _('Game controller'))
+        self.controller_test_button.configure(state='normal' if info['rumble'] else 'disabled')
+        if not info['rumble']:
+            status = _('Connected · Vibration not supported')
+        elif test:
+            status = _('Connected · Vibration test completed') if info['tested'] \
+                else _('Connected · Vibration test failed')
+        else:
+            status = _('Connected · Vibration supported')
+        self.controller_status.configure(text=status)
 
     def play(self):
         if self.process:
@@ -1309,7 +1985,13 @@ class Launcher:
             return
         self.set_log('')
         try:
-            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
+            env = game_environment(self.app)
+        except OSError as error:
+            self.messagebox.showerror(
+                NAME, _('Could not save the input configuration: {}').format(error))
+            return
+        try:
+            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
@@ -1321,6 +2003,8 @@ class Launcher:
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')
         self.stop_button.configure(state='normal')
+        self.controller_refresh_button.configure(state='disabled')
+        self.controller_test_button.configure(state='disabled')
         self.status.configure(text=_('Preparing the game; it opens in its own window…'), fg=GOLD)
         if self.app.get('close_on_play'):
             self.root.after(5000, self.root.destroy)
@@ -1358,6 +2042,7 @@ class Launcher:
                     self.play_button.configure(state='normal')
                     self.stop_button.configure(state='disabled')
                     self.refresh()
+                    self.detect_controller()
                     # It failed to start or crashed (not Stop, not closing the window): say why.
                     if not self.stopping and (code != 0 or not self.entered):
                         reason = self.last_problem or _('see the Log page')
@@ -1366,11 +2051,7 @@ class Launcher:
                         self.show('log')
                 else:
                     stripped = item.strip()
-                    if stripped.startswith(('STOP:', 'ERROR', 'GPU crash: the', 'Fault:')) or \
-                            ('failed' in stripped and not stripped.startswith('GPU [')) or \
-                            stripped.startswith(('No eboot.bin', 'No big', 'Set BB_GAME_DIR', 'bb-probe.exe not found')):
-                        if not self.last_problem or stripped.startswith(('STOP:', 'GPU crash')):
-                            self.last_problem = stripped
+                    self.last_problem = select_run_problem(self.last_problem, stripped)
                     if 'Entering original x86-64 code' in item:
                         self.entered = True
                         self.status.configure(text=_('The game is running.'), fg=GOLD)
@@ -1382,9 +2063,18 @@ class Launcher:
         self.root.after(100, self.drain_output)
 
     def stop(self):
-        if self.job:
-            self.stopping = True
-            self.job.terminate()
+        if not self.process:
+            return
+        self.stop_button.configure(state='disabled')
+        try:
+            if not self.job or not self.job.terminate():
+                terminate_process_tree(self.process)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.stop_button.configure(state='normal')
+            self.messagebox.showerror(NAME, _('Could not stop the game: {}').format(error))
+            return
+        self.stopping = True
+        self.status.configure(text=_('Stopping the game…'), fg=GOLD)
 
     def append(self, text):
         self.log.configure(state='normal')
@@ -1504,21 +2194,115 @@ class Launcher:
     def clear_cache(self):
         if self.process:
             return
-        shutil.rmtree(Path(self.app['user_dir'] or DATA_DIR / 'user') / 'cache', ignore_errors=True)
+        cache = Path(self.app['user_dir'] or DATA_DIR / 'user') / 'cache'
+        try:
+            shutil.rmtree(cache)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self.messagebox.showerror(NAME, _('Could not clear the shader cache: {}').format(error))
+            return
         self.messagebox.showinfo(NAME, _('Shader cache cleared. The next start stutters for a while as it is rebuilt.'))
 
     def shortcut(self):
-        """Uncharted.lnk on the desktop."""
+        """Configure the collection shortcut where the action happens."""
+        from PIL import Image, ImageTk
+
+        window = self.tk.Toplevel(self.root)
+        window.title(_('Desktop shortcut'))
+        window.configure(bg=PANEL)
+        window.transient(self.root)
+        window.grab_set()
+        window.resizable(False, False)
+        shell = self.tk.Frame(window, bg=PANEL)
+        shell.pack(padx=self.px(24), pady=self.px(22))
+        self.tk.Label(shell, text=_('Desktop shortcut'), bg=PANEL, fg=TEXT,
+                      font=self.font_title).grid(row=0, column=0, columnspan=2, sticky='w')
+        self.tk.Label(shell, text=_('Shortcut name'), bg=PANEL, fg=TEXT,
+                      font=self.font_ui).grid(row=1, column=0, sticky='w', pady=(18, 4))
+        name = self.tk.StringVar(value=self.app.get('shortcut_name', APP_DEFAULTS['shortcut_name']))
+        self.ttk.Entry(shell, textvariable=name, width=48).grid(row=2, column=0, columnspan=2, sticky='ew')
+        self.tk.Label(shell, text=_('Shortcut icon'), bg=PANEL, fg=TEXT,
+                      font=self.font_ui).grid(row=3, column=0, sticky='w', pady=(16, 4))
+        icon = self.tk.StringVar(value=self.app.get('shortcut_icon', ''))
+        preview = self.tk.Canvas(shell, width=self.px(112), height=self.px(112), bg=BG,
+                                 highlightthickness=2, highlightbackground=GOLD_DIM, cursor='hand2')
+        preview.grid(row=4, column=0, sticky='w')
+        photo = {'image': None}
+
+        def draw_icon(*_args):
+            preview.delete('all')
+            try:
+                with Image.open(icon.get()) as source:
+                    image = source.convert('RGBA')
+                    image.thumbnail((self.px(96), self.px(96)), Image.LANCZOS)
+                photo['image'] = ImageTk.PhotoImage(image)
+                preview.create_image(self.px(56), self.px(56), image=photo['image'])
+            except (OSError, ValueError, self.tk.TclError):
+                photo['image'] = None
+                preview.create_text(self.px(56), self.px(56), text=_('Original icon'), fill=MUTED,
+                                    font=self.font_ui_sm, width=self.px(86))
+
+        def choose_icon(candidate=''):
+            chosen = candidate or self.image_path(_('Shortcut icon'), icon.get())
+            if chosen:
+                try:
+                    with Image.open(chosen) as image:
+                        image.verify()
+                except (OSError, ValueError) as error:
+                    self.messagebox.showerror(NAME, _('This image could not be opened: {}').format(error))
+                    return
+                icon.set(chosen)
+
+        actions = self.tk.Frame(shell, bg=PANEL)
+        actions.grid(row=4, column=1, sticky='w', padx=(16, 0))
+        self.pill(actions, _('Choose image'), choose_icon, background=PANEL).pack(anchor='w')
+        self.pill(actions, _('Restore'), lambda: icon.set(''), kind='ghost', background=PANEL).pack(
+            anchor='w', pady=(6, 0))
+        buttons = self.tk.Frame(shell, bg=PANEL)
+        buttons.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(18, 0))
+        self.pill(buttons, _('Cancel'), window.destroy, kind='ghost', background=PANEL).pack(side='right')
+
+        def create():
+            self.app['shortcut_name'] = name.get().strip() or APP_DEFAULTS['shortcut_name']
+            self.app['shortcut_icon'] = icon.get()
+            self.collect()
+            window.destroy()
+            self.create_shortcut()
+
+        self.pill(buttons, _('Create shortcut'), create, kind='primary', background=PANEL).pack(
+            side='right', padx=(0, 6))
+        preview.bind('<Button-1>', lambda _event: choose_icon())
+        self.enable_image_drop(preview, choose_icon)
+        icon.trace_add('write', draw_icon)
+        draw_icon()
+        window.bind('<Escape>', lambda _event: window.destroy())
+
+    def create_shortcut(self):
+        """Create the configured .lnk on the desktop."""
         if FROZEN:
             target, arguments, icon = sys.executable, '', f'{sys.executable},0'
         else:
             pythonw = Path(sys.executable).with_name('pythonw.exe')
             target = str(pythonw if pythonw.exists() else sys.executable)
             arguments, icon = Path(__file__).resolve(), PORT_DIR / 'launcher' / 'uncharted.ico'
-        script = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath("Desktop")'
-                  '+"\\Uncharted.lnk");'
-                  f'$s.TargetPath="{target}";$s.WorkingDirectory="{PORT_DIR}";$s.IconLocation="{icon}";'
-                  + (f"$s.Arguments='\"{arguments}\"';" if arguments else '') + '$s.Save()')
+        custom_icon = self.app.get('shortcut_icon', '')
+        if custom_icon:
+            try:
+                from PIL import Image
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                icon = CONFIG_DIR / 'custom-shortcut.ico'
+                with Image.open(custom_icon) as image:
+                    image.convert('RGBA').save(icon, sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
+            except OSError as error:
+                self.messagebox.showerror(NAME, _('This image could not be opened: {}').format(error))
+                return
+        name = re.sub(r'[<>:"/\\|?*]', '', self.app.get('shortcut_name', '')).strip() or 'Uncharted'
+        ps = lambda value: "'" + str(value).replace("'", "''") + "'"
+        script = ('$desktop=[Environment]::GetFolderPath("Desktop");'
+                  f'$s=(New-Object -ComObject WScript.Shell).CreateShortcut($desktop+{ps(chr(92) + name + ".lnk")});'
+                  f'$s.TargetPath={ps(target)};$s.WorkingDirectory={ps(PORT_DIR)};$s.IconLocation={ps(icon)};'
+                  + (f'$s.Arguments={ps(chr(34) + str(arguments) + chr(34))};' if arguments else '') + '$s.Save()')
         result = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True,
                                 creationflags=NO_WINDOW)
         if result.returncode == 0:
@@ -1527,7 +2311,97 @@ class Launcher:
             self.messagebox.showerror(NAME, result.stderr.decode(errors='replace')[:400])
 
     def add_to_steam(self):
-        """The collection in the Steam library (a non-Steam game that starts Uncharted.exe --play)."""
+        """Preview the collection art before writing the non-Steam shortcut."""
+        from PIL import Image, ImageTk
+        import uncharted_art
+
+        window = self.tk.Toplevel(self.root)
+        window.title(_('Add to Steam'))
+        window.configure(bg=PANEL)
+        window.transient(self.root)
+        window.grab_set()
+        window.resizable(False, False)
+        shell = self.tk.Frame(window, bg=PANEL)
+        shell.pack(padx=self.px(24), pady=self.px(22))
+        self.tk.Label(shell, text=_('Add collection to Steam'), bg=PANEL, fg=TEXT,
+                      font=self.font_title).grid(row=0, column=0, columnspan=3, sticky='w')
+        self.tk.Label(shell, text=_('Use one image and adjust each Steam format separately.'), bg=PANEL,
+                      fg=MUTED, font=self.font_ui).grid(row=1, column=0, columnspan=3, sticky='w', pady=(2, 14))
+        formats = [('portrait', _('Portrait'), (600, 900), (150, 225)),
+                   ('header', _('Header'), (920, 430), (230, 108)),
+                   ('hero', _('Hero'), (1920, 620), (300, 97))]
+        previews = {}
+        photos = {}
+        selected = {'path': self.app.get('steam_art', ''),
+                    'crops': {name: dict(self.app.get('art_crops', {}).get(f'steam_{name}', {}))
+                              for name, _label, _size, _preview in formats}}
+
+        def redraw():
+            for column, (name, label, size, preview_size) in enumerate(formats):
+                canvas = previews[name]
+                canvas.delete('all')
+                try:
+                    with Image.open(selected['path']) as source:
+                        image = uncharted_art.crop_image(
+                            source.convert('RGB'), preview_size, selected['crops'][name])
+                    photos[name] = ImageTk.PhotoImage(image)
+                    canvas.create_image(0, 0, image=photos[name], anchor='nw')
+                except (OSError, ValueError, self.tk.TclError):
+                    canvas.create_text(preview_size[0] // 2, preview_size[1] // 2,
+                                       text=_('Choose image'), fill=MUTED, font=self.font_ui_sm)
+                canvas.create_rectangle(1, 1, preview_size[0] - 2, preview_size[1] - 2,
+                                        outline=GOLD_DIM, width=2)
+
+        def choose(candidate=''):
+            chosen = candidate or self.image_path(_('Collection image'), selected['path'])
+            if chosen:
+                try:
+                    with Image.open(chosen) as image:
+                        image.verify()
+                except (OSError, ValueError) as error:
+                    self.messagebox.showerror(NAME, _('This image could not be opened: {}').format(error))
+                    return
+                selected['path'] = chosen
+                redraw()
+
+        def adjust(name, label, size):
+            result = self.edit_art('steam_art', label, size, f'steam_{name}',
+                                   initial_path=selected['path'], initial_crop=selected['crops'][name])
+            if result:
+                selected['path'], selected['crops'][name] = result
+                redraw()
+
+        for column, (name, label, size, preview_size) in enumerate(formats):
+            cell = self.tk.Frame(shell, bg=PANEL)
+            cell.grid(row=2, column=column, sticky='n', padx=(0 if column == 0 else 16, 0))
+            self.tk.Label(cell, text=label, bg=PANEL, fg=TEXT, font=self.font_ui_md).pack(anchor='w')
+            canvas = self.tk.Canvas(cell, width=preview_size[0], height=preview_size[1], bg=BG,
+                                    highlightthickness=0, cursor='hand2')
+            canvas.pack(pady=(6, 8))
+            previews[name] = canvas
+            canvas.bind('<Button-1>', lambda _e, n=name, l=label, s=size: adjust(n, l, s))
+            self.enable_image_drop(canvas, choose)
+            self.pill(cell, _('Adjust crop'), lambda n=name, l=label, s=size: adjust(n, l, s),
+                      background=PANEL, padding=(12, 6)).pack(anchor='w')
+        footer = self.tk.Frame(shell, bg=PANEL)
+        footer.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(18, 0))
+        self.pill(footer, _('Choose image'), choose, background=PANEL).pack(side='left')
+        self.pill(footer, _('Cancel'), window.destroy, kind='ghost', background=PANEL).pack(side='right')
+
+        def add():
+            self.app['steam_art'] = selected['path']
+            self.app.setdefault('art_crops', {}).update(
+                {f'steam_{name}': crop for name, crop in selected['crops'].items()})
+            self.collect()
+            window.destroy()
+            self.perform_add_to_steam()
+
+        self.pill(footer, _('Add to Steam'), add, kind='primary', background=PANEL).pack(side='right', padx=(0, 6))
+        redraw()
+        window.bind('<Escape>', lambda _event: window.destroy())
+
+    def perform_add_to_steam(self):
+        """Write the collection shortcut and its user-selected artwork to Steam."""
         import bbport_steam
         steam = bbport_steam.steam_folder()
         configs = bbport_steam.user_configs(steam) if steam else []
@@ -1562,8 +2436,11 @@ class Launcher:
                 # Library pictures (cover, header, hero) from the box art of the player's game folder.
                 try:
                     import uncharted_art
-                    uncharted_art.steam_artwork(game_folder(self.app, 'u1') or game_folder(self.app, 'u2'), config / 'grid',
-                                                bbport_steam.shortcut_id(f'"{exe}"', title))
+                    uncharted_art.steam_artwork(
+                        game_folder(self.app, 'u1') or game_folder(self.app, 'u2'), config / 'grid',
+                        bbport_steam.shortcut_id(f'"{exe}"', title), self.app.get('steam_art', ''), {
+                            name: self.app.get('art_crops', {}).get(f'steam_{name}', {})
+                            for name in ('portrait', 'header', 'hero')})
                 except Exception:  # pictures are a nicety: the shortcut works without them
                     pass
         except (OSError, ValueError) as error:
@@ -1587,20 +2464,36 @@ class GameJob:
     collection, an in-game restart), so Stop ends all of them."""
 
     def __init__(self, process):
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-        self.handle = kernel32.CreateJobObjectW(None, None)
+        self.kernel32 = ctypes.windll.kernel32
+        self.kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        self.handle = self.kernel32.CreateJobObjectW(None, None)
         if self.handle:
-            kernel32.AssignProcessToJobObject(ctypes.c_void_p(self.handle), ctypes.c_void_p(int(process._handle)))
+            assigned = self.kernel32.AssignProcessToJobObject(
+                ctypes.c_void_p(self.handle), ctypes.c_void_p(int(process._handle)))
+            if not assigned:
+                self.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+                self.handle = None
 
     def terminate(self):
-        if self.handle:
-            ctypes.windll.kernel32.TerminateJobObject(ctypes.c_void_p(self.handle), 1)
+        return bool(self.handle and self.kernel32.TerminateJobObject(ctypes.c_void_p(self.handle), 1))
 
     def close(self):
         if self.handle:
-            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+            self.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
             self.handle = None
+
+
+def terminate_process_tree(process):
+    """Stop a launcher process and every child when its Windows job is unavailable."""
+    if process.poll() is not None:
+        return
+    taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe'
+    result = subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, creationflags=NO_WINDOW, timeout=10)
+    if result.returncode and process.poll() is None:
+        detail = result.stdout.decode(errors='replace').strip()
+        raise OSError(detail or _('taskkill exited with code {}').format(result.returncode))
 
 
 def version_tuple(text):
@@ -1652,7 +2545,17 @@ def play_without_window(settings):
     log_dir = Path(settings.get('user_dir') or DATA_DIR / 'user')
     log_dir.mkdir(parents=True, exist_ok=True)
     with open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1) as log:
-        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
+        try:
+            env = game_environment(settings)
+        except OSError as error:
+            text = _('Could not save the input configuration: {}').format(error) + '\n'
+            log.write(text)
+            try:
+                sys.stderr.write(text)
+            except (OSError, ValueError):
+                pass
+            return 1
+        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         for raw in iter(process.stdout.readline, b''):
@@ -1682,7 +2585,11 @@ def main():
         pass
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except (ImportError, tk.TclError):
+        root = tk.Tk()
     Launcher(root, tk, ttk, filedialog, messagebox)
     root.mainloop()
 

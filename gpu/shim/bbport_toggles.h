@@ -12,6 +12,7 @@
 typedef unsigned long long sigjmp_buf[32];
 extern "C" __attribute__((returns_twice)) int bb_setjmp(sigjmp_buf buffer);
 #define sigsetjmp(buffer, save) bb_setjmp(buffer)
+extern "C" [[noreturn]] void bb_longjmp(sigjmp_buf buffer, int value);
 #endif
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
@@ -71,6 +72,8 @@ enum : std::uint64_t {
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
     // g2-arm64 diagnosis: set to log the images at BB_POOL_LOG (texture_cache.cpp).
     PoolLog = 1ull << 58,
+    /// One upscaler frame start per frame (Uncharted draws twice into its display buffer).
+    OneFrameStart = 1ull << 59,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

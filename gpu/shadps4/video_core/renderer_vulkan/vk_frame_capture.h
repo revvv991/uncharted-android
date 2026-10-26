@@ -15,9 +15,12 @@
 
 namespace VideoCore {
 struct ImageInfo;
-}
+struct Image;
+} // namespace VideoCore
 
 namespace Vulkan {
+
+class Runtime;
 
 class FrameCapture {
 public:
@@ -44,6 +47,19 @@ public:
     /// Contents of a bound buffer (first 1 KiB), kept for small passes and a pass's first draw.
     static void Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size);
     static void Note(const char* text);
+
+    /// Window thread, F10 with BB_TEXTURE_DUMP=1: records the frames between the next flips and
+    /// saves every texture they sample (mip 0 as .dds) next to the pass list, in
+    /// <user>/texture_dump/<time>/.
+    static void ArmTextureDump();
+    /// GPU thread, for each sampled texture: the copy for ArmTextureDump while recording.
+    static void DumpTexture(Runtime& runtime, VideoCore::Image& image);
+
+    /// BB_ICON_COLLECT=1: each compressed picture that a pass drawing into a display buffer
+    /// samples (the HUD and button prompts) is saved once, in <user>/button_icons, to add new
+    /// prompts to button_prompts.cpp. Those draws then skip the texture binding helper and memo.
+    static bool CollectingIcons();
+    static void CollectIcon(Runtime& runtime, VideoCore::Image& image);
 
 private:
     enum : u32 { Idle, Armed, Recording };

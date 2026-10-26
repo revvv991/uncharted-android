@@ -13,6 +13,8 @@
 #include "bbport_copy.h"
 #include "bbport_owner_wait.h"
 #include "bbport_toggles.h"
+#include "common/thread.h"
+#include "video_core/landing_gate.h"
 #include "common/alignment.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -23,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_vram.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
@@ -43,6 +46,13 @@ extern void (*g_gpu_crash_context)();
 }
 
 namespace VideoCore {
+
+namespace {
+// bbport: deferred raycaster copies (landing_gate.h). The instance is cleared and the stopping
+// flag set first thing in ~BufferCache: every wait on the landing thread is released then.
+std::atomic<BufferCache*> land_instance{nullptr};
+std::atomic<bool> land_stopping{false};
+} // namespace
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
@@ -142,6 +152,20 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    {
+        // bbport: system memory for arena blocks when the card is full (EnsureResident).
+        const auto& mem_props = instance.GetMemoryProperties();
+        const auto wanted = vk::MemoryPropertyFlagBits::eHostVisible |
+                            vk::MemoryPropertyFlagBits::eHostCoherent;
+        for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+            const auto flags = mem_props.memoryTypes[i].propertyFlags;
+            if (((reqs.memoryTypeBits >> i) & 1) && (flags & wanted) == wanted &&
+                !(flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                arena_host_memory_type_index = i;
+                break;
+            }
+        }
+    }
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * num_arena_pages) * sizeof(vk::DeviceAddress);
@@ -159,6 +183,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     static Vulkan::Scheduler* write_scheduler;
     write_scheduler = &scheduler;
     g_gpu_write_done_tick = [] { return write_scheduler->CurrentTick() + 1; };
+    land_stopping.store(false, std::memory_order_release);
+    land_instance.store(this, std::memory_order_release);
     const char* side_env = std::getenv("BB_SIDE_DOWNLOAD");
     if (instance.GetSideQueue() && !(side_env && side_env[0] == '0')) {
         side_queue = std::make_unique<SideQueue>(instance, instance.GetSideQueue());
@@ -182,6 +208,32 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
         arena->cpu_addr + arena->size_bytes);
     boost::container::small_vector<VAddr, 16> pages;
     u64 write_tick = 0;
+    // bbport: without merging (BB_GPU_MERGE=0) a faulting page whose GPU work is submitted but
+    // not done is waited for here, by its own tick, instead of the full read back waiting for
+    // everything queued (the current frame too). BB_SIDE_WAIT=0: off.
+    static const bool wait_writes = [] {
+        const char* env = std::getenv("BB_GPU_MERGE");
+        const char* side = std::getenv("BB_SIDE_WAIT");
+        return env && env[0] == '0' && !(side && side[0] == '0');
+    }();
+    if (wait_writes) {
+        u64 fault_tick = 0;
+        {
+            std::scoped_lock lk{shadow_mutex};
+            for (VAddr at = page; at < page + length; at += TRACKER_BYTES_PER_PAGE) {
+                if (memory_tracker->IsRegionGpuModified(at, TRACKER_BYTES_PER_PAGE)) {
+                    fault_tick = std::max(fault_tick, memory_tracker->LatestGpuWriteTick(
+                                                          at, TRACKER_BYTES_PER_PAGE));
+                }
+            }
+        }
+        // Only work already submitted: a tick still being recorded would need a flush from
+        // here, which deadlocks with the recording thread (loading screen hang); the full read
+        // back below handles those.
+        if (fault_tick && !scheduler.IsFree(fault_tick) && fault_tick < scheduler.CurrentTick()) {
+            scheduler.Wait(fault_tick);
+        }
+    }
     {
         std::scoped_lock lk{shadow_mutex};
         for (VAddr at = window_start; at < window_end; at += TRACKER_BYTES_PER_PAGE) {
@@ -279,7 +331,344 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
     return true;
 }
 
-BufferCache::~BufferCache() = default;
+// bbport: deferred raycaster copies (see landing_gate.h). The guest part of the copy is made at
+// the dispatch; the GPU-written bytes of the source land in the destination on a worker thread
+// once the GPU work that wrote them has completed, in registration order.
+struct BufferCache::Landing {
+    u64 seq{};
+    u64 tick{};
+    vk::Buffer buffer;
+    boost::container::small_vector<vk::BufferCopy, 4> copies; ///< dstOffset: in the side staging
+    boost::container::small_vector<VAddr, 4> targets;         ///< guest address of each copy
+};
+
+bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_SCALAR_COPY64_DEFER");
+        return env && env[0] == '1'; // run.py: on for Uncharted 2
+    }();
+    if (!enabled || !side_queue || land_stopping.load(std::memory_order_acquire) || size == 0 ||
+        size > SideQueue::StagingSize / 2 || !memory->IsValidGpuMapping(src, size) ||
+        !memory->IsValidGpuMapping(dst, size)) {
+        return false;
+    }
+    const u64 first_block = src >> block_shift;
+    const u64 last_block = (src + size - 1) >> block_shift;
+    const Buffer* arena = GetArena(first_block, last_block);
+    if (!arena || src < arena->cpu_addr || src + size > arena->cpu_addr + arena->size_bytes) {
+        return false;
+    }
+    auto landing = std::make_shared<Landing>();
+    landing->buffer = arena->Handle();
+    u64 total = 0;
+    gpu_modified_ranges.ForEachInRange(src, size, [&](VAddr start, VAddr end) {
+        total = Common::AlignUp(total, 64);
+        landing->copies.push_back(vk::BufferCopy{
+            .srcOffset = start - arena->cpu_addr,
+            .dstOffset = total,
+            .size = end - start,
+        });
+        landing->targets.push_back(dst + (start - src));
+        total += end - start;
+    });
+    if (landing->copies.empty() || total > SideQueue::StagingSize) {
+        return false;
+    }
+    // The tick of the work that wrote the source. Everything is recorded by now (the dispatch
+    // follows a drain of the draw pipe), so a write marked for the next tick is in the open
+    // command buffer; that one is submitted here, so the tick completes without anybody waiting
+    // for something else to submit it.
+    u64 tick = memory_tracker->LatestGpuWriteTick(src, size);
+    if (tick != 0) {
+        tick = std::min(tick, scheduler.CurrentTick());
+        if (tick >= scheduler.CurrentTick()) {
+            scheduler.Flush();
+        }
+    }
+    if (tick == 0) {
+        return false; // page flags and written ranges disagree: nothing says when it lands
+    }
+    landing->tick = tick;
+    // The guest part of the copy now; the GPU-written bytes follow when they have landed.
+    memory->TryWriteBacking(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), size);
+    {
+        std::scoped_lock lk{landing_mutex};
+        if (landing_stop) {
+            return false;
+        }
+        landing->seq = ++landing_registered_seq;
+        landing_registered.store(landing->seq, std::memory_order_release);
+        landing_queue.push_back(std::move(landing));
+        if (!landing_thread.joinable()) {
+            landing_thread = std::thread([this] { LandingWorker(); });
+        }
+    }
+    landing_cv.notify_one();
+    return true;
+}
+
+/// Waits for the GPU to reach `tick`, in slices, so that the shutdown can cancel it. False when
+/// cancelled or when the wait failed for a reason other than a lost device (which ends the game,
+/// like the other GPU waits do).
+bool BufferCache::WaitLandingTick(u64 tick) {
+    auto& semaphore = *scheduler.GetWorkSemaphore();
+    if (semaphore.IsFree(tick)) {
+        return true;
+    }
+    semaphore.Refresh();
+    if (semaphore.IsFree(tick)) {
+        return true;
+    }
+    const vk::Device device = instance.GetDevice();
+    const vk::Semaphore handle = semaphore.Handle();
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &handle,
+        .pValues = &tick,
+    };
+    const auto begin = std::chrono::steady_clock::now();
+    bool reported = false;
+    while (!land_stopping.load(std::memory_order_acquire)) {
+        const vk::Result result = device.waitSemaphores(&wait_info, 20'000'000ull);
+        if (result == vk::Result::eSuccess) {
+            semaphore.Refresh();
+            return true;
+        }
+        if (result == vk::Result::eErrorDeviceLost) {
+            Vulkan::DeviceLost(device);
+        }
+        if (result != vk::Result::eTimeout) {
+            std::printf("Landing: waiting for tick %llu failed (%s); the copy lands without data\n",
+                        static_cast<unsigned long long>(tick), vk::to_string(result).c_str());
+            return false;
+        }
+        if (!reported && std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) {
+            reported = true;
+            std::printf("GPU stall: the landing thread waits 5 s for tick %llu\n",
+                        static_cast<unsigned long long>(tick));
+        }
+    }
+    return false;
+}
+
+bool BufferCache::ExecuteLanding(Landing& landing) {
+    auto& side = *side_queue;
+    if (!WaitLandingTick(landing.tick)) {
+        return false;
+    }
+    u64 total = 0;
+    for (const auto& copy : landing.copies) {
+        total = std::max(total, copy.dstOffset + copy.size);
+    }
+    {
+        std::scoped_lock lk{side.mutex};
+        Vulkan::Check(side.device.resetCommandPool(*side.pool));
+        Vulkan::Check(side.cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+        side.cmdbuf.copyBuffer(landing.buffer, side.staging.Handle(), landing.copies);
+        const vk::MemoryBarrier2 to_host = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        side.cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+        Vulkan::Check(side.cmdbuf.end());
+        const vk::Semaphore timeline = scheduler.GetWorkSemaphore()->Handle();
+        const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+        const u64 wait_value = landing.tick;
+        const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+            .waitSemaphoreValueCount = 1,
+            .pWaitSemaphoreValues = &wait_value,
+        };
+        const vk::SubmitInfo submit = {
+            .pNext = &timeline_info,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &timeline,
+            .pWaitDstStageMask = &wait_stage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &side.cmdbuf,
+        };
+        Vulkan::Check(side.queue.submit(submit, *side.fence));
+        // The tick has been reached, so the copy is short. In slices anyway: at shutdown it gets
+        // half a second more.
+        u32 slices_after_stop = 0;
+        for (;;) {
+            const vk::Result result = side.device.waitForFences(*side.fence, true, 20'000'000ull);
+            if (result == vk::Result::eSuccess) {
+                break;
+            }
+            if (result == vk::Result::eErrorDeviceLost) {
+                Vulkan::DeviceLost(side.device);
+            }
+            if (result != vk::Result::eTimeout) {
+                Vulkan::Check(result);
+            }
+            if (land_stopping.load(std::memory_order_acquire) && ++slices_after_stop > 25) {
+                return false;
+            }
+        }
+        Vulkan::Check(side.device.resetFences(*side.fence));
+        side.staging.Invalidate(0, total);
+        for (size_t i = 0; i < landing.copies.size(); ++i) {
+            memory->TryWriteBacking(reinterpret_cast<void*>(landing.targets[i]),
+                                    side.staging.mapped_data.data() + landing.copies[i].dstOffset,
+                                    landing.copies[i].size);
+        }
+    }
+    return true;
+}
+
+void BufferCache::LandingWorker() {
+    Common::SetCurrentThreadName("bb:Landing");
+    std::unique_lock lk{landing_mutex};
+    for (;;) {
+        landing_cv.wait(lk, [&] {
+            return landing_stop || !landing_queue.empty() ||
+                   (!gated_labels.empty() && gated_labels.front().seq <= landing_done_seq);
+        });
+        if (landing_stop) {
+            break;
+        }
+        if (!gated_labels.empty() && gated_labels.front().seq <= landing_done_seq) {
+            auto fn = std::move(gated_labels.front().fn);
+            gated_labels.pop_front();
+            gate_running = true;
+            lk.unlock();
+            fn();
+            lk.lock();
+            gate_running = false;
+            gate_outstanding.fetch_sub(1, std::memory_order_release);
+            continue;
+        }
+        const auto landing = std::move(landing_queue.front());
+        landing_queue.pop_front();
+        lk.unlock();
+        // Lands without data when cancelled at shutdown or when the wait for the GPU failed:
+        // the labels behind it go on either way.
+        ExecuteLanding(*landing);
+        lk.lock();
+        landing_done_seq = landing->seq;
+        landing_done.store(landing->seq, std::memory_order_release);
+        landing_done_cv.notify_all();
+    }
+    // Shutdown: what is still pending is dropped, nobody waits for it any more.
+    landing_queue.clear();
+    gated_labels.clear();
+    gate_outstanding.store(0, std::memory_order_release);
+    landing_done_seq = landing_registered_seq;
+    landing_done.store(landing_done_seq, std::memory_order_release);
+    landing_done_cv.notify_all();
+    landing_exited.store(true, std::memory_order_release);
+}
+
+BufferCache::~BufferCache() {
+    StopLanding();
+}
+
+void BufferCache::StopLanding() {
+    // Stop first: nothing new goes to the landing thread, and the waits on it (its wait for the
+    // GPU, the guest-visible labels waiting behind a landing) let go.
+    const auto stop_begin = std::chrono::steady_clock::now();
+    land_stopping.store(true, std::memory_order_release);
+    land_instance.store(nullptr, std::memory_order_release);
+    u64 dropped_copies = 0;
+    size_t dropped_labels = 0;
+    {
+        std::scoped_lock lk{landing_mutex};
+        landing_stop = true;
+        dropped_copies = landing_registered_seq - landing_done_seq;
+        dropped_labels = gated_labels.size();
+    }
+    landing_cv.notify_all();
+    landing_done_cv.notify_all();
+    if (landing_thread.joinable()) {
+        // The thread leaves its waits within a slice (20 ms). If it is stuck in the driver
+        // anyway the process must still end: this runs from the exit of the game.
+        for (int ms = 0; ms < 3000 && !landing_exited.load(std::memory_order_acquire); ++ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (landing_exited.load(std::memory_order_acquire)) {
+            landing_thread.join();
+            if (dropped_copies != 0 || dropped_labels != 0) {
+                std::printf("Landing thread stopped: %llu copies and %zu labels were still pending "
+                            "(%lld ms)\n",
+                            static_cast<unsigned long long>(dropped_copies), dropped_labels,
+                            static_cast<long long>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - stop_begin)
+                                    .count()));
+            }
+        } else {
+            std::printf("Landing thread did not stop within 3 s: ending the process\n");
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
+    }
+}
+
+bool BufferCache::LandingGateActive() const {
+    return PendingLanding() != 0 || gate_outstanding.load(std::memory_order_acquire) != 0;
+}
+
+u64 BufferCache::PendingLanding() const {
+    const u64 registered = landing_registered.load(std::memory_order_acquire);
+    return registered > landing_done.load(std::memory_order_acquire) ? registered : 0;
+}
+
+void BufferCache::WaitLanding(u64 seq) {
+    if (seq == 0 || landing_done.load(std::memory_order_acquire) >= seq) {
+        return;
+    }
+    std::unique_lock lk{landing_mutex};
+    // Released at shutdown as well; a stall is reported, not ended (the landing thread waits for
+    // the GPU, which ends the game when the device is lost).
+    const auto done = [&] { return landing_stop || landing_done_seq >= seq; };
+    if (!landing_done_cv.wait_for(lk, std::chrono::seconds(5), done)) {
+        std::printf("GPU stall: a label waits 5 s for the landing of copy %llu\n",
+                    static_cast<unsigned long long>(seq));
+        landing_done_cv.wait(lk, done);
+    }
+}
+
+void BufferCache::RunAfterLanding(u64 seq, std::function<void()> fn) {
+    {
+        std::unique_lock lk{landing_mutex};
+        if (landing_stop || (seq <= landing_done_seq && gated_labels.empty() && !gate_running)) {
+            lk.unlock();
+            fn();
+            return;
+        }
+        gated_labels.push_back({seq, std::move(fn)});
+        gate_outstanding.fetch_add(1, std::memory_order_release);
+    }
+    landing_cv.notify_one();
+}
+
+namespace LandingGate {
+u64 Pending() {
+    auto* cache = land_instance.load(std::memory_order_acquire);
+    return cache ? cache->PendingLanding() : 0;
+}
+bool Active() {
+    auto* cache = land_instance.load(std::memory_order_acquire);
+    return cache && cache->LandingGateActive();
+}
+void Wait(u64 seq) {
+    if (auto* cache = land_instance.load(std::memory_order_acquire)) {
+        cache->WaitLanding(seq);
+    }
+}
+void Run(u64 seq, std::function<void()> fn) {
+    if (auto* cache = land_instance.load(std::memory_order_acquire)) {
+        cache->RunAfterLanding(seq, std::move(fn));
+    } else {
+        fn();
+    }
+}
+bool Stopped() {
+    return land_stopping.load(std::memory_order_acquire);
+}
+} // namespace LandingGate
 
 void BufferCache::ForceUpload(VAddr device_addr, u64 size) {
     if (!IsRegionGpuModified(device_addr, size)) {
@@ -575,6 +964,45 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
     }
+}
+
+void BufferCache::ReadMemoryAsync(VAddr device_addr, u32 size) {
+    static constexpr u32 SlotSize = 64;
+    static constexpr u32 NumSlots = 4096;
+    if (size == 0 || size > SlotSize || !IsRegionGpuModified(device_addr, size)) {
+        return;
+    }
+    if (!async_readback) {
+        async_readback = std::make_unique<Buffer>(instance, 0, u64{SlotSize} * NumSlots,
+                                                  MemoryType::HostCached, "Async small readback");
+        async_slot_busy = std::make_unique<std::atomic<bool>[]>(NumSlots);
+    }
+    const u32 slot = async_next_slot++ % NumSlots;
+    if (async_slot_busy[slot].load(std::memory_order_acquire)) {
+        return; // the copy before it has not landed yet; the next end-of-pipe event copies again
+    }
+    const u32 first_block = device_addr >> block_shift;
+    const u32 last_block = (device_addr + size - 1) >> block_shift;
+    const Buffer* arena = GetArena(first_block, last_block);
+    if (!arena || device_addr < arena->cpu_addr ||
+        device_addr + size > arena->cpu_addr + arena->size_bytes) {
+        return;
+    }
+    const vk::BufferCopy copy{
+        .srcOffset = device_addr - arena->cpu_addr,
+        .dstOffset = u64{slot} * SlotSize,
+        .size = size,
+    };
+    runtime.CopyBuffer(arena, async_readback.get(), std::span{&copy, 1});
+    async_slot_busy[slot].store(true, std::memory_order_relaxed);
+    scheduler.DeferPriorityOperation([this, slot, device_addr, size] {
+        const u64 offset = u64{slot} * SlotSize;
+        async_readback->Invalidate(offset, size);
+        // Through the backing memory: no write fault on a page the caches track.
+        memory->TryWriteBacking(reinterpret_cast<void*>(device_addr),
+                                async_readback->mapped_data.data() + offset, size);
+        async_slot_busy[slot].store(false, std::memory_order_release);
+    });
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -1021,6 +1449,93 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     return new_arena;
 }
 
+u64 BufferCache::AllocateArenaMemory(u64 size, vk::DeviceMemory& memory) {
+    // bbport: one vkAllocateMemory per resident range ran into the driver's limit on the number
+    // of allocations (4096 on NVIDIA and AMD; over 2000 after a few minutes of U2's prologue):
+    // the ranges are carved out of larger chunks now (they are never freed, so a bump pointer
+    // does). When the card has no room (the driver's budget, BB_TEST_VRAM_MB) the chunks come
+    // from system memory instead of failing: the GPU reads them over PCIe, slower but alive.
+    const bool tight = Vulkan::Vram::TestLimit() != 0 || instance.GetTotalMemoryBudget() < 5_GB;
+    const u64 chunk_size = Vulkan::Vram::Legacy() ? size : tight ? 16_MB : 64_MB;
+    const auto carve = [&](bool host) -> std::optional<u64> {
+        for (ArenaChunk& chunk : arena_chunks) {
+            if (chunk.host == host && chunk.size - chunk.used >= size) {
+                memory = chunk.memory;
+                const u64 offset = chunk.used;
+                chunk.used += size;
+                return offset;
+            }
+        }
+        return std::nullopt;
+    };
+    if (const auto offset = carve(false)) {
+        return *offset;
+    }
+    if (host_arena_active) {
+        if (const auto offset = carve(true)) {
+            return *offset;
+        }
+    }
+    vk::MemoryAllocateInfo alloc_info = {
+        .allocationSize = std::max(size, chunk_size),
+        .memoryTypeIndex = arena_memory_type_index,
+    };
+    vk::Result result = vk::Result::eErrorOutOfDeviceMemory;
+    if (!host_arena_active) {
+        for (const u64 try_size : {std::max(size, chunk_size), size}) {
+            alloc_info.allocationSize = try_size;
+            if (!Vulkan::Vram::Allows(try_size)) {
+                continue;
+            }
+            const auto r = instance.GetDevice().allocateMemory(alloc_info);
+            result = r.result;
+            if (result == vk::Result::eSuccess) {
+                arena_chunks.push_back({r.value, try_size, size, false});
+                Vulkan::Vram::arena_bytes.fetch_add(try_size, std::memory_order_relaxed);
+                Vulkan::Vram::arena_count.fetch_add(1, std::memory_order_relaxed);
+                memory = r.value;
+                return 0;
+            }
+        }
+    }
+    Vulkan::Vram::failed_allocs.fetch_add(1, std::memory_order_relaxed);
+    Vulkan::Vram::urgent.store(true, std::memory_order_relaxed);
+    if (arena_host_memory_type_index == ~0u && !Vulkan::Vram::Strict() && !host_arena_active) {
+        // Sparse binds cannot use system memory on this driver (NVIDIA): go over the budget and
+        // let the driver page (the simulated card, BB_TEST_VRAM_MB, is let through here).
+        alloc_info.allocationSize = std::max(size, chunk_size);
+        const auto r = instance.GetDevice().allocateMemory(alloc_info);
+        if (r.result == vk::Result::eSuccess) {
+            arena_chunks.push_back({r.value, alloc_info.allocationSize, size, false});
+            Vulkan::Vram::arena_bytes.fetch_add(alloc_info.allocationSize,
+                                                std::memory_order_relaxed);
+            Vulkan::Vram::arena_count.fetch_add(1, std::memory_order_relaxed);
+            Vulkan::Vram::recovered_allocs.fetch_add(1, std::memory_order_relaxed);
+            memory = r.value;
+            return 0;
+        }
+        result = r.result;
+    }
+    ASSERT_MSG(arena_host_memory_type_index != ~0u && !Vulkan::Vram::Legacy(),
+               "Failed allocating arena memory: vk::Result={}", vk::to_string(result));
+    alloc_info.memoryTypeIndex = arena_host_memory_type_index;
+    alloc_info.allocationSize = std::max(size, chunk_size);
+    host_arena_active = true;
+    Vulkan::Vram::host_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    Vulkan::Vram::urgent.store(true, std::memory_order_relaxed);
+    const auto host_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    arena_chunks.push_back({host_memory, alloc_info.allocationSize, size, true});
+    const u64 host_total =
+        Vulkan::Vram::arena_host_bytes.fetch_add(alloc_info.allocationSize) +
+        alloc_info.allocationSize;
+    std::printf("Buffer cache: no video memory for %llu MiB of arena (%s), using system memory "
+                "(%llu MiB there so far)\n",
+                static_cast<unsigned long long>(size >> 20), vk::to_string(result).c_str(),
+                static_cast<unsigned long long>(host_total >> 20));
+    memory = host_memory;
+    return 0;
+}
+
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
     u32 resident_blocks{};
     IntervalList bind_ranges;
@@ -1052,12 +1567,10 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
     BbStats::Timer timer{BbStats::t_resident};
 
-    const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
-    BbStats::arena_bytes += alloc_info.allocationSize;
+    const u64 needed = u64{resident_blocks} << block_shift;
+    vk::DeviceMemory device_memory{};
+    const u64 chunk_offset = AllocateArenaMemory(needed, device_memory);
+    BbStats::arena_bytes += needed; // g2-arm64: resident bytes (carved out of larger chunks)
     ++BbStats::arena_allocations;
     static const bool arena_log = [] {
         const char* env = std::getenv("BB_ARENA_LOG");
@@ -1096,7 +1609,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
+    u64 memory_offset = chunk_offset;
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;

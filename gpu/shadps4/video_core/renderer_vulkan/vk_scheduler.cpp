@@ -19,6 +19,7 @@
 #include "bbport_copy.h"
 #include "bbport_owner_wait.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/landing_gate.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -295,18 +296,28 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
     return chunk;
 }
 
-void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
+void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq) {
     if (!IsRecordingDeferred()) {
         WaitHostCopies();
+        if (VideoCore::LandingGate::Active()) {
+            WaitDeferredSignals();
+        }
+        VideoCore::LandingGate::Wait(landing_seq);
         signal();
         return;
     }
     BbCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
-        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
-            signal();
-            done->fetch_add(1, std::memory_order_release);
+    Record([signal = std::move(signal), done = deferred_signals_done,
+            landing_seq](vk::CommandBuffer) mutable {
+        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done), landing_seq] {
+            auto fire = [signal = std::move(signal), done = std::move(done)] {
+                signal();
+                done->fetch_add(1, std::memory_order_release);
+            };
+            // A signal behind deferred raycaster copies waits for them on the landing thread:
+            // this thread must not block (submissions wait for the copy threads).
+            VideoCore::LandingGate::Run(landing_seq, std::move(fire));
         });
     });
     KickRecording(true);
@@ -322,6 +333,9 @@ void Scheduler::WaitDeferredSignals() {
     const BbOwnerWait::Scope owner_waits; // g2-arm64: the signals may need the owner
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
+        if (VideoCore::LandingGate::Stopped()) {
+            break; // shutdown: the labels waiting on the landing thread were dropped
+        }
         // Helps the copy threads the signals wait for.
         BbCopy::WaitAsync();
         std::this_thread::yield();
@@ -360,14 +374,18 @@ void Scheduler::KickRecording(bool force) {
     if (full_chunks.empty() && record_chunk->Empty()) {
         return;
     }
+    // g2-arm64 (from uncharted_Linux 53fba30): the replacement is taken before the current chunk
+    // is handed over, so record_chunk is never null (see RetireChunk). AcquireChunk() takes
+    // recorder_mutex itself.
+    std::unique_ptr<RecordChunk> next = record_chunk->Empty() ? nullptr : AcquireChunk();
     bool wake;
     {
         std::scoped_lock lk{recorder_mutex};
         for (auto& chunk : full_chunks) {
             recorder_queue.push_back(std::move(chunk));
         }
-        if (!record_chunk->Empty()) {
-            recorder_queue.push_back(std::move(record_chunk));
+        if (next) {
+            recorder_queue.push_back(std::exchange(record_chunk, std::move(next)));
         }
         wake = recorder_sleeping;
         queued_chunks.store(recorder_queue.size(), std::memory_order_release);
@@ -376,9 +394,6 @@ void Scheduler::KickRecording(bool force) {
     // A busy recorder picks the new chunks up by itself: waking it is a syscall per draw.
     if (wake) {
         recorder_cv.notify_one();
-    }
-    if (!record_chunk) {
-        record_chunk = AcquireChunk();
     }
 }
 
@@ -613,8 +628,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     std::scoped_lock lk{submit_mutex};
     // bbport: BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
-#ifdef _WIN32 // g2-arm64: Windows-only diagnostics
     static const bool submit_threads = std::getenv("BB_SUBMIT_THREADS") != nullptr;
+#ifdef _WIN32
     if (submit_threads) {
         static std::mutex seen_mutex;
         static std::vector<std::pair<const Scheduler*, u32>> seen;

@@ -9,6 +9,15 @@
 #include <mutex>
 
 #include "video_core/renderer_vulkan/vk_common.h"
+
+#include <vk_mem_alloc.h>
+#include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
+
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_info.h"
 
 namespace Vulkan {
@@ -53,12 +62,20 @@ bool pass_open = false;
 // BB_CAPTURE_BY_FLIP=1: the recording spans the passes between two flips instead of starting
 // and ending at passes that write a display buffer (Uncharted writes two per frame).
 u64 record_start_flip = 0;
+// F10 (ArmTextureDump): a by-flip recording that also saves the sampled textures.
+std::atomic<bool> dump_requested{false};
+// Texture dump of the current recording (GPU thread).
+bool dumping = false;
+std::string dump_dir;
+std::vector<Target> dumped;
+u64 dump_bytes = 0;
+u32 dump_skipped = 0;
 bool CaptureByFlip() {
     static const bool value = [] {
         const char* env = std::getenv("BB_CAPTURE_BY_FLIP");
         return env && env[0] == '1';
     }();
-    return value;
+    return value || dump_requested.load(std::memory_order_acquire) || dumping;
 }
 std::mutex display_mutex;
 std::vector<VAddr> display_buffers;
@@ -79,7 +96,7 @@ std::string Describe(const Target& t) {
 
 void AddSampled(Entry& entry) {
     for (const auto& s : pending_sampled) {
-        if (entry.sampled.size() < 32 &&
+        if (entry.sampled.size() < 256 &&
             std::ranges::find(entry.sampled, s) == entry.sampled.end()) {
             entry.sampled.push_back(s);
         }
@@ -93,10 +110,155 @@ void AddShader(Entry& entry, u64 hash) {
     }
 }
 
+void StartDump() {
+    dump_requested.store(false, std::memory_order_release);
+    const char* user = std::getenv("BB_GPU_USER_DIR");
+    dump_dir = std::format("{}/texture_dump/{}", user && user[0] ? user : "user",
+                           static_cast<long long>(std::time(nullptr)));
+    std::error_code ec;
+    std::filesystem::create_directories(dump_dir, ec);
+    dumped.clear();
+    dump_bytes = 0;
+    dump_skipped = 0;
+    dumping = !ec;
+    std::printf("Texture dump: recording into %s%s\n", dump_dir.c_str(),
+                ec ? " failed (cannot create the folder)" : "");
+}
+
+void EndDump() {
+    if (dumping) {
+        std::printf("Texture dump: %zu textures (%llu MiB) saved to %s, %u skipped\n",
+                    dumped.size() - dump_skipped,
+                    static_cast<unsigned long long>(dump_bytes >> 20), dump_dir.c_str(),
+                    dump_skipped);
+    }
+    dumping = false;
+}
+
+/// DXGI format of a DDS file for `format`, 0 when there is none (the dump is then .raw).
+u32 DxgiFormat(vk::Format format) {
+    switch (format) {
+    case vk::Format::eBc1RgbaUnormBlock: case vk::Format::eBc1RgbUnormBlock: return 71;
+    case vk::Format::eBc1RgbaSrgbBlock: case vk::Format::eBc1RgbSrgbBlock: return 72;
+    case vk::Format::eBc2UnormBlock: return 74;
+    case vk::Format::eBc2SrgbBlock: return 75;
+    case vk::Format::eBc3UnormBlock: return 77;
+    case vk::Format::eBc3SrgbBlock: return 78;
+    case vk::Format::eBc4UnormBlock: return 80;
+    case vk::Format::eBc4SnormBlock: return 81;
+    case vk::Format::eBc5UnormBlock: return 83;
+    case vk::Format::eBc5SnormBlock: return 84;
+    case vk::Format::eBc6HUfloatBlock: return 95;
+    case vk::Format::eBc6HSfloatBlock: return 96;
+    case vk::Format::eBc7UnormBlock: return 98;
+    case vk::Format::eBc7SrgbBlock: return 99;
+    case vk::Format::eR8G8B8A8Unorm: return 28;
+    case vk::Format::eR8G8B8A8Srgb: return 29;
+    case vk::Format::eB8G8R8A8Unorm: return 87;
+    case vk::Format::eB8G8R8A8Srgb: return 91;
+    case vk::Format::eA2B10G10R10UnormPack32: return 24;
+    case vk::Format::eB10G11R11UfloatPack32: return 26;
+    case vk::Format::eR16G16B16A16Sfloat: return 10;
+    case vk::Format::eR16G16B16A16Unorm: return 11;
+    case vk::Format::eR8G8Unorm: return 49;
+    case vk::Format::eR8Unorm: return 61;
+    case vk::Format::eR16Sfloat: return 54;
+    case vk::Format::eR16Unorm: return 56;
+    case vk::Format::eR32Sfloat: return 41;
+    default: return 0;
+    }
+}
+
+/// A DDS file (DX10 header) with one 2D mip, or the bare data when `dxgi` is 0.
+void WriteTexture(const std::string& path, u32 dxgi, u32 width, u32 height, const void* data,
+                  u64 size) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        return;
+    }
+    if (dxgi) {
+        u32 header[1 + 31 + 5]{};
+        header[0] = 0x20534444;     // "DDS "
+        header[1] = 124;            // dwSize
+        header[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000; // caps, height, width, pixel format, linear size
+        header[3] = height;
+        header[4] = width;
+        header[5] = static_cast<u32>(size);
+        header[7] = 1;              // mips
+        header[19] = 32;            // pixel format: size
+        header[20] = 0x4;           // DDPF_FOURCC
+        header[21] = 0x30315844;    // "DX10"
+        header[27] = 0x1000;        // DDSCAPS_TEXTURE
+        header[32] = dxgi;
+        header[33] = 3;             // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+        header[35] = 1;             // array size
+        std::fwrite(header, sizeof(header), 1, f);
+    }
+    std::fwrite(data, 1, size, f);
+    std::fclose(f);
+}
+
+/// Copies mip 0 of `image` (`size` bytes) into a host buffer after the commands recorded so
+/// far and writes it to `path` once the GPU is done (same steps as Runtime::DownloadImage).
+bool SaveImage(Runtime& runtime, VideoCore::Image& image, u64 size, const std::string& path) {
+    const vk::Format format = image.info.pixel_format;
+    const u32 width = image.info.size.width, height = image.info.size.height;
+    const Instance& instance = runtime.GetInstance();
+    const VkBufferCreateInfo buffer_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo allocation_info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation,
+                        &allocation_info) != VK_SUCCESS) {
+        return false;
+    }
+
+    Scheduler& scheduler = runtime.GetScheduler();
+    scheduler.EndRendering();
+    if (runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead)) {
+        runtime.FlushBarriers();
+    }
+    const vk::BufferImageCopy region{
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {width, height, 1},
+    };
+    scheduler.Record([src = image.GetImage(), dst = vk::Buffer(buffer),
+                      region](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImageToBuffer(src, vk::ImageLayout::eTransferSrcOptimal, dst, region);
+        const vk::MemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+    });
+
+    const u32 dxgi = DxgiFormat(format);
+    scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), buffer, allocation,
+                                      allocation_info, size, dxgi, width, height, path] {
+        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        WriteTexture(path, dxgi, width, height, allocation_info.pMappedData, size);
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    });
+    return true;
+}
+
 void Write(VAddr presented) {
-    const char* dir = std::getenv("BB_CAPTURE_DIR");
+    const char* env_dir = std::getenv("BB_CAPTURE_DIR");
+    const std::string out_dir = dumping ? dump_dir : env_dir ? env_dir : ".";
+    const char* dir = out_dir.c_str();
     const std::string path =
-        std::format("{}/frame_{}.txt", dir ? dir : ".", static_cast<long long>(std::time(nullptr)));
+        std::format("{}/frame_{}.txt", dir, static_cast<long long>(std::time(nullptr)));
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) {
         std::printf("Frame capture: cannot write %s\n", path.c_str());
@@ -201,9 +363,13 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
             pending_buffers.clear();
             pass_open = false;
             record_start_flip = now;
+            if (dump_requested.load(std::memory_order_acquire)) {
+                StartDump();
+            }
             state.store(Recording, std::memory_order_release);
         } else if (state.load(std::memory_order_relaxed) == Recording && now >= record_start_flip + 2) {
             Write(last_presented.load(std::memory_order_relaxed));
+            EndDump();
             entries.clear();
             pending_sampled.clear();
             pending_buffers.clear();
@@ -288,7 +454,7 @@ void FrameCapture::Buffer(u64 stage_hash, u32 slot, VAddr address, const void* d
 }
 
 void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage) {
-    if (pending_sampled.size() < 64) {
+    if (pending_sampled.size() < 256) {
         pending_sampled.emplace_back(ToTarget(info), storage);
     }
 }
@@ -296,6 +462,148 @@ void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage) {
 void FrameCapture::Note(const char* text) {
     if (!entries.empty()) {
         entries.back().note += text;
+    }
+}
+
+void FrameCapture::ArmTextureDump() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_TEXTURE_DUMP");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || state.load(std::memory_order_acquire) != Idle) {
+        return;
+    }
+    dump_requested.store(true, std::memory_order_release);
+    state.store(Armed, std::memory_order_release);
+    std::printf("Texture dump: armed (F10)\n");
+}
+
+void FrameCapture::DumpTexture(Runtime& runtime, VideoCore::Image& image) {
+    if (!dumping || state.load(std::memory_order_relaxed) != Recording) {
+        return;
+    }
+    // Textures the game loaded; render targets, depth and multisampled images are left out.
+    const auto& info = image.info;
+    if (info.props.is_depth || info.num_samples > 1 || image.usage.render_target ||
+        image.usage.depth_target || image.usage.vo_surface || image.binding.is_target ||
+        image.scene_proxy || image.backing->num_samples != 1 ||
+        !(image.usage_flags & vk::ImageUsageFlagBits::eTransferSrc)) {
+        return;
+    }
+    const Target target = ToTarget(info);
+    if (std::ranges::find(dumped, target) != dumped.end()) {
+        return;
+    }
+    dumped.push_back(target);
+    const vk::Format format = info.pixel_format;
+    const u32 block_size = vk::blockSize(format);
+    const auto block = vk::blockExtent(format);
+    const u32 width = info.size.width, height = info.size.height;
+    const u64 size = block_size ? u64((width + block[0] - 1) / block[0]) *
+                                      ((height + block[1] - 1) / block[1]) * block_size
+                                : 0;
+    if (size == 0 || size > (64ull << 20) || dump_bytes + size > (2048ull << 20)) {
+        ++dump_skipped;
+        return;
+    }
+    dump_bytes += size;
+    const u8* guest = reinterpret_cast<const u8*>(info.guest_address);
+    const auto& mip = info.mips_layout[0];
+    // The guest data hash of mip 0 names the texture for a later replacement.
+    const u64 hash = guest && mip.size ? XXH3_64bits(guest + mip.offset, mip.size) : 0;
+    std::string name = vk::to_string(format);
+    std::erase(name, ' ');
+    const std::string path =
+        std::format("{}/{:04}_{:016x}_{:x}_{}x{}_{}.{}", dump_dir, dumped.size() - 1, hash,
+                    info.guest_address, width, height, name, DxgiFormat(format) ? "dds" : "raw");
+    if (!SaveImage(runtime, image, size, path)) {
+        ++dump_skipped;
+    }
+}
+
+bool FrameCapture::CollectingIcons() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_ICON_COLLECT");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void FrameCapture::CollectIcon(Runtime& runtime, VideoCore::Image& image) {
+    const auto& info = image.info;
+    const vk::Format format = info.pixel_format;
+    bool uncompressed = false; // icon sheets (U2), but also the font cache that changes all the time
+    switch (format) {
+    case vk::Format::eBc1RgbaUnormBlock:
+    case vk::Format::eBc1RgbaSrgbBlock:
+    case vk::Format::eBc3UnormBlock:
+    case vk::Format::eBc3SrgbBlock:
+    case vk::Format::eBc4UnormBlock:
+    case vk::Format::eBc7UnormBlock:
+    case vk::Format::eBc7SrgbBlock:
+        break;
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+        uncompressed = true;
+        break;
+    default:
+        return; // the frame's own images
+    }
+    const u32 width = info.size.width, height = info.size.height;
+    const u8* guest = reinterpret_cast<const u8*>(info.guest_address);
+    const auto& mip = info.mips_layout[0];
+    if (width < 32 || height < 32 || width > 1024 || height > 1024 || !guest || !mip.size ||
+        image.usage.render_target || image.binding.is_target || image.backing->num_samples != 1 ||
+        !(image.usage_flags & vk::ImageUsageFlagBits::eTransferSrc)) {
+        return;
+    }
+    // GPU thread only. Pictures are hashed at every use: one slot can show different prompts
+    // over time (a handful of small pictures per frame). An uncompressed slot is saved at most 4
+    // times: a sheet can be seen empty before the game fills it, and the font cache changes all
+    // the time.
+    static std::vector<u64> saved;
+    static std::vector<std::pair<Target, u32>> uncompressed_slots;
+    const u64 hash = XXH3_64bits(guest + mip.offset, mip.size);
+    if (saved.size() >= 500 || std::ranges::find(saved, hash) != saved.end()) {
+        return;
+    }
+    if (uncompressed) {
+        const Target target = ToTarget(info);
+        auto it = std::ranges::find(uncompressed_slots, target, &std::pair<Target, u32>::first);
+        if (it == uncompressed_slots.end()) {
+            if (uncompressed_slots.size() >= 64) {
+                return;
+            }
+            it = uncompressed_slots.insert(uncompressed_slots.end(), {target, 0});
+        }
+        if (it->second >= 4) {
+            return;
+        }
+        ++it->second;
+    }
+    saved.push_back(hash);
+    static const std::string dir = [] {
+        const char* user = std::getenv("BB_GPU_USER_DIR");
+        const std::string path = std::format("{}/button_icons", user && user[0] ? user : "user");
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        return path;
+    }();
+    std::string name = vk::to_string(format);
+    std::erase(name, ' ');
+    const std::string path =
+        std::format("{}/{:016x}_{}x{}_{}.dds", dir, hash, width, height, name);
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        return;
+    }
+    const auto block = vk::blockExtent(format);
+    const u64 size = u64((width + block[0] - 1) / block[0]) * ((height + block[1] - 1) / block[1]) *
+                     vk::blockSize(format);
+    if (SaveImage(runtime, image, size, path)) {
+        std::printf("Button icons: saved %s\n", path.c_str());
     }
 }
 

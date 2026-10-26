@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/assert.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -425,7 +426,9 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
     case AmdGpu::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
     default:
-        UNREACHABLE();
+        // bbport (BilalReloaded): the reserved values come only from garbage T#s (unused resource
+        // table slots: Uncharted 2's treasure effects); they read zero instead of stopping.
+        return vk::ComponentSwizzle::eZero;
     }
 }
 
@@ -786,11 +789,28 @@ vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat
 
 vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
-    bool found =
-        result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
-    ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
-               static_cast<u32>(num_format));
-    return result;
+    if (result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid) {
+        return result;
+    }
+    // bbport (from BilalReloaded's Uncharted port): a format pair no hardware has comes from a
+    // garbage sharp (an unused descriptor slot: Uncharted 2's treasure viewer and pickup effect,
+    // cs 8f067540). The GPU never reads it; the closest valid format of that layout keeps the game
+    // running instead of stopping it.
+    static std::atomic<int> warnings{0};
+    if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Vulkan, "Unknown data_format={} and num_format={}: using a fallback format",
+                    static_cast<u32>(data_format), static_cast<u32>(num_format));
+    }
+    for (const auto fallback : {AmdGpu::NumberFormat::Unorm, AmdGpu::NumberFormat::Uint,
+                                AmdGpu::NumberFormat::Float}) {
+        if (u32(data_format) < 64) {
+            result = surface_format_table[GetSurfaceFormatTableIndex(data_format, fallback)];
+            if (result != vk::Format::eUndefined) {
+                return result;
+            }
+        }
+    }
+    return vk::Format::eR8G8B8A8Unorm;
 }
 
 static constexpr DepthFormatInfo CreateDepthFormatInfo(

@@ -10,7 +10,7 @@
 namespace BbSettings {
 
 enum Upscaler : int { UpscalerOff = 0, UpscalerFsr3 = 1, UpscalerFsr4 = 2, UpscalerFsr411 = 3,
-                      UpscalerTaa = 4, UpscalerDlss = 5, UpscalerCount };
+                      UpscalerTaa = 4, UpscalerDlss = 5, UpscalerXess = 6, UpscalerCount };
 /// FSR 4 v07 or FSR 4.1.1: the same inputs, settings and placement in the frame.
 inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
@@ -28,26 +28,26 @@ struct Effect {
     bool default_on;
 };
 inline constexpr Effect Effects[] = {
-    {"effect_chromatic_aberration", "Хроматическая аберрация", true},
-    {"effect_dof", "Глубина резкости (DoF)", true},
-    {"effect_motion_blur", "Размытие в движении", true},
-    {"effect_ssao", "Затенение SSAO", true},
-    {"effect_game_aa", "Собственное сглаживание игры", true},
-    {"effect_dynamic_shadows", "Тени от динамических источников", true},
-    {"effect_ssr", "Отражения SSR (не было в игре)", false},
-    {"skip_intro", "Пропуск заставок при запуске", false},
-    {"debug_camera", "Свободная камера (Cross + L3)", false},
-    {"debug_menu", "Debug menu (нужны файлы шрифтов)", false},
-    {"cheat_no_death", "Чит: бессмертие (не ниже 1 HP)", false},
-    {"cheat_stealth", "Чит: враги не замечают", false},
-    {"cheat_silent", "Чит: враги не слышат", false},
-    {"cheat_rally_no_decay", "Чит: Rally не угасает", false},
-    {"cheat_enemy_control", "Чит: управление врагом (R3 / L3)", false},
-    {"tweak_no_rally", "Без Rally (возврата HP)", false},
-    {"tweak_camera_distance", "Камера дальше", false},
-    {"tweak_no_camera_rotation", "Без автоповорота камеры", false},
-    {"tweak_easy_run", "Бег с меньшим наклоном стика", false},
-    {"tweak_ragdoll", "Физика тел как в Dark Souls", false},
+    {"effect_chromatic_aberration", "Chromatic aberration", true},
+    {"effect_dof", "Depth of field (DoF)", true},
+    {"effect_motion_blur", "Motion blur", true},
+    {"effect_ssao", "Ambient occlusion (SSAO)", true},
+    {"effect_game_aa", "Game's own anti-aliasing", true},
+    {"effect_dynamic_shadows", "Dynamic light shadows", true},
+    {"effect_ssr", "SSR reflections (not in the original)", false},
+    {"skip_intro", "Skip intro videos", false},
+    {"debug_camera", "Free camera (Cross + L3)", false},
+    {"debug_menu", "Debug menu (needs font files)", false},
+    {"cheat_no_death", "Cheat: no death (never below 1 HP)", false},
+    {"cheat_stealth", "Cheat: enemies don't see you", false},
+    {"cheat_silent", "Cheat: enemies don't hear you", false},
+    {"cheat_rally_no_decay", "Cheat: Rally doesn't decay", false},
+    {"cheat_enemy_control", "Cheat: control an enemy (R3 / L3)", false},
+    {"tweak_no_rally", "No Rally (HP regain)", false},
+    {"tweak_camera_distance", "Camera further away", false},
+    {"tweak_no_camera_rotation", "No camera auto-rotation", false},
+    {"tweak_easy_run", "Run with less stick tilt", false},
+    {"tweak_ragdoll", "Dark Souls-style ragdolls", false},
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Live output resolutions: the upscaler's output and the UI host targets.
@@ -101,6 +101,9 @@ struct Values {
     /// DLSS (bbport_dlss.dll, NVIDIA RTX) is ready, or why not (null before the device exists).
     std::atomic<bool> dlss_supported{false};
     std::atomic<const char*> dlss_problem{nullptr};
+    /// Intel XeSS (libxess.dll) is ready, or why not (null before the device exists).
+    std::atomic<bool> xess_supported{false};
+    std::atomic<const char*> xess_problem{nullptr};
     /// Frame generation: provider and output frames per game frame (2 = one generated frame,
     /// up to 4 with DLSS on RTX 50). dlssg_max_multiplier: 1 without DLSS Frame Generation.
     std::atomic<int> frame_gen{FrameGenOff};
@@ -128,6 +131,8 @@ void Load();
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
 /// After device creation: DLSS availability; a DLSS setting falls back to FSR 3.1 without it.
 void ConfigureDlssSupport(bool available, const char* problem);
+/// Same for Intel XeSS (libxess.dll).
+void ConfigureXessSupport(bool available, const char* problem);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
 int RenderPreset();
@@ -142,5 +147,11 @@ float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 const char* FrameGenName(int frame_gen);
+
+/// Whether FSR 3.1 has been seen rendering correctly on this driver (a VkDriverId value).
+/// Nothing is on the list yet, so every driver gets the warning: on RADV PHOENIX (Mesa
+/// 26.2.0-devel, Legion Go, 2026-10-18) FSR 3.1 turned gameplay into noise with nothing in
+/// the log. Add a driver here once a play test on it has been looked at.
+bool FsrDriverValidated(unsigned driver_id);
 
 } // namespace BbSettings

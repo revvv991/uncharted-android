@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Experimental, an early preview (version 0.2.4).** Tested on one device so far (Retroid Pocket G2).
+> **Experimental, an early preview (version 0.2.5).** Tested on one device so far (Retroid Pocket G2).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -48,7 +48,7 @@ at 1280x720.
 ## Repository layout
 
 - The root is the port: upstream uncharted_pc with our work on top, one commit per release
-  (base: uncharted_pc 0.3.6).
+  (base: uncharted_pc 0.3.9).
   The upstream README is kept as [README.uncharted_pc.md](README.uncharted_pc.md).
 - [`android/`](android/): the Android part. Build scripts, the APK and its launcher, device tools,
   the patches for FEX and Mesa.
@@ -70,7 +70,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.2.4.apk` from
+1. Install the APK (`uncharted-android-0.2.5.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
@@ -121,6 +121,9 @@ documentation was written by Claude.
 - [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo: the port this is built on.
 - [bbport / bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) by deadinside28: the native
   port uncharted_pc grew from.
+- [uncharted_Linux](https://github.com/spacepepperoni/uncharted_Linux) by spacepepperoni and its
+  contributors: fixes taken from it (the texture cache, the draw scheduler, the frame limiter,
+  failures that no longer stop the game; the change list names its commits).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4): the renderer and the shader recompiler.
 - [FEX-Emu](https://github.com/FEX-Emu/FEX): FEXCore.
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (Turnip) and

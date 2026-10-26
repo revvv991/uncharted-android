@@ -59,6 +59,11 @@ public:
         return *pipeline;
     }
 
+    /// g2-arm64 (from uncharted_Linux 45963a2): false when the driver could not create it.
+    bool IsValid() const noexcept {
+        return static_cast<bool>(pipeline);
+    }
+
     vk::PipelineLayout GetLayout() const noexcept {
         return *pipeline_layout;
     }

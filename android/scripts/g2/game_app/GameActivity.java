@@ -125,6 +125,13 @@ public class GameActivity extends SDLActivity {
             Os.setenv("BB_VELOCITY_PS", "f4b18264", false);
             Os.setenv("BB_UPSCALE_BEFORE_CS", "aec539f0", false);
             Os.setenv("BB_HUDLESS_PS", "484cdbf5", false);
+            // The sun shadow pass rebuilds positions from the jittered depth: jittered with it,
+            // or its shadows flicker under FSR 3.1 / TAA (upstream 0.3.9's run.py).
+            Os.setenv("BB_JITTER_PS", "f614041e", false);
+            // The games' own PlayStation buttons in their prompts: upstream's automatic choice
+            // shows keyboard keys until a controller is used, and the touch gamepad is none.
+            // BB_BUTTON_PROMPTS=xbox (or auto) in More environment picks another style.
+            Os.setenv("BB_BUTTON_PROMPTS", "0", false);
             // Extracted native libraries: hook libraries and custom Vulkan drivers for
             // libadrenotools (BB_VK_DRIVER=libvulkan_freedreno.so selects Turnip).
             Os.setenv("BB_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);

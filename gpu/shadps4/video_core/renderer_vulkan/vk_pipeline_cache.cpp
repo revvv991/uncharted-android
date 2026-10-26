@@ -4,13 +4,20 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <filesystem>
+#include <csetjmp>
+#include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <ranges>
 #include <string>
 #include <unordered_set>
 
+#include "bbport_threads.h"
 #include "common/hash.h"
+#include "common/thread.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
@@ -36,6 +43,8 @@ using Shader::Output;
 using Shader::SwStage;
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
+
+static PipelineCache* g_exit_pipeline_cache = nullptr;
 
 constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
@@ -231,7 +240,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = sel.cs ? *sel.cs : liverpool->GetCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -352,41 +361,293 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    WarmUp();
-
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+    // bbport: the driver's own pipeline cache lives on disk beside the shader blobs, so a second
+    // run does not have the driver compile the same pipelines again. The stored pipelines are
+    // preloaded by StartWarmUp once the rasterizer is ready.
+    if (const char* env = std::getenv("BB_PREP_COMPILE")) {
+        worker_compile = env[0] != '0';
+    }
+    std::vector<char> initial_data;
+    if (EmulatorSettings.IsPipelineCacheEnabled()) {
+        auto& db = Storage::DataBase::Instance();
+        db.SetDeviceTag(fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID()));
+        db.Open();
+        // Not warm until StartWarmUp has run and finished: nothing may select pipelines before.
+        warm_done.store(false, std::memory_order_release);
+        if (!db.Directory().empty()) {
+            driver_cache_path = db.Directory() / "vulkan_driver.vkc";
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(driver_cache_path, ec);
+            if (!ec && size > 0 && size < (u64(1) << 30)) {
+                std::ifstream file{driver_cache_path, std::ios::binary};
+                initial_data.resize(size);
+                if (!file.read(initial_data.data(), std::streamsize(size))) {
+                    initial_data.clear();
+                }
+                // The blob is the driver's own. One written by another GPU or driver version (the
+                // header, VkPipelineCacheHeaderVersionOne, names the device and driver) is not
+                // handed over: the spec asks drivers to ignore it, but Intel's Windows driver
+                // crashes on a blob from NVIDIA (igc64.dll, a read of 0x30) instead.
+                if (!initial_data.empty() && !DriverCacheHeaderMatches(initial_data)) {
+                    LOG_INFO(Render_Vulkan,
+                             "Driver pipeline cache is from another GPU or driver version: not used");
+                    initial_data.clear();
+                }
+            }
+        }
+    }
+    vk::PipelineCacheCreateInfo cache_info{
+        .initialDataSize = initial_data.size(),
+        .pInitialData = initial_data.empty() ? nullptr : initial_data.data(),
+    };
+    auto created = instance.GetDevice().createPipelineCacheUnique(cache_info);
+    if (created.result != vk::Result::eSuccess && !initial_data.empty()) {
+        initial_data.clear();
+        created = instance.GetDevice().createPipelineCacheUnique({});
+    }
+    ASSERT_MSG(created.result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+               vk::to_string(created.result));
+    pipeline_cache = std::move(created.value);
+    driver_cache_loaded_size = DriverCacheSize();
+    if (!driver_cache_path.empty()) {
+        driver_cache_saver = std::jthread([this](std::stop_token stop) { DriverCacheSaver(stop); });
+    }
+    g_exit_pipeline_cache = this;
 }
 
-PipelineCache::~PipelineCache() = default;
+bool PipelineCache::DriverCacheHeaderMatches(const std::vector<char>& data) const {
+    // VkPipelineCacheHeaderVersionOne: headerSize, headerVersion, vendorID, deviceID, UUID.
+    constexpr size_t HeaderSize = 16 + VK_UUID_SIZE;
+    if (data.size() < HeaderSize) {
+        return false;
+    }
+    u32 header[4]{};
+    std::memcpy(header, data.data(), sizeof(header));
+    const auto uuid = instance.GetPipelineCacheUUID();
+    return header[0] >= HeaderSize && header[1] == u32(vk::PipelineCacheHeaderVersion::eOne) &&
+           header[2] == instance.GetVendorID() && header[3] == instance.GetDeviceID() &&
+           std::memcmp(data.data() + 16, uuid.data(), VK_UUID_SIZE) == 0;
+}
+
+PipelineCache::~PipelineCache() {
+    g_exit_pipeline_cache = nullptr;
+    if (warm_thread.joinable()) {
+        warm_thread.join();
+    }
+}
+
+size_t PipelineCache::DriverCacheSize() {
+    size_t size = 0;
+    if (pipeline_cache && instance.GetDevice().getPipelineCacheData(*pipeline_cache, &size,
+                                                                   nullptr) != vk::Result::eSuccess) {
+        return 0;
+    }
+    return size;
+}
+
+/// Writes the driver's pipeline cache beside the shader blobs (temp file, then rename).
+void PipelineCache::SaveDriverCache() {
+    if (driver_cache_path.empty() || !pipeline_cache) {
+        return;
+    }
+    std::scoped_lock lock{driver_cache_mutex};
+    driver_cache_dirty.store(0);
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty()) {
+        return;
+    }
+    auto temp = driver_cache_path;
+    temp += ".tmp";
+    {
+        std::ofstream file{temp, std::ios::binary | std::ios::trunc};
+        if (!file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()))) {
+            return;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, driver_cache_path, ec);
+}
+
+void PipelineCache::DriverCacheSaver(std::stop_token stop) {
+    Common::SetCurrentThreadName("bb:PipelineCacheSave");
+    BbThreads::MakeBelowNormal();
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    while (!stop.stop_requested()) {
+        {
+            std::unique_lock lock{mutex};
+            cv.wait_for(lock, stop, std::chrono::seconds(20), [] { return false; });
+        }
+        if (stop.stop_requested()) {
+            break;
+        }
+        if (driver_cache_dirty.load() != 0 && IsWarm()) {
+            SaveDriverCache();
+        }
+    }
+}
+
+void PipelineCache::SaveForExit() {
+    Storage::DataBase::Instance().Flush(3000);
+    if (driver_cache_dirty.load() != 0 && IsWarm()) {
+        SaveDriverCache();
+    }
+}
+
+void FlushPipelineCacheForExit() {
+    if (auto* cache = g_exit_pipeline_cache) {
+        cache->SaveForExit();
+    }
+}
 
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
+static std::atomic<s64> g_last_compile_ms{-1000000};
+static s64 NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+bool PipelineCache::CompilingRecently() {
+    return NowMs() - g_last_compile_ms.load(std::memory_order_relaxed) < 1000;
+}
 namespace {
+/// BB_COMPILE_LOG=1 prints one line per compile (kind, ms, thread, whether it ran on the GPU thread).
 struct CompileTimer {
+    const char* kind;
+    u64 id;
+    u32 extra;
+    bool worker;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    CompileTimer(const char* kind_, u64 id_ = 0, u32 extra_ = 0)
+        : kind{kind_}, id{id_}, extra{extra_}, worker{std::strstr(kind_, "-w") != nullptr} {
+        g_last_compile_ms.store(NowMs(), std::memory_order_relaxed);
+    }
     ~CompileTimer() {
-        g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now() - start)
-                                   .count());
-        ++g_bb_compiles;
+        const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+        // The frame statistics count what the GPU thread itself spent (workers: kind "...-w").
+        if (!worker) {
+            g_bb_compile_ns += ns;
+            ++g_bb_compiles;
+        }
+        g_last_compile_ms.store(NowMs(), std::memory_order_relaxed);
+        static const bool log = std::getenv("BB_COMPILE_LOG") != nullptr;
+        if (log) {
+            std::printf("Compile: %s %016llx %u %.2f ms\n", kind,
+                        static_cast<unsigned long long>(id), extra, double(ns) / 1e6);
+        }
     }
 };
 } // namespace
 
 bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
+    if (!IsWarm()) {
+        return false;
+    }
     // Tessellation stages read constant buffers from memory at selection time: not prepared.
     if (worker_sel.regs->stage_enable.hs_en) {
         return false;
     }
-    return RefreshGraphicsKey(worker_sel) && !worker_sel.worker->failed;
+    auto& worker = *worker_sel.worker;
+    worker.compile = worker_compile;
+    if (!RefreshGraphicsKey(worker_sel) || worker.failed) {
+        return false;
+    }
+    if (worker.compile) {
+        EnsureWorkerPipeline(worker_sel);
+    }
+    return true;
+}
+
+/// bbport: a draw-preparation worker builds the pipeline of the draw it prepares when it does
+/// not exist yet, so the GPU thread finds it (or waits for the worker's compile instead of
+/// repeating it). The stages keep pointing at the programs' own Infos, which the GPU thread
+/// refreshes per draw; the worker's copies only serve the construction.
+void PipelineCache::EnsureWorkerPipeline(PipelineSelection& worker_sel) {
+    auto& worker = *worker_sel.worker;
+    // Without dynamic vertex input the constructor reads the vertex buffers' sharps.
+    if (!instance.IsVertexInputDynamicState()) {
+        return;
+    }
+    const auto& key = worker_sel.graphics_key;
+    {
+        std::shared_lock lock{pipelines_mutex};
+        if (graphics_pipelines.contains(key)) {
+            return;
+        }
+    }
+    std::array<const Shader::Info*, MaxShaderStages> program_infos{};
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (!worker_sel.infos[i]) {
+            continue;
+        }
+        for (const auto& [program, info] : worker.infos) {
+            if (&info == worker_sel.infos[i]) {
+                program_infos[i] = &program->info;
+                break;
+            }
+        }
+        if (!program_infos[i]) {
+            return;
+        }
+    }
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
+    const u64 claim_id = pipeline_hash ^ PipelineClaimTag;
+    BbThreads::ScopedNormalPriority boost; // the GPU thread may wait for this claim
+    AcquireClaim(claim_id);
+    {
+        std::shared_lock lock{pipelines_mutex};
+        if (graphics_pipelines.contains(key)) {
+            ReleaseClaim(claim_id);
+            return;
+        }
+    }
+    // A guest buffer the worker reads may be unmapped by now: the draw is left to the GPU thread.
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        ReleaseClaim(claim_id);
+        worker.failed = true;
+        return;
+    }
+    runtime_fault_recover = &recover;
+    {
+        CompileTimer timer{"gpipe-w", pipeline_hash, key.motion_vectors};
+        GraphicsPipeline::SerializationSupport sdata{};
+        auto pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, key, *pipeline_cache, worker_sel.infos,
+            worker_sel.runtime_infos, worker_sel.fetch_shader, worker_sel.modules, sdata, false);
+        // g2-arm64 (from uncharted_Linux 45963a2): one the driver could not create stays an
+        // empty entry (its draws skipped, not compiled again) and is not saved.
+        if (!pipeline->IsValid()) {
+            std::unique_lock lock{pipelines_mutex};
+            graphics_pipelines.try_emplace(key, nullptr);
+            runtime_fault_recover = nullptr;
+            ReleaseClaim(claim_id);
+            return;
+        }
+        pipeline->RebindStages(program_infos);
+        RegisterPipelineData(key, pipeline_hash, sdata);
+        num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
+        driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock lock{pipelines_mutex};
+        if (EmulatorSettings.IsShaderCollect()) {
+            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+                if (worker_sel.infos[stage]) {
+                    module_related_pipelines[worker_sel.modules[stage]].emplace_back(key);
+                }
+            }
+        }
+        graphics_pipelines.emplace(key, std::move(pipeline));
+    }
+    runtime_fault_recover = nullptr;
+    ReleaseClaim(claim_id);
 }
 
 const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& prepared) {
-    if (prepared.state.load(std::memory_order_acquire) != PreparedDraw::Ready ||
+    if (prepared.state.load(std::memory_order_acquire) != PreparedDraw::Ready || !IsWarm() ||
         prepared.reg_checksum != liverpool->gfx_reg_checksum) {
         return nullptr;
     }
@@ -414,12 +675,14 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
             return nullptr;
         }
     }
+    std::shared_lock lock{pipelines_mutex};
     const auto it = graphics_pipelines.find(prepared.key);
     return it != graphics_pipelines.end() ? it->second.get() : nullptr;
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared) {
+    EnsureWarm();
     used_prepared = nullptr;
     if (prepared) {
         if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
@@ -431,20 +694,52 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey(sel)) {
         return nullptr;
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
-    if (is_new) {
-        const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
-        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
+    {
+        std::shared_lock lock{pipelines_mutex};
+        const auto it = graphics_pipelines.find(sel.graphics_key);
+        if (it != graphics_pipelines.end()) {
+            return it->second.get();
+        }
+    }
+    // A draw-preparation worker may be building it right now: wait for that instead of
+    // repeating the compile.
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
+    const u64 claim_id = pipeline_hash ^ PipelineClaimTag;
+    AcquireClaim(claim_id);
+    {
+        std::shared_lock lock{pipelines_mutex};
+        const auto it = graphics_pipelines.find(sel.graphics_key);
+        if (it != graphics_pipelines.end()) {
+            ReleaseClaim(claim_id);
+            return it->second.get();
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+    CompileTimer timer{"gpipe", pipeline_hash, sel.graphics_key.motion_vectors};
 
-        GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+    GraphicsPipeline::SerializationSupport sdata{};
+    auto pipeline = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
+        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+    // g2-arm64 (from uncharted_Linux 45963a2): one the driver could not create stays an empty
+    // entry (its draws skipped, not compiled again on every draw) and is not saved.
+    if (!pipeline->IsValid()) {
+        {
+            std::unique_lock lock{pipelines_mutex};
+            graphics_pipelines.try_emplace(sel.graphics_key, nullptr);
+        }
+        ReleaseClaim(claim_id);
+        sel.fetch_shader.reset();
+        return nullptr;
+    }
 
-        RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
+    RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+    num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
+    driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
 
+    const GraphicsPipeline* result = nullptr;
+    {
+        std::unique_lock lock{pipelines_mutex};
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
                 if (sel.infos[stage]) {
@@ -453,9 +748,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 }
             }
         }
-        sel.fetch_shader.reset();
+        // The preload may have inserted the same one meanwhile: keep that.
+        result = graphics_pipelines.try_emplace(sel.graphics_key, std::move(pipeline))
+                     .first->second.get();
     }
-    return it->second.get();
+    ReleaseClaim(claim_id);
+    sel.fetch_shader.reset();
+    return result;
 }
 
 u32 PipelineCache::CsSplitRequest(u64 hash, const AmdGpu::ComputeProgram& cs_pgm) {
@@ -497,28 +796,150 @@ u32 PipelineCache::CsSplitRequest(u64 hash, const AmdGpu::ComputeProgram& cs_pgm
 
 const ComputePipeline* PipelineCache::GetComputePipeline(bool direct) {
     compute_direct = direct;
+    EnsureWarm();
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
-    if (is_new) {
-        const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
-        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
+    {
+        std::shared_lock lock{pipelines_mutex};
+        const auto it = compute_pipelines.find(compute_key);
+        if (it != compute_pipelines.end()) {
+            return it->second.get();
+        }
+    }
+    // A draw-preparation worker may be building it right now: wait for that instead of
+    // repeating the compile.
+    const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+    const u64 claim_id = pipeline_hash ^ PipelineClaimTag;
+    AcquireClaim(claim_id);
+    {
+        std::shared_lock lock{pipelines_mutex};
+        const auto it = compute_pipelines.find(compute_key);
+        if (it != compute_pipelines.end()) {
+            ReleaseClaim(claim_id);
+            return it->second.get();
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+    CompileTimer timer{"cpipe", pipeline_hash, u32(liverpool->CurrentQueueId())};
 
-        ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *sel.infos[0],
-                                                       sel.modules[0], sdata, false);
-        RegisterPipelineData(compute_key, sdata);
-        ++num_new_pipelines;
+    ComputePipeline::SerializationSupport sdata{};
+    auto pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                      *pipeline_cache, compute_key, *sel.infos[0],
+                                                      sel.modules[0], sdata, false);
+    // g2-arm64 (from uncharted_Linux 45963a2): as for graphics pipelines, kept empty, not saved.
+    if (!pipeline->IsValid()) {
+        {
+            std::unique_lock lock{pipelines_mutex};
+            compute_pipelines.try_emplace(compute_key, nullptr);
+        }
+        ReleaseClaim(claim_id);
+        return nullptr;
+    }
+    RegisterPipelineData(compute_key, sdata);
+    num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
+    driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
 
+    const ComputePipeline* result = nullptr;
+    {
+        std::unique_lock lock{pipelines_mutex};
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = sel.modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
+        // The preload may have inserted the same one meanwhile: keep that.
+        result = compute_pipelines.try_emplace(compute_key, std::move(pipeline)).first->second.get();
     }
-    return it->second.get();
+    ReleaseClaim(claim_id);
+    return result;
+}
+
+/// bbport: a draw-preparation worker translates the compute program a dispatch will run and builds
+/// its pipeline, like EnsureWorkerPipeline does for draws; the GPU thread then finds both.
+void PipelineCache::PrepareComputePipeline(PipelineSelection& worker_sel) {
+    if (!IsWarm() || !worker_sel.cs || !worker_sel.worker) {
+        return;
+    }
+    auto& worker = *worker_sel.worker;
+    worker.compile = worker_compile;
+    if (!worker.compile) {
+        return;
+    }
+    worker.stages.clear();
+    worker.failed = false;
+    // The program's code is read from guest memory, which may be reused by now.
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = nullptr;
+        return;
+    }
+    runtime_fault_recover = &recover;
+    const auto& cs_pgm = *worker_sel.cs;
+    if (!cs_pgm.Address<u32*>()) {
+        runtime_fault_recover = nullptr;
+        return;
+    }
+    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    runtime_fault_recover = nullptr;
+    Shader::Backend::Bindings binding{};
+    ComputePipelineKey key{};
+    std::tie(worker_sel.infos[0], worker_sel.modules[0], worker_sel.fetch_shader, key.value) =
+        GetProgram(worker_sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
+    if (worker.failed || !worker_sel.infos[0] || worker.stages.empty()) {
+        return;
+    }
+    const Program* program = worker.stages.back().program;
+    {
+        std::shared_lock lock{pipelines_mutex};
+        if (compute_pipelines.contains(key)) {
+            return;
+        }
+    }
+    const auto pipeline_hash = std::hash<ComputePipelineKey>{}(key);
+    const u64 claim_id = pipeline_hash ^ PipelineClaimTag;
+    BbThreads::ScopedNormalPriority boost; // the GPU thread may wait for this claim
+    AcquireClaim(claim_id);
+    {
+        std::shared_lock lock{pipelines_mutex};
+        if (compute_pipelines.contains(key)) {
+            ReleaseClaim(claim_id);
+            return;
+        }
+    }
+    // The sharps of the program's buffers are read from guest memory.
+    sigjmp_buf recover_build;
+    if (sigsetjmp(recover_build, 0)) {
+        runtime_fault_recover = nullptr;
+        ReleaseClaim(claim_id);
+        return;
+    }
+    runtime_fault_recover = &recover_build;
+    {
+        CompileTimer timer{"cpipe-w", pipeline_hash, u32(liverpool->CurrentQueueId())};
+        ComputePipeline::SerializationSupport sdata{};
+        auto pipeline = std::make_unique<ComputePipeline>(
+            instance, scheduler, desc_heap, profile, *pipeline_cache, key, *worker_sel.infos[0],
+            worker_sel.modules[0], sdata, false);
+        // g2-arm64 (from uncharted_Linux 45963a2): kept empty, not saved (see above).
+        if (!pipeline->IsValid()) {
+            std::unique_lock lock{pipelines_mutex};
+            compute_pipelines.try_emplace(key, nullptr);
+            runtime_fault_recover = nullptr;
+            ReleaseClaim(claim_id);
+            return;
+        }
+        pipeline->RebindStage(&program->info);
+        RegisterPipelineData(key, sdata);
+        num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
+        driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock lock{pipelines_mutex};
+        if (EmulatorSettings.IsShaderCollect()) {
+            module_related_pipelines[worker_sel.modules[0]].emplace_back(key);
+        }
+        compute_pipelines.try_emplace(key, std::move(pipeline));
+    }
+    runtime_fault_recover = nullptr;
+    ReleaseClaim(claim_id);
 }
 
 bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
@@ -809,6 +1230,20 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     }
 
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
+    // g2-arm64 (from uncharted_Linux 055fac6): a draw whose vertex buffer table pointer is
+    // null (Bloodborne, before a crash at the cutscene after Rom) has no vertex input to
+    // build: skipped.
+    if (vs_info && sel.fetch_shader) {
+        for (const auto& attrib : sel.fetch_shader->attributes) {
+            if (vs_info->UdPointerNull(attrib.sgpr_base)) {
+                static std::atomic<u32> reported{0};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 5) {
+                    std::printf("GPU: draw skipped: its vertex buffer table pointer is null\n");
+                }
+                return false;
+            }
+        }
+    }
     if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
@@ -838,13 +1273,18 @@ bool PipelineCache::RefreshComputeKey() {
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding,
+                                              Shader::Pools& translate_pools) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
-    CompileTimer timer;
+    CompileTimer timer{&translate_pools == &pools ? "shader" : "shader-w", info.pgm_hash, u32(perm_idx) | (u32(info.hw_stage) << 16) | ((info.hw_stage == HwStage::Vertex && runtime_info.hw.vs.motion_vectors) ||
+                                    (info.hw_stage == HwStage::Fragment && runtime_info.hw.fs.motion_vectors)
+                                ? 0x80000000u
+                                : 0u)};
 
-    const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const auto ir_program =
+        Shader::TranslateProgram(code, translate_pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
@@ -872,73 +1312,163 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+void PipelineCache::AcquireClaim(u64 id) {
+    std::unique_lock lock{claim_mutex};
+    if (claims.contains(id)) {
+        // Somebody else is building it: the time spent waiting is a stall of the caller.
+        const auto start = std::chrono::steady_clock::now();
+        while (!claim_cv.wait_for(lock, std::chrono::seconds(1),
+                                  [&] { return !claims.contains(id); })) {
+            std::printf("Claim wait: %016llx held for over %lld ms (%s thread)\n",
+                        static_cast<unsigned long long>(id),
+                        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                   std::chrono::steady_clock::now() - start)
+                                                   .count()),
+                        BbThreads::IsBackground() ? "worker" : "GPU");
+        }
+        const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+        if (!BbThreads::IsBackground()) {
+            g_bb_compile_ns += ns;
+        }
+        static const bool log = std::getenv("BB_COMPILE_LOG") != nullptr;
+        if (log && ns > 200000) {
+            std::printf("Compile: wait%s %016llx 0 %.2f ms\n", BbThreads::IsBackground() ? "-w" : "",
+                        static_cast<unsigned long long>(id), double(ns) / 1e6);
+        }
+    }
+    claims.insert(id);
+}
+
+void PipelineCache::ReleaseClaim(u64 id) {
+    {
+        std::scoped_lock lock{claim_mutex};
+        claims.erase(id);
+    }
+    claim_cv.notify_all();
+}
+
+Program* PipelineCache::FindProgram(u64 hash) {
+    std::shared_lock lock{programs_mutex};
+    const auto it = program_cache.find(hash);
+    return it != program_cache.end() ? it.value().get() : nullptr;
+}
+
+/// Translates a program seen for the first time (permutation 0) and publishes it. The caller
+/// holds the program's claim; `binding` is not advanced.
+PipelineCache::NewProgram PipelineCache::CreateProgram(HwStage hw_stage, SwStage sw_stage,
+                                                       const Shader::ShaderParams& params,
+                                                       Shader::RuntimeInfo& runtime_info,
+                                                       Shader::Backend::Bindings& binding,
+                                                       Shader::Pools& translate_pools) {
+    auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
+    auto start = binding;
+    const auto module = CompileModule(new_program->info, runtime_info, params.code, 0, binding,
+                                      translate_pools);
+    auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
+    const auto perm_hash = HashCombine(params.hash, 0);
+
+    RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
+    NewProgram result{nullptr, module, spec.fetch_shader_data, perm_hash};
+    new_program->AddPermut(module, std::move(spec));
+    new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
+    result.program = new_program.get();
+    std::unique_lock lock{programs_mutex};
+    program_cache.emplace(params.hash, std::move(new_program));
+    return result;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage hw_stage,
                                                 SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
     if (sel.worker) {
-        // bbport: draw-preparation worker: look up only, with the worker's own Info copy.
+        // bbport: draw-preparation worker, with the worker's own Info copy. A program or
+        // permutation that does not exist yet is translated here (the GPU thread then finds
+        // it ready) when the worker may compile; otherwise the draw is left to the GPU thread.
         auto& worker = *sel.worker;
-        std::shared_lock lk{programs_mutex};
-        const auto found_program = program_cache.find(params.hash);
-        if (found_program == program_cache.end() || !found_program->second->info_template) {
-            worker.failed = true;
-            return {};
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const Program* program = nullptr;
+            {
+                std::shared_lock lk{programs_mutex};
+                const auto found_program = program_cache.find(params.hash);
+                if (found_program != program_cache.end() && found_program->second->info_template) {
+                    program = found_program->second.get();
+                }
+            }
+            if (!program) {
+                if (!worker.compile || !WorkerTranslate(worker, hw_stage, sw_stage, params,
+                                                        runtime_info, binding, nullptr)) {
+                    worker.failed = true;
+                    return {};
+                }
+                continue;
+            }
+            auto [it_info, new_info] = worker.infos.try_emplace(program, *program->info_template);
+            auto& info = it_info->second;
+            info.pgm_base = params.Base();
+            info.user_data = params.user_data;
+            // The walk of resource tables and the fetch shader parse read guest memory through
+            // pointers in the registers; ahead of the GPU thread that memory may already be
+            // reused. A fault returns here (runtime_fault_recover) and the draw is left to the
+            // GPU thread. A jump out of the specialization leaks its partial allocations (rare).
+            sigjmp_buf recover;
+            if (sigsetjmp(recover, 0)) {
+                worker.failed = true;
+                return {};
+            }
+            runtime_fault_recover = &recover;
+            info.RefreshFlatBuf();
+            auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            runtime_fault_recover = nullptr;
+            size_t perm_idx = 0;
+            vk::ShaderModule module{};
+            std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+            bool found = false;
+            {
+                std::shared_lock lk{programs_mutex};
+                const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+                if (it != program->modules.end()) {
+                    found = true;
+                    perm_idx = std::distance(program->modules.begin(), it);
+                    module = it->module;
+                    fetch_shader = it->spec.fetch_shader_data;
+                }
+            }
+            if (!found) {
+                if (!worker.compile || !WorkerTranslate(worker, hw_stage, sw_stage, params,
+                                                        runtime_info, binding, &spec)) {
+                    worker.failed = true;
+                    return {};
+                }
+                continue;
+            }
+            info.AddBindings(binding);
+            worker.stages.push_back(
+                {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
+            return std::make_tuple(&info, module, fetch_shader,
+                                   HashCombine(params.hash, perm_idx));
         }
-        const Program* program = found_program->second.get();
-        auto [it_info, new_info] = worker.infos.try_emplace(program, *program->info_template);
-        auto& info = it_info->second;
-        info.pgm_base = params.Base();
-        info.user_data = params.user_data;
-        // The walk of resource tables and the fetch shader parse read guest memory through
-        // pointers in the registers; ahead of the GPU thread that memory may already be
-        // reused. A fault returns here (runtime_fault_recover) and the draw is left to the GPU
-        // thread. A jump out of the specialization leaks its partial allocations (rare).
-        sigjmp_buf recover;
-        if (sigsetjmp(recover, 0)) {
-            worker.failed = true;
-            return {};
-        }
-        runtime_fault_recover = &recover;
-        info.RefreshFlatBuf();
-        auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
-        runtime_fault_recover = nullptr;
-        const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-        if (it == program->modules.end()) {
-            worker.failed = true;
-            return {};
-        }
-        info.AddBindings(binding);
-        const size_t perm_idx = std::distance(program->modules.begin(), it);
-        worker.stages.push_back(
-            {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
-        return std::make_tuple(&info, it->module, it->spec.fetch_shader_data,
-                               HashCombine(params.hash, perm_idx));
+        worker.failed = true;
+        return {};
     }
 
-    auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
-    if (it_pgm == program_cache.end()) {
-        auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
-        auto start = binding;
-        const auto module =
-            CompileModule(new_program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
-
-        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        new_program->AddPermut(module, std::move(spec));
-        new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
-        Program* program = new_program.get();
-        {
-            std::unique_lock lk{programs_mutex};
-            program_cache.emplace(params.hash, std::move(new_program));
+    Program* program = FindProgram(params.hash);
+    if (!program) {
+        AcquireClaim(params.hash);
+        program = FindProgram(params.hash);
+        if (!program) {
+            const auto created = CreateProgram(hw_stage, sw_stage, params, runtime_info, binding,
+                                               pools);
+            ReleaseClaim(params.hash);
+            return std::make_tuple(&created.program->info, created.module, created.fetch_shader,
+                                   created.perm_hash);
         }
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        ReleaseClaim(params.hash);
     }
 
-    auto& program = it_pgm.value();
     if (!program->info_template) {
         // Programs loaded by the pipeline cache warm-up get their template on first use.
         std::unique_lock lk{programs_mutex};
@@ -950,39 +1480,109 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.RefreshFlatBuf();
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
-    size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
-
+    size_t perm_idx = 0;
     vk::ShaderModule module{};
-
-    // bbport: consecutive draws of a program almost always use the same permutation.
-    auto it = program->last_used < program->modules.size() &&
-                      program->modules[program->last_used].spec == spec
-                  ? program->modules.begin() + program->last_used
-                  : std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it != program->modules.end()) {
-        program->last_used = std::distance(program->modules.begin(), it);
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+    bool found = false;
+    {
+        std::shared_lock lk{programs_mutex};
+        // bbport: consecutive draws of a program almost always use the same permutation.
+        auto it = program->last_used < program->modules.size() &&
+                          program->modules[program->last_used].spec == spec
+                      ? program->modules.begin() + program->last_used
+                      : std::ranges::find(program->modules, spec, &Program::Module::spec);
+        if (it != program->modules.end()) {
+            found = true;
+            program->last_used = std::distance(program->modules.begin(), it);
+            perm_idx = program->last_used;
+            module = it->module;
+            fetch_shader = it->spec.fetch_shader_data;
+        }
     }
-    if (it == program->modules.end()) {
-        auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+    if (!found) {
+        AcquireClaim(params.hash);
+        {
+            std::shared_lock lk{programs_mutex};
+            const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+            if (it != program->modules.end()) {
+                found = true;
+                perm_idx = std::distance(program->modules.begin(), it);
+                module = it->module;
+                fetch_shader = it->spec.fetch_shader_data;
+            }
+        }
+        if (!found) {
+            // Only the holder of the claim appends, so the size is the new permutation's index.
+            perm_idx = program->modules.size();
+            const u64 perm_hash = HashCombine(params.hash, perm_idx);
+            auto new_info = Shader::Info(hw_stage, sw_stage, params);
+            module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding, pools);
+            fetch_shader = spec.fetch_shader_data;
 
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        std::unique_lock lk{programs_mutex};
-        program->AddPermut(module, std::move(spec));
-    } else {
-        info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+            std::unique_lock lk{programs_mutex};
+            program->AddPermut(module, std::move(spec));
+            ReleaseClaim(params.hash);
+            return std::make_tuple(&program->info, module, fetch_shader, perm_hash);
+        }
+        ReleaseClaim(params.hash);
     }
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    info.AddBindings(binding);
+    return std::make_tuple(&program->info, module, fetch_shader, HashCombine(params.hash, perm_idx));
+}
+
+/// bbport: a draw-preparation worker translates a missing program (`spec` null) or permutation
+/// of `params` for the GPU thread to find. The worker's copy of the Info supplies the specialization.
+bool PipelineCache::WorkerTranslate(PrepWorker& worker, HwStage hw_stage, SwStage sw_stage,
+                                    const Shader::ShaderParams& params,
+                                    Shader::RuntimeInfo& runtime_info,
+                                    const Shader::Backend::Bindings& binding,
+                                    Shader::StageSpecialization* spec) {
+    if (!worker.pools) {
+        worker.pools = std::make_unique<Shader::Pools>();
+    }
+    BbThreads::ScopedNormalPriority boost; // the GPU thread may wait for this claim
+    sigjmp_buf recover;
+    AcquireClaim(params.hash);
+    if (sigsetjmp(recover, 0)) {
+        ReleaseClaim(params.hash);
+        return false;
+    }
+    runtime_fault_recover = &recover;
+    auto local_binding = binding; // the lookup that follows advances the real one
+    Program* program = FindProgram(params.hash);
+    if (!program) {
+        CreateProgram(hw_stage, sw_stage, params, runtime_info, local_binding, *worker.pools);
+    } else if (spec) {
+        bool exists = false;
+        {
+            std::shared_lock lk{programs_mutex};
+            exists = std::ranges::find(program->modules, *spec, &Program::Module::spec) !=
+                     program->modules.end();
+        }
+        if (!exists) {
+            const size_t perm_idx = program->modules.size();
+            const u64 perm_hash = HashCombine(params.hash, perm_idx);
+            auto new_info = Shader::Info(hw_stage, sw_stage, params);
+            const auto module = CompileModule(new_info, runtime_info, params.code, perm_idx,
+                                              local_binding, *worker.pools);
+            const auto& info = worker.infos.at(program);
+            RegisterShaderMeta(info, spec->fetch_shader_data, *spec, perm_hash, perm_idx);
+            std::unique_lock lk{programs_mutex};
+            Shader::StageSpecialization stored{*spec};
+            stored.info = &program->info;
+            program->AddPermut(module, std::move(stored));
+        }
+    }
+    runtime_fault_recover = nullptr;
+    ReleaseClaim(params.hash);
+    return true;
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
     std::optional<vk::ShaderModule> new_module{};
+    std::scoped_lock replace_lock{programs_mutex, pipelines_mutex};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
             if (m.module == module) {

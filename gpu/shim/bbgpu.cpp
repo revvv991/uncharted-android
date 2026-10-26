@@ -33,6 +33,7 @@
 #include "core/signals.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/button_prompts.h"
 
 extern "C" {
 // runtime_memory.c
@@ -251,6 +252,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         std::printf("Window closed (close button, Alt+F4 or system quit request)\n");
         std::fflush(stdout);
+        Vulkan::FlushPipelineCacheForExit();
         std::_Exit(0);
     });
     g_window_thread.detach();
@@ -382,6 +384,18 @@ u32 ConsumeGameOnlyScreenshotRequests() { return 0; }
 u32 ConsumeWithOverlaysScreenshotRequests() { return 0; }
 ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 } // namespace VideoCore
+
+extern "C" void bbgpu_prompts_controller(int device) {
+    VideoCore::ButtonPrompts::SetDevice(device);
+}
+
+extern "C" void bbgpu_trophy_notify(int grade, const char* game, const char* name, const void* png,
+                                    uint64_t png_size) {
+    const auto* bytes = static_cast<const unsigned char*>(png);
+    BbOverlay::NotifyTrophy(grade, game ? game : "", name ? name : "",
+                            bytes && png_size ? std::vector<unsigned char>(bytes, bytes + png_size)
+                                              : std::vector<unsigned char>());
+}
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;

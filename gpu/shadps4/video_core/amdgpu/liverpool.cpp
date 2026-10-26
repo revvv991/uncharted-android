@@ -29,6 +29,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/landing_gate.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -629,6 +630,8 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = reinterpret_cast<const EopTask*>(data)->eop;
     const u64 seq = reinterpret_cast<const EopTask*>(data)->seq;
+    // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
     rasterizer.ProcessDownloadImages();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
@@ -648,6 +651,9 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     if (readback.second) {
         rasterizer.GetBufferCache().ReadMemory(readback.first, readback.second, false, true);
     }
+    // bbport: small buffers compute shaders wrote since the last event (see
+    // Rasterizer::NoteSmallWrittenBuffers): the game reads them from guest memory.
+    rasterizer.ReadBackSmallWrittenBuffers();
     // Guest memory copies on the copy threads precede the fence the guest sees.
     // BB_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
     // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
@@ -657,6 +663,7 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return env && env[0] == '1';
     }();
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
+        VideoCore::LandingGate::Wait(landing_seq);
         BbCopy::AfterCopies([eop, seq] {
             SignalEop(eop);
             FenceWritten(seq);
@@ -664,14 +671,17 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
-        rasterizer.SignalAfterHostCopies([eop, seq] {
-            SignalEop(eop);
-            FenceWritten(seq);
-        });
+        rasterizer.SignalAfterHostCopies(
+            [eop, seq] {
+                SignalEop(eop);
+                FenceWritten(seq);
+            },
+            landing_seq);
     } else {
         // Labels are written in order: not before the ones deferred to the recording thread.
         rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
+        VideoCore::LandingGate::Wait(landing_seq);
         SignalEop(eop);
         FenceWritten(seq);
     }
@@ -695,18 +705,23 @@ void SignalAscReleaseMem(const AscReleaseMem& release) {
 
 void RunAscReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto release = *reinterpret_cast<const AscReleaseMem*>(data);
+    // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
     rasterizer.ProcessDownloadImages();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
     if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // As end-of-pipe fences: written after the copies queued before it.
-        rasterizer.SignalAfterHostCopies([release] {
-            SignalAscReleaseMem(release);
-            FenceWritten(release.seq);
-        });
+        rasterizer.SignalAfterHostCopies(
+            [release] {
+                SignalAscReleaseMem(release);
+                FenceWritten(release.seq);
+            },
+            landing_seq);
     } else {
         rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
+        VideoCore::LandingGate::Wait(landing_seq);
         SignalAscReleaseMem(release);
         FenceWritten(release.seq);
     }
@@ -795,9 +810,23 @@ void NoteTaskStep(u32 step, u64 begin_ns, u64 end_ns) {
 }
 
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
+    // Raycaster copies deferred before the flip land before the guest hears of it (the labels
+    // before it wait for them as well, landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
+    if (VideoCore::LandingGate::Active() && Vulkan::DrawPipe::OnStageB() &&
+        !BbToggle::Disabled(BbToggle::RecorderFences)) {
+        // Behind the deferred fences, which the interrupt must not overtake, without waiting.
+        rasterizer.OnGuestFlip();
+        rasterizer.GetBufferCache().CheckStableBindings();
+        rasterizer.CheckConstants();
+        rasterizer.SignalAfterHostCopies(
+            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); }, landing_seq);
+        return;
+    }
     const bool steps = TaskStepsOn();
     const u64 t0 = steps ? SteadyNs() : 0;
     rasterizer.WaitDeferredSignals();
+    VideoCore::LandingGate::Wait(landing_seq);
     const u64 t1 = steps ? SteadyNs() : 0;
     rasterizer.OnGuestFlip();
     rasterizer.GetBufferCache().CheckStableBindings();
@@ -830,6 +859,7 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitHostCopies();
     const u64 t1 = steps ? SteadyNs() : 0;
     rasterizer.WaitDeferredSignals();
+    VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
     const u64 t2 = steps ? SteadyNs() : 0;
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
@@ -869,15 +899,22 @@ bool EosDeferred() {
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = reinterpret_cast<const EosTask*>(data)->eos;
     const u64 eos_seq = reinterpret_cast<const EosTask*>(data)->seq;
-    if (event_eos.command != PM4CmdEventWriteEos::Command::GdsStore && EosDeferred() &&
-        Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
+    // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
+    // While copies wait to land (LandingGate::Active) the label goes in order with the other
+    // deferred fences also with BB_EOS_DEFERRED=0: a label written at once would overtake them.
+    if (event_eos.command != PM4CmdEventWriteEos::Command::GdsStore &&
+        (EosDeferred() || VideoCore::LandingGate::Active()) && Vulkan::DrawPipe::OnStageB() &&
+        !BbToggle::Disabled(BbToggle::RecorderFences)) {
         rasterizer.ProcessDownloadImages();
         rasterizer.GetBufferCache().CheckStableBindings();
         rasterizer.CheckConstants();
-        rasterizer.SignalAfterHostCopies([eos = event_eos, eos_seq] {
-            SignalEos(eos);
-            FenceWritten(eos_seq);
-        });
+        rasterizer.SignalAfterHostCopies(
+            [eos = event_eos, eos_seq] {
+                SignalEos(eos);
+                FenceWritten(eos_seq);
+            },
+            landing_seq);
         return;
     }
     // Copies deferred to the recording thread precede writes the guest sees.
@@ -886,6 +923,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.ProcessDownloadImages();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
+    VideoCore::LandingGate::Wait(landing_seq);
     SignalEos(event_eos);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
@@ -1038,6 +1076,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // The nested task's coroutine frame is ours to free (final_suspend keeps it); without
+            // this the host heap grew by one frame per indirect buffer for the whole session.
+            task.handle.destroy();
             break;
         }
         default:
@@ -1060,6 +1101,21 @@ u64 Liverpool::HashRegisterPacket(u64 checksum, const u32* words, u32 count) {
         checksum ^= checksum >> 29;
     }
     return checksum;
+}
+
+void Liverpool::ApplyComputeRegisterPacket(ComputeProgram& cs, const PM4Header* header) {
+    if (header->type3.opcode != PM4ItOpcode::SetShReg) {
+        return;
+    }
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (header->type3.NumWords() - 1) * sizeof(u32);
+    if (set_data->reg_offset >= 0x200 &&
+        set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4) &&
+        set_size <= sizeof(ComputeProgram) &&
+        (set_data->reg_offset - 0x200) * sizeof(u32) + set_size <= sizeof(ComputeProgram)) {
+        std::memcpy(reinterpret_cast<u32*>(&cs) + (set_data->reg_offset - 0x200), header + 2,
+                    set_size);
+    }
 }
 
 void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,
@@ -1294,7 +1350,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     Vulkan::DrawPreparation* draw_prep =
         seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
     if (draw_prep) {
-        draw_prep->BeginSubmission(seq, regs, gfx_reg_checksum);
+        draw_prep->BeginSubmission(seq, regs, gfx_reg_checksum, mapped_queues[GfxQueueId].cs_state);
     }
     static const bool dcb_stats = EmulatorSettingsImpl::Flag("BB_DCB_STATS", false);
     const int dcb_depth = g_dcb_depth;
@@ -1323,12 +1379,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
         case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+            // g2-arm64 (from uncharted_Linux b3411eb, after parsifal295's PR #57): a garbage
+            // dword read as a packet header (a command buffer the game was already reusing:
+            // "Unimplemented PM4 type 0 ... size: 15810") stopped the whole game. The rest of
+            // this buffer is dropped instead; the loop ends normally, so the submission's
+            // cleanup below still runs.
+            if (static int reported = 0; reported < 16) {
+                ++reported;
+                LOG_WARNING(Render, "PM4 header {:#010x} (type {}) at +{:#x}: rest of the buffer "
+                                    "dropped",
+                            header->raw, type, reinterpret_cast<uintptr_t>(dcb.data()) - base_addr);
+            }
+            dcb = {};
+            continue;
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -2279,6 +2343,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->WaitHostCopies();
                 rasterizer->WaitDeferredSignals();
+                VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
             }
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
@@ -2343,6 +2408,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->WaitHostCopies();
                 rasterizer->WaitDeferredSignals();
+                VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
                 rasterizer->GetBufferCache().CheckStableBindings();
                 rasterizer->CheckConstants();
             }

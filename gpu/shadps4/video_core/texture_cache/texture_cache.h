@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "bbport_toggles.h"
@@ -111,6 +112,10 @@ public:
     /// whole_range (bbport): the GPU wrote exactly [address, address + max_size), so every image
     /// overlapping it is dirty, not only one starting at the address (copies moving textures).
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_range = false);
+
+    /// bbport: after the button prompts switched between the game's pictures, the keyboard's and
+    /// Xbox, the button prompt pictures are uploaded again (button_prompts.h). GPU thread, once per submission.
+    void UpdateButtonPrompts();
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -383,6 +388,7 @@ private:
     void UntrackImageTail(ImageId image_id);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
+    static u64 MaybeDirtyHash(const Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
@@ -416,8 +422,13 @@ private:
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 registered_image_bytes = 0; ///< bbport: guest bytes of registered images (diagnostics)
+    bool tight_budget = false;                  ///< bbport: card under ~5 GB
+    std::atomic<u64> pending_free_bytes{0};     ///< bbport: deleted, not yet destroyed
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};
+    /// g2-arm64 (from uncharted_Linux 0680e7c): gc_tick at each of the last 64 seconds.
+    std::array<u64, 64> gc_tick_at_second{};
+    u64 gc_second = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
@@ -454,6 +465,7 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    u32 button_prompt_switches = 0;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

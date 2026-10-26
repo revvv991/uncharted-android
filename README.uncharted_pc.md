@@ -17,15 +17,22 @@ code runs directly on your PC and the graphics are translated to Vulkan. Unpack 
 
 - All three games from one launcher: Drake's Fortune, Among Thieves and Drake's Deception.
 - 60 FPS like on PS4, or 120 FPS (higher rates are experimental).
+- Render resolution above 1080p (up to 3200x1800) and ultrawide aspect ratios: the games draw a real larger or wider picture, set in the launcher.
 - Anti-aliasing with TAA, AMD FSR 3.1, AMD FSR 4 or NVIDIA DLSS (DLAA).
 - Frame generation: AMD FSR 3 (any GPU) or NVIDIA DLSS (RTX 40 2x, RTX 50 up to 4x).
 - Keyboard, mouse and controller together, all remappable. Mouse look in U3.
+- Stereo, 5.1 or 7.1 sound: the games are told the real speaker layout (it follows the Windows setting, or pick it in the launcher).
+- Trophies: the games' own trophy lists in the launcher, and a notice in the game when you earn one.
+- Button prompts for keyboard and mouse, Xbox or PlayStation controllers; controller vibration settings.
+- Cheats page (infinite health and ammo per game), launcher languages, your own covers and Steam art.
+- A Fixes page for fixes that cost speed: Automatic turns each one on only where it helps.
 - Add to Steam and desktop shortcuts from the launcher, automatic updates.
 
 ## Requirements
 
 - Windows 10 (1903 or later) or Windows 11, 64-bit.
-- An Intel Core 4th generation (Haswell) or newer, an AMD Ryzen, or an AMD FX.
+- An Intel Core 3rd generation (Ivy Bridge) or newer, an AMD Ryzen, or an AMD FX. Older Intel CPUs
+  with AVX (Core 2nd and 3rd generation, Xeon E3 v1/v2): experimental, see Known problems.
 - A graphics card with Vulkan 1.3 and a current driver, with **6 GB of video memory or more**.
   4 GB cards (GTX 1650, RX 570) run out of video memory and crash after a while; on those, keep
   Anti-aliasing and Frame generation off.
@@ -37,8 +44,8 @@ code runs directly on your PC and the graphics are translated to Vulkan. Unpack 
   the game could freeze and close with "GPU crash: the graphics device was lost". It came from
   the speed fix for that area and is fixed in 0.3. If it still happens to you, set Frame rate to
   60 on the Display page and open an issue with your `user\last_run.log`.
-- **Uncharted 3:** green or black shapes flash for a single frame on some characters (Sully's
-  shirt in Cartagena). It happens in shadPS4 too, so it's a shader translation problem. Not fixed yet.
+- **Uncharted 3:** green or black shapes flashing on Sully's shirt in Cartagena: the cloth
+  solvers raced on NVIDIA's 32-lane groups. Fixed in 0.3.9 with BilalReloaded's fix.
 - **Crash with "ASSERTION: GetRenderFrameParams(frameToFreeInstancesFor)->m_gfxEopTick"**
   (mostly U1 after the first cutscene): the game expected the GPU side to be done with a frame it
   wanted to reuse, and stopped when it wasn't yet (shaders building on a first run). Fixed in
@@ -51,8 +58,10 @@ code runs directly on your PC and the graphics are translated to Vulkan. Unpack 
 - **Uncharted 2 loading crashes** (`ReadSync file (req/read: ...)`, white textures then
   `iSubMesh < m_numSubMeshInstances`): file reads could come back cut short. Fixed in 0.3.5.
 - **Older CPUs:** the games use instructions of the PS4's processor (AVX, BMI1, MOVBE, LZCNT).
-  AMD FX runs since 0.3.6 (its missing MOVBE is emulated, a bit slower). Intel Core 3rd generation
-  and older can't run the games yet; the game says so instead of crashing with 0xc000001d.
+  Since 0.3.7 they are rewritten on CPUs that lack them, so Intel Core 3rd generation (Ivy Bridge)
+  runs, as does AMD FX. Sandy Bridge (2nd generation) also lacks F16C and is not supported.
+- **Random crashes with "execute access to 0" or a fault at `0x63f5d0` (U1):** Windows wrote its
+  exception data over values the game keeps just below the stack pointer. Fixed in 0.3.7.
 - **Uncharted 2, train wreck:** `IsFinite(deltaTransform)` in character-leg-ik.cpp, fixed in 0.3.6
   for the EU 1.00 version.
 - Frame rates above 120 are experimental.
@@ -69,10 +78,15 @@ Bloodborne by deadinside28, and on the [shadPS4](https://github.com/shadps4-emu/
 renderer. Video decoding (Videodec2) and the DLSS bridge come from
 [IFreemz/shadPS4-Bloodborne-DLSS-FSR](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR).
 Thanks to Mindro for the shadPS4 Uncharted build that showed which problems to look for.
+Several fixes come from BilalReloaded's
+[Uncharted port](https://github.com/bc160201983/Uncharted-The-Nathan-Drake-Collection-PC-port)
+(GPL v2): the Uncharted 3 cloth solver barriers (Sully's shirt), guest memory committed as the
+game allocates it (error 1450), the Uncharted 3 look-at reset and the garbage descriptor fixes.
 
 Also used: [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK (FSR),
 FSR 4 assets from [FireBurn/Q2RTX](https://github.com/FireBurn/Q2RTX), the
 [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) (`nvngx_dlss.dll` under NVIDIA's license),
+[Intel XeSS SDK](https://github.com/intel/xess) (`libxess.dll` under Intel's license),
 [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [SDL3](https://github.com/libsdl-org/SDL),
 [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui),
 [sirit](https://github.com/shadps4-emu/sirit), [magic_enum](https://github.com/Neargye/magic_enum),

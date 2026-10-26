@@ -9,6 +9,11 @@
 #include "video_utils.h"
 #include "videodec_error.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+
 #include "common/support/avdec.h"
 
 #include <atomic>
@@ -44,6 +49,17 @@ VdecStageTimes TakeVdecStageTimes() {
             g_convert_ns.exchange(0) / 1e9, g_copy_ns.exchange(0) / 1e9};
 }
 
+// The games read the chroma plane after luma rows padded to 64 (1088 for 1080p; 1472 for 1440p).
+static constexpr u32 kHeightAlignment = 64;
+
+// Frames fitted into a game display size (BB_GAME_RES) use the display's own row length (3440 for
+// 3440x1440), which the games take as the pitch of the movie planes; others the usual 64.
+static u32 PitchAlignment() {
+    s32 w = 0, h = 0;
+    GameResolution(w, h);
+    return w ? 16 : 64;
+}
+
 VdecDecoder::VdecDecoder(const OrbisVideodec2DecoderConfigInfo& config_info,
                          const OrbisVideodec2DecoderMemoryInfo& memory_info) {
     const AVCodec* codec = avcodec_find_decoder(
@@ -75,16 +91,12 @@ VdecDecoder::VdecDecoder(const OrbisVideodec2DecoderConfigInfo& config_info,
 VdecDecoder::~VdecDecoder() {
     avcodec_free_context(&m_codec_context);
     sws_freeContext(m_sws_context);
+    sws_freeContext(m_fit_context);
     av_frame_free(&m_nv12_frame);
 }
 
 
 namespace {
-/// bbport: luma plane height alignment of the frames handed to the game. Uncharted's movie player
-/// finds the chroma plane at width * AlignUp(height, 64) (movie-rendering, 01.02 @0x8fb8be), the
-/// decoder put it at AlignUp(height, 16): the same for 1080p, not for e.g. 720p.
-constexpr u32 FrameHeightAlign = 64;
-
 /// BB_VDEC_SIZE=<w>x<h>: hand every frame to the game scaled to this size. Uncharted's movie
 /// player sizes its frames from the display configuration (the output size), which a resolution
 /// patch lowers, while its movies are 1080p.
@@ -382,20 +394,21 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& input_data,
         av_frame_free(&frame);
         frame = nv12_frame;
     }
+    frame = FitToDisplay(frame);
 
     const bool is_avc = m_codec_context->codec_id == AV_CODEC_ID_H264;
     const u64 info_size =
         is_avc ? sizeof(OrbisVideodec2AvcPictureInfo) : sizeof(OrbisVideodec2HevcPictureInfo);
     const u64 copy_start = NowNs();
     Videodec::CopyNV12Data((u8*)frame_buffer.frame_buffer,
-                           frame_buffer.frame_buffer_size - info_size, *frame, FrameHeightAlign);
+                           frame_buffer.frame_buffer_size - info_size, *frame, kHeightAlignment, PitchAlignment());
     g_convert_ns += copy_start - convert_start;
     g_copy_ns += NowNs() - copy_start;
     frame_buffer.is_accepted = true;
 
     const auto width = Common::AlignUp<u32>(frame->width, 16);
-    const auto pitch = Common::AlignUp<u32>(frame->width, 64);
-    const auto height = Common::AlignUp<u32>(frame->height, FrameHeightAlign);
+    const auto pitch = Common::AlignUp<u32>(frame->width, PitchAlignment());
+    const auto height = Common::AlignUp<u32>(frame->height, kHeightAlignment);
 
     output_info.is_valid = true;
     output_info.is_error_frame = false;
@@ -483,17 +496,18 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frame_buffer,
         av_frame_free(&frame);
         frame = nv12_frame;
     }
+    frame = FitToDisplay(frame);
 
     const bool is_avc = m_codec_context->codec_id == AV_CODEC_ID_H264;
     const u64 info_size =
         is_avc ? sizeof(OrbisVideodec2AvcPictureInfo) : sizeof(OrbisVideodec2HevcPictureInfo);
     Videodec::CopyNV12Data((u8*)frame_buffer.frame_buffer,
-                           frame_buffer.frame_buffer_size - info_size, *frame, FrameHeightAlign);
+                           frame_buffer.frame_buffer_size - info_size, *frame, kHeightAlignment, PitchAlignment());
     frame_buffer.is_accepted = true;
 
     const auto width = Common::AlignUp<u32>(frame->width, 16);
-    const auto pitch = Common::AlignUp<u32>(frame->width, 64);
-    const auto height = Common::AlignUp<u32>(frame->height, FrameHeightAlign);
+    const auto pitch = Common::AlignUp<u32>(frame->width, PitchAlignment());
+    const auto height = Common::AlignUp<u32>(frame->height, kHeightAlignment);
 
     output_info.is_valid = true;
     output_info.is_error_frame = false;
@@ -611,6 +625,65 @@ AVFrame* VdecDecoder::ConvertNV12Frame(AVFrame& frame, s32 width, s32 height,
         return nullptr;
     }
     return reference;
+}
+
+void GameResolution(s32& width, s32& height) {
+    static s32 w = -1, h = 0;
+    if (w < 0) {
+        w = 0;
+        unsigned pw = 0, ph = 0;
+        if (const char* res = std::getenv("BB_GAME_RES");
+            res && std::sscanf(res, "%ux%u", &pw, &ph) == 2 && pw >= 640 && ph >= 360 &&
+            !(pw == 1920 && ph == 1080)) {
+            w = static_cast<s32>(pw & ~1u);
+            h = static_cast<s32>(ph & ~1u);
+        }
+    }
+    width = w;
+    height = h;
+}
+
+AVFrame* VdecDecoder::FitToDisplay(AVFrame* frame) {
+    s32 target_w = 0, target_h = 0;
+    GameResolution(target_w, target_h);
+    if (!target_w || !frame || frame->format != AV_PIX_FMT_NV12 ||
+        (frame->width == target_w && frame->height == target_h)) {
+        return frame;
+    }
+    AVFrame* canvas = av_frame_alloc();
+    canvas->format = AV_PIX_FMT_NV12;
+    canvas->width = target_w;
+    canvas->height = target_h;
+    canvas->pts = frame->pts;
+    canvas->pkt_dts = frame->pkt_dts < 0 ? 0 : frame->pkt_dts;
+    canvas->opaque = frame->opaque;
+    if (av_frame_get_buffer(canvas, 0) < 0) {
+        av_frame_free(&canvas);
+        return frame;
+    }
+    for (s32 y = 0; y < target_h; ++y) {
+        std::memset(canvas->data[0] + y * canvas->linesize[0], 16, target_w);
+    }
+    for (s32 y = 0; y < target_h / 2; ++y) {
+        std::memset(canvas->data[1] + y * canvas->linesize[1], 128, target_w);
+    }
+    // Fit inside the canvas keeping the movie's shape (even sizes: 4:2:0).
+    const double scale = std::min(static_cast<double>(target_w) / frame->width,
+                                  static_cast<double>(target_h) / frame->height);
+    s32 fit_w = std::min(target_w, static_cast<s32>(frame->width * scale + 0.5) & ~1);
+    s32 fit_h = std::min(target_h, static_cast<s32>(frame->height * scale + 0.5) & ~1);
+    const s32 x0 = ((target_w - fit_w) / 2) & ~1, y0 = ((target_h - fit_h) / 2) & ~1;
+    m_fit_context = sws_getCachedContext(m_fit_context, frame->width, frame->height, AV_PIX_FMT_NV12,
+                                         fit_w, fit_h, AV_PIX_FMT_NV12, SWS_BICUBIC, nullptr,
+                                         nullptr, nullptr);
+    if (m_fit_context) {
+        u8* dst[4] = {canvas->data[0] + y0 * canvas->linesize[0] + x0,
+                      canvas->data[1] + (y0 / 2) * canvas->linesize[1] + x0, nullptr, nullptr};
+        const int dst_stride[4] = {canvas->linesize[0], canvas->linesize[1], 0, 0};
+        sws_scale(m_fit_context, frame->data, frame->linesize, 0, frame->height, dst, dst_stride);
+    }
+    av_frame_free(&frame);
+    return canvas;
 }
 
 } // namespace Libraries::Videodec2

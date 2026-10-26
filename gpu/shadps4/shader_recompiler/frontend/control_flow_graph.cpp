@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
 #include <algorithm>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -183,9 +184,15 @@ void CFG::SplitDivergenceScopes() {
                (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo);
     };
 
+    // Epilogue blocks that continue a scope split at a scalar instruction (see below), with the
+    // index the scope continues after.
+    std::unordered_map<const Block*, s32> continued_scopes;
     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
         auto next_blk = std::next(blk);
         s32 curr_begin = -1;
+        if (const auto it = continued_scopes.find(&*blk); it != continued_scopes.end()) {
+            curr_begin = it->second;
+        }
         for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
             const auto& inst = inst_list[index];
             const bool is_close = is_close_scope(inst);
@@ -209,6 +216,64 @@ void CFG::SplitDivergenceScopes() {
                     s32 curr_end = index;
                     while (IgnoresExecMask(inst_list[curr_end])) {
                         --curr_end;
+                    }
+
+                    // A scalar ALU instruction between exec-masked ones runs for the whole wave,
+                    // whatever EXEC is. Inside the scope only the active threads would see its
+                    // result: a waterfall loop that updates its mask of remaining threads there
+                    // (v_cmpx; v_movreld; s_andn2_b64 s[40:41], s[40:41], s[42:43]; v_movreld)
+                    // ended after one round for the others, which kept the values of other
+                    // threads (Uncharted 3 light shafts). End the scope before such an
+                    // instruction and continue it after, when the instruction reads nothing the
+                    // scope wrote to scalar registers.
+                    const s32 split_at = [&] {
+                        bool scalar_written = false;
+                        for (s32 i = curr_begin; i < curr_end; ++i) {
+                            const auto& scope_inst = inst_list[i];
+                            if (scope_inst.category == InstCategory::ScalarALU) {
+                                if (scalar_written) {
+                                    return -1;
+                                }
+                                for (u32 d = 0; d < scope_inst.dst_count; ++d) {
+                                    const auto field = scope_inst.dst[d].field;
+                                    if (field == OperandField::ExecLo ||
+                                        field == OperandField::ExecHi) {
+                                        return -1;
+                                    }
+                                }
+                                for (u32 s = 0; s < scope_inst.src_count; ++s) {
+                                    const auto field = scope_inst.src[s].field;
+                                    if (field == OperandField::VccLo ||
+                                        field == OperandField::VccHi ||
+                                        field == OperandField::VccZ ||
+                                        field == OperandField::ExecLo ||
+                                        field == OperandField::ExecHi ||
+                                        field == OperandField::ExecZ) {
+                                        return -1;
+                                    }
+                                }
+                                return i;
+                            }
+                            if (IgnoresExecMask(scope_inst)) {
+                                // Lane reads, scalar loads, branches: leave the scope whole.
+                                scalar_written = true;
+                                continue;
+                            }
+                            for (u32 d = 0; d < scope_inst.dst_count; ++d) {
+                                const auto field = scope_inst.dst[d].field;
+                                if (field != OperandField::VectorGPR &&
+                                    field != OperandField::Undefined) {
+                                    scalar_written = true;
+                                }
+                            }
+                        }
+                        return -1;
+                    }();
+                    if (split_at != -1) {
+                        curr_end = split_at - 1;
+                        while (IgnoresExecMask(inst_list[curr_end])) {
+                            --curr_end;
+                        }
                     }
 
                     // Create a new block for the divergence scope.
@@ -235,6 +300,9 @@ void CFG::SplitDivergenceScopes() {
                         epi_block->branch_false = blk->branch_false;
                         epi_block->num_predecessors = 2;
                         blocks.insert_before(next_blk, *epi_block);
+                        if (split_at != -1) {
+                            continued_scopes.emplace(epi_block, curr_end);
+                        }
 
                         // Have divergence block always jump to epilogue block.
                         block->cond = IR::Condition::True;

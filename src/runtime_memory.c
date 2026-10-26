@@ -18,6 +18,7 @@
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -135,11 +136,52 @@ static void region_insert(size_t at, HostRegion r) {
 static void region_erase(size_t at, size_t n) {
     memmove(regions+at,regions+at+n,(region_count-at-n)*sizeof(*regions)); region_count-=n;
 }
+/* Something else lives in the range (a DLL an overlay or an antivirus injects, a heap): the reservation
+ * fails with error 487, and what it is differs from launch to launch ("only sometimes after pressing
+ * play countless times", issue #334). Say what sits there and start the game again, up to 8 times, as
+ * a child process of this one: its exit code is ours. BB_TEST_OCCUPY=1 puts a block in the range on
+ * the first try, to test this. */
+static void reserve_failed(void) {
+    const DWORD error=GetLastError();
+    int listed=0;
+    for (uintptr_t at=USER_MIN; at<USER_MAX && listed<8;) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((void *)at,&m,sizeof(m))) break;
+        if (m.State!=MEM_FREE) {
+            char name[MAX_PATH]="";
+            K32GetMappedFileNameA(GetCurrentProcess(),m.BaseAddress,name,sizeof(name));
+            printf("Runtime: the PS4 address range is not free: %p +0x%zx (%s)\n",m.BaseAddress,(size_t)m.RegionSize,name[0] ? name : "no file");
+            ++listed;
+        }
+        at=(uintptr_t)m.BaseAddress+m.RegionSize;
+    }
+    const char *text=getenv("BB_RESERVE_TRY");
+    const int tries=text ? atoi(text) : 0;
+    if (tries<8) {
+        char number[16];
+        snprintf(number,sizeof(number),"%d",tries+1);
+        SetEnvironmentVariableA("BB_RESERVE_TRY",number);
+        STARTUPINFOA startup={.cb=sizeof(startup)};
+        PROCESS_INFORMATION process;
+        char *line=_strdup(GetCommandLineA());
+        printf("Runtime: starting again (try %d of 8)\n",tries+1);
+        fflush(NULL);
+        if (line && CreateProcessA(NULL,line,NULL,NULL,TRUE,0,NULL,NULL,&startup,&process)) {
+            DWORD code=21;
+            WaitForSingleObject(process.hProcess,INFINITE);
+            GetExitCodeProcess(process.hProcess,&code);
+            exit((int)code);
+        }
+    }
+    SetLastError(error);
+    win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
+}
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
     if (region_count) return;
+    if (getenv("BB_TEST_OCCUPY") && !getenv("BB_RESERVE_TRY")) VirtualAlloc((void *)0x1400000000ull,0x10000,MEM_RESERVE,PAGE_NOACCESS);
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
+        reserve_failed();
     region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
 }
 static void view_map(const HostRegion *r, DWORD protect) {
@@ -231,12 +273,38 @@ static int host_protect(uintptr_t address, uint64_t size, int prot) {
 }
 /* Released pages read as zero when reused, like the memfd's punched holes. */
 static void host_discard(uint64_t phys, uint64_t size) { memset(backing_base+phys,0,size); }
+/* bbport (from BilalReloaded's Uncharted port, GPL v2): the section is only reserved; pages are
+ * committed when the game allocates them (direct allocations, flexible maps), so Windows charges
+ * the commit limit for the ~4.8 GB a game uses, not the whole 6+ GB pool at start. A full commit
+ * made PCs with 16 GB and a small page file fail at start (error 1450) whenever other programs
+ * were open. When the commit limit is reached, Windows grows a system-managed page file a moment
+ * later: retry for up to 10 s. Committed pages stay committed (a section's cannot be decommitted). */
+static int host_commit(uint64_t phys, uint64_t size) {
+    for (int attempt=0;;++attempt) {
+        if (VirtualAlloc(backing_base+phys,size,MEM_COMMIT,PAGE_READWRITE)) {
+            if (attempt) printf("Runtime: committed %" PRIu64 " MiB of guest memory after %d retries (page file grew)\n",size>>20,attempt);
+            return 0;
+        }
+        DWORD error=GetLastError();
+        if (attempt==40 || (error!=ERROR_COMMITMENT_LIMIT && error!=ERROR_NOT_ENOUGH_MEMORY && error!=ERROR_NO_SYSTEM_RESOURCES && error!=ERROR_COMMITMENT_MINIMUM)) {
+            fprintf(stderr,"Runtime: cannot commit %" PRIu64 " MiB of guest memory (error %lu); is the page file large enough?\n",size>>20,error);
+            return -1;
+        }
+        if (!attempt) printf("Runtime: commit limit reached (%" PRIu64 " MiB of guest memory, error %lu): waiting for the page file to grow\n",size>>20,error);
+        /* Not while holding the region table: every GPU upload and tracked-page fault waits on
+         * it. The caller's range is claimed already (block or flexible bits). */
+        int held=exclusive_depth==1;
+        if (held) write_unlock();
+        Sleep(250);
+        if (held) write_lock();
+    }
+}
 /* Direct memory occupies [0,POOL_SIZE) of the section, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (backing_base) return 0;
     runtime_memory_reserve();
     uint64_t bytes=POOL_SIZE+FLEX_SPAN;
-    section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_RESERVE,bytes,NULL,NULL,0);
     if (!section) { fprintf(stderr,"Runtime: cannot create %" PRIu64 " MiB of guest memory (error %lu); is the page file large enough?\n",bytes>>20,GetLastError()); return -1; }
     backing_base=MapViewOfFile3(section,GetCurrentProcess(),NULL,0,bytes,0,PAGE_READWRITE,NULL,0);
     return backing_base ? 0 : -1;
@@ -253,6 +321,7 @@ static int pool(void) {
     return 0;
 }
 void runtime_memory_reserve(void) {}
+static int host_commit(uint64_t phys, uint64_t size) { (void)phys; (void)size; return 0; }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     void *mapped = !reserved
         ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
@@ -330,7 +399,9 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    /* Direct and flexible mappings both sit on the backing pool at a byte offset: the right half
+     * continues from where the left half stops (write_backing and drop_range read phys). */
+    if (right.kind==KIND_DIRECT || right.kind==KIND_FLEXIBLE) right.phys+=a-vmas[i].start;
     vmas[i].end=a;
     return vma_insert(i+1,right);
 }
@@ -415,7 +486,10 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
     uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
-    if ((uint64_t)low >= end || size > end - (uint64_t)low) return NO_SPACE;
+    if ((uint64_t)low >= end || size > end - (uint64_t)low) {
+        printf("Runtime: direct allocation of %" PRIu64 " bytes in [%#" PRIx64 ", %#" PRIx64 ") refused: no space (pool %" PRIu64 " bytes)\n",size,(uint64_t)low,(uint64_t)high,(uint64_t)POOL_SIZE);
+        return NO_SPACE;
+    }
     write_lock();
     if (pool()) { write_unlock(); return NO_MEMORY; }
     uint64_t start = align_up((uint64_t)low, alignment);
@@ -432,7 +506,10 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
         }
         if (!overlap) break;
     }
-    blocks[slot] = (Block){start, size, type, 1}; *out = (int64_t)start;
+    /* Claimed before the commit: host_commit may drop the lock while the page file grows. */
+    blocks[slot] = (Block){start, size, type, 1};
+    if (host_commit(start, size)) { blocks[slot].used = 0; write_unlock(); return NO_MEMORY; }
+    *out = (int64_t)start;
     ++allocations; live_bytes += size;
     write_unlock();
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
@@ -534,6 +611,7 @@ static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int fl
     if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return NO_MEMORY;
     uint64_t phys=flex_alloc(size);
     if (phys==UINT64_MAX) return NO_MEMORY;
+    if (host_commit(phys,size)) { flex_set((phys-POOL_SIZE)/PAGE,size/PAGE,0); return NO_MEMORY; }
     int32_t result=place(inout,size,prot,flags,PAGE,KIND_FLEXIBLE,0,phys);
     if (result) flex_free(phys,size); else ++flexible_maps;
     return result;

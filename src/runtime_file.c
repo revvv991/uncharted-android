@@ -31,7 +31,8 @@ typedef struct stat HostStat;
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define MAX_FILES 1024
-#define MAX_MOUNTS 16
+/* 5 fixed mounts (/app0, /hostapp, /temp0, /download0, /data) + one per save-data slot (16), with room to spare */
+#define MAX_MOUNTS 32
 
 typedef struct { int64_t sec, nsec; } GuestTimespec;
 typedef struct {
@@ -91,6 +92,39 @@ void runtime_file_configure(const char *app0,const char *user) {
         runtime_file_mount(guest,path);
     }
 }
+#ifndef _WIN32
+/* PS4 (and Windows) paths ignore case, Linux's do not: the game asks for
+ * cubemap/train-wreck-a/Train_Wreck_a_07.dds, the dump has train_wreck_a_07.dds. Only when the
+ * exact path is missing, each missing component below the mount (path+root) is matched without
+ * case against its directory. ASCII case folding keeps the length, so the name is fixed in place. */
+static void fix_case(char *path,size_t root) {
+    struct stat s;
+    if (!stat(path,&s)) return;
+    char *p=path+root;
+    while (*p=='/') ++p;
+    while (*p) {
+        char *end=strchr(p,'/');
+        if (end) *end=0;
+        if (stat(path,&s)) {
+            char saved=p[-1];
+            p[-1]=0;
+            DIR *d=opendir(p-1==path ? "/" : path);
+            p[-1]=saved;
+            int found=0;
+            if (d) {
+                struct dirent *e;
+                while ((e=readdir(d))) if (!strcasecmp(e->d_name,p) && strlen(e->d_name)==strlen(p)) {
+                    memcpy(p,e->d_name,strlen(p)); found=1; break;
+                }
+                closedir(d);
+            }
+            if (!found) { if (end) *end='/'; return; }
+        }
+        if (!end) return;
+        *end='/'; p=end+1;
+    }
+}
+#endif
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
@@ -106,10 +140,17 @@ static int translate(const char *guest,char *out,size_t size) {
         if (!strncmp(buffer,mounts[i].guest,n) && (buffer[n]=='/' || !buffer[n]) && n>best) { best=n; m=&mounts[i]; }
     }
     int result=0;
+    size_t root=0;
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
+    else root=strlen(m->host);
     pthread_mutex_unlock(&lock);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
+#ifndef _WIN32
+    if (!result) fix_case(out,root);
+#else
+    (void)root;
+#endif
     return result;
 }
 static int host_flags(int flags) {
@@ -301,6 +342,7 @@ static ssize_t host_write(int h,const void *buffer,uint64_t size) { return write
 /* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
  * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
  * goes through the handler, which unprotects it (and records the upcoming write). */
+#ifdef _WIN32
 static void touch_for_write(void *buffer,uint64_t size) {
     if (!size) return;
     uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
@@ -309,11 +351,37 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+#endif
 /* The GPU side can write-protect a destination page again between touch_for_write and the read;
  * the host then stops short (Windows: no error, fewer bytes) and a short read the guest takes as
  * complete loses data (U2's script module: 16384 of 392775 bytes, issue #101; streamed level
  * data). Files are read until the request is done or the file ends, touching the rest again.
  * offset -1: at the file position. */
+#ifndef _WIN32
+/* Linux: the kernel never raises the guest-page fault for a read() into a protected page, it
+ * returns EFAULT or stops short, so the retries below could still end with part of the data
+ * (iSubMesh < m_numSubMeshInstances on the train-wreck level). The file is read into a
+ * per-thread host buffer and copied in user space: a protected guest page faults in memcpy like
+ * any guest write and the handler unprotects it. */
+#define BOUNCE_SIZE (4u<<20)
+static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
+    static __thread unsigned char *bounce;
+    if (!bounce && !(bounce=malloc(BOUNCE_SIZE))) return -1;
+    unsigned char *at=buffer;
+    uint64_t done=0;
+    while (done<size) {
+        size_t want=size-done>BOUNCE_SIZE ? BOUNCE_SIZE : (size_t)(size-done);
+        ssize_t n=offset<0 ? read(h,bounce,want) : pread(h,bounce,want,offset+(int64_t)done);
+        if (n<0 && errno==EINTR) continue;
+        if (n<0) { if (done) break; return -1; }
+        if (n==0) break;
+        memcpy(at+done,bounce,(size_t)n);
+        done+=(uint64_t)n;
+        if (h<3) break;
+    }
+    return (ssize_t)done;
+}
+#else
 static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
     unsigned char *at=buffer;
     uint64_t done=0;
@@ -327,6 +395,7 @@ static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
     }
     return (ssize_t)done;
 }
+#endif
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;

@@ -98,6 +98,12 @@ public:
         return fetch_shader;
     }
 
+    /// bbport: points the stages at other Infos describing the same programs (a worker builds
+    /// the pipeline from its own copies, which the pipeline must not keep).
+    void RebindStages(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+        std::ranges::copy(infos, stages.begin());
+    }
+
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }

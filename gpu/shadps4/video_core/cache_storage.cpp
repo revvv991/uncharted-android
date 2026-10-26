@@ -14,22 +14,50 @@
 
 #include <miniz.h>
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
+#include <string>
+#include <thread>
 
 namespace {
 
 std::mutex submit_mutex{};
-u32 num_requests{};
+std::atomic<u32> num_requests{};
 std::condition_variable_any request_cv{};
 std::queue<std::packaged_task<void()>> req_queue{};
 std::mutex m_request{};
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
+std::string device_tag{};
+
+std::string DeviceSuffix() {
+    return device_tag.empty() ? std::string{} : "-" + device_tag;
+}
+
+/// A cache from before the per-GPU names cannot be told from a mixed one (it belongs to whichever
+/// GPU wrote last, and the loader only compares the shader profile), and a build that reads it
+/// would rebuild it anyway: it is removed, on a thread of its own (it can hold tens of thousands
+/// of files).
+void RemoveUntaggedCache(const std::filesystem::path& untagged, const std::filesystem::path& tagged) {
+    if (device_tag.empty() || untagged == tagged) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(untagged, ec)) {
+        return;
+    }
+    LOG_INFO(Render, "Removing the shader cache {} from before per-GPU caches", untagged.string());
+    std::thread{[untagged] {
+        std::error_code error;
+        std::filesystem::remove_all(untagged, error);
+    }}.detach();
+}
 
 } // namespace
 
@@ -41,14 +69,14 @@ void ProcessIO(const std::stop_token& stoken) {
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
+            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests.load() != 0; });
         }
 
         if (stoken.stop_requested()) {
             break;
         }
 
-        while (num_requests) {
+        while (num_requests.load() != 0) {
             std::packaged_task<void()> request{};
             {
                 std::scoped_lock lock{m_request};
@@ -88,6 +116,14 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     }
 }
 
+void DataBase::SetDeviceTag(std::string tag) {
+    device_tag = std::move(tag);
+}
+
+const std::string& DataBase::DeviceTag() const {
+    return device_tag;
+}
+
 void DataBase::Open() {
     if (opened) {
         return;
@@ -99,8 +135,12 @@ void DataBase::Open() {
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 
+        const auto base_name = std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix();
         cache_path = GetUserPath(PathType::CacheDir) /
-                     std::filesystem::path{std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix()}.replace_extension(".zip");
+                     std::filesystem::path{base_name + DeviceSuffix()}.replace_extension(".zip");
+        RemoveUntaggedCache(GetUserPath(PathType::CacheDir) /
+                               std::filesystem::path{base_name}.replace_extension(".zip"),
+                           cache_path);
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
@@ -111,11 +151,13 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        cache_path = GetUserPath(PathType::CacheDir) /
-                     (std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix());
+        const auto base_name = std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix();
+        cache_path = GetUserPath(PathType::CacheDir) / (base_name + DeviceSuffix());
+        RemoveUntaggedCache(GetUserPath(PathType::CacheDir) / base_name, cache_path);
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
+        directory = cache_path;
     }
 
     io_worker = std::jthread{ProcessIO};
@@ -269,6 +311,40 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 }
             }
         }
+    }
+}
+
+std::vector<std::string> DataBase::ListBlobNames(BlobType type) {
+    std::vector<std::string> names;
+    if (!opened) {
+        return names;
+    }
+    const auto ext = "." + GetBlobFileExtension(type);
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (int index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            const std::string entry{file_name.data()};
+            if (entry.ends_with(ext)) {
+                names.push_back(entry.substr(0, entry.size() - ext.size()));
+            }
+        }
+        return names;
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
+        if (entry.path().extension().string() == ext) {
+            names.push_back(entry.path().stem().string());
+        }
+    }
+    return names;
+}
+
+void DataBase::Flush(u32 max_ms) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_ms);
+    while (opened && num_requests.load() != 0 && std::chrono::steady_clock::now() < end) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 

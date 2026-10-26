@@ -21,10 +21,10 @@ def load(path):
         body = off + 8
         if sid == 0x0402:
             a, pt, n = struct.unpack_from("<QQQ", data, body)
-            blobs.append((a, n, body + 24))
+            blobs.append((a, n, body + 24, True))
         elif sid == 0x0B02:
             t, a, pt, n = struct.unpack_from("<iQQQ", data, body)
-            blobs.append((a, n, body + 28))
+            blobs.append((a, n, body + 28, False))
         elif sid == 0x0202:
             b = data[body: off + size]
             w = struct.unpack_from("<%dI" % (len(b) // 4), b)
@@ -52,18 +52,19 @@ def load(path):
 
 
 def words(data, blobs, addr, n):
-    for a, cnt, doff in blobs:
+    for a, cnt, doff, ib in sorted(blobs, key=lambda b: not b[3]):
         if a <= addr and addr + n * 4 <= a + cnt * 4:
             return list(struct.unpack_from("<%dI" % n, data, doff + (addr - a)))
     return None
 
 
 def ib_size(data, blobs, base):
-    best = None
-    for a, cnt, doff in blobs:
-        if a == base:
-            best = cnt if best is None else max(best, cnt)
-    return best
+    # An IB section has the IB's own size; a GPU object at the same address is the whole BO.
+    sizes = [(not ib, cnt) for a, cnt, doff, ib in blobs if a == base]
+    if not sizes:
+        return None
+    first = min(sizes)[0]
+    return max(cnt for kind, cnt in sizes if kind == first)
 
 
 def at(data, blobs, base, rem, label):
@@ -96,14 +97,19 @@ def at(data, blobs, base, rem, label):
         i += 1 + ln
 
 
-for path in sys.argv[1:]:
-    data, blobs, regs = load(path)
-    print("== %s: CP_PROTECT_STATUS 0x%x" % (path.split("/")[-1].split("\\")[-1], regs.get(0x824, 0)))
-    for label, b_lo, b_hi, r1, i2_lo, i2_hi, r2 in (
-            ("BR", 0x928, 0x929, 0x92a, 0x92b, 0x92c, 0x92d),
-            ("BV", 0xa6d, 0xa6e, 0xa70, 0xa71, 0xa72, 0xa74)):
-        ib1 = regs.get(b_lo, 0) | (regs.get(b_hi, 0) << 32)
-        ib2 = regs.get(i2_lo, 0) | (regs.get(i2_hi, 0) << 32)
-        at(data, blobs, ib1, regs.get(r1, 0), label + " IB1")
-        if ib2:
-            at(data, blobs, ib2, regs.get(r2, 0), label + " IB2")
+def main():
+    for path in sys.argv[1:]:
+        data, blobs, regs = load(path)
+        print("== %s: CP_PROTECT_STATUS 0x%x" % (path.split("/")[-1].split("\\")[-1], regs.get(0x824, 0)))
+        for label, b_lo, b_hi, r1, i2_lo, i2_hi, r2 in (
+                ("BR", 0x928, 0x929, 0x92a, 0x92b, 0x92c, 0x92d),
+                ("BV", 0xa6d, 0xa6e, 0xa70, 0xa71, 0xa72, 0xa74)):
+            ib1 = regs.get(b_lo, 0) | (regs.get(b_hi, 0) << 32)
+            ib2 = regs.get(i2_lo, 0) | (regs.get(i2_hi, 0) << 32)
+            at(data, blobs, ib1, regs.get(r1, 0), label + " IB1")
+            if ib2:
+                at(data, blobs, ib2, regs.get(r2, 0), label + " IB2")
+
+
+if __name__ == "__main__":
+    main()

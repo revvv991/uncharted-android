@@ -8,6 +8,9 @@
 #   committer revvv991 (GitHub noreply), the date in UTC, no trailers. Nothing of the private
 #   history goes out. PREVIOUS=<directory or URL of the public repository>: a later release goes
 #   on top of that repository's main instead of BASE.
+# - MERGED=<commit>: an upstream commit our main has merged (uncharted_pc 0.3.9: 754ed2a) becomes
+#   the release commit's second parent, so the public history carries upstream's commits up to it
+#   with their authors (the same hashes as on GitHub). Left out when the parent already has it.
 # - The tree: SRC's main (default: the WSL working copy) without CLAUDE.md, android/docs/ and
 #   android/notes/ (the development notes) and any extra PATHS (space separated). Dropped as well:
 #   the "Date:" lines of our patch files (git format-patch; the time zone tells where the author
@@ -25,6 +28,9 @@ NAME=revvv991
 EMAIL=345025393+revvv991@users.noreply.github.com
 [ ! -e "$OUT" ] || { echo "$OUT exists: give a new directory" >&2; exit 1; }
 git -C "$SRC" merge-base --is-ancestor "$BASE" main || { echo "BASE $BASE is not an ancestor of main" >&2; exit 1; }
+if [ -n "${MERGED:-}" ]; then
+    git -C "$SRC" merge-base --is-ancestor "$MERGED" main || { echo "MERGED $MERGED is not in main" >&2; exit 1; }
+fi
 VERSION=$(git -C "$SRC" show main:android/VERSION | tr -d '[:space:]')
 
 git clone -q --no-local --no-tags --single-branch --branch main "$SRC" "$OUT"
@@ -94,17 +100,21 @@ EOF
 
 git add -A
 DATE=$(date -u +%Y-%m-%dT%H:%M:%S+0000)
-GIT_AUTHOR_NAME=$NAME GIT_AUTHOR_EMAIL=$EMAIL GIT_AUTHOR_DATE=$DATE \
-GIT_COMMITTER_NAME=$NAME GIT_COMMITTER_EMAIL=$EMAIL GIT_COMMITTER_DATE=$DATE \
-    git commit -q -m "uncharted-android $VERSION"
-git branch -f main HEAD
-git checkout -q main
+export GIT_AUTHOR_NAME=$NAME GIT_AUTHOR_EMAIL=$EMAIL GIT_AUTHOR_DATE=$DATE
+export GIT_COMMITTER_NAME=$NAME GIT_COMMITTER_EMAIL=$EMAIL GIT_COMMITTER_DATE=$DATE
+PARENTS=(-p HEAD)
+if [ -n "${MERGED:-}" ] && ! git merge-base --is-ancestor "$MERGED" HEAD; then
+    PARENTS+=(-p "$MERGED")
+fi
+COMMIT=$(git commit-tree "$(git write-tree)" "${PARENTS[@]}" -m "uncharted-android $VERSION")
+git branch -f main "$COMMIT"
+git checkout -q -f main
 git tag -l | xargs -r git tag -d > /dev/null
 rm -f .git/FETCH_HEAD
 git reflog expire --expire=now --all
 git gc -q --prune=now
 
-echo "== $(git rev-list --count HEAD) commits, HEAD $(git rev-parse --short HEAD) \"$(git log -1 --format=%s)\" on $(git rev-parse --short HEAD~1)"
+echo "== $(git rev-list --count HEAD) commits, HEAD $(git rev-parse --short HEAD) \"$(git log -1 --format=%s)\" on $(git log -1 --format=%p)"
 echo "== our commit: $(git log -1 --format='author %an <%ae> %ad, committer %cn <%ce> %cd' --date=iso)"
 echo "== objects outside main (should be 0): $(( $(git rev-list --objects --all | wc -l) - $(git rev-list --objects main | wc -l) ))"
 echo "== authors and committers"

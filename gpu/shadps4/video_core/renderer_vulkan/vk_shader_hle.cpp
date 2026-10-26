@@ -303,9 +303,24 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
             const char* env = std::getenv("BB_SCALAR_COPY_BOTH");
             return !(env && env[0] == '0');
         }();
-        static const bool sync = [] {
+        static const bool sync_all = [] {
             const char* env = std::getenv("BB_SCALAR_COPY_SYNC");
             return env && env[0] == '1';
+        }();
+        // The 64-dword copy moves the results of the game's mesh raycasters into their record
+        // arrays in guest memory (MeshRaycaster::HandleResults reads them there), in two steps:
+        // GPU output -> staging buffer, staging buffer -> record array. GPU readbacks are
+        // relaxed, so a read of the record array never fetches GPU data. Copied on the GPU only,
+        // the records the game read were not the ones this copy made (U2: assertion in
+        // GetSubMeshInstance after a checkpoint). The second step, whose destination the guest
+        // CPU writes, also copies in guest memory, with the GPU-written bytes of its source;
+        // the first step's destination is GPU-only and needs nothing. BB_SCALAR_COPY64_SYNC=0:
+        // off, 1: both steps, unset: second step only.
+        static const int sync_64 = [] {
+            // Unset: off. run.py sets 2 for Uncharted 2, which needs it; in U3's Cartagena
+            // square it cost 94 -> 54 FPS.
+            const char* env = std::getenv("BB_SCALAR_COPY64_SYNC");
+            return !env ? 0 : env[0] == '0' ? 0 : env[0] == '1' ? 1 : 2;
         }();
         const bool src_written = src_gpu && buffer_cache.IsRangeGpuWritten(src.base_address, size);
         static const bool small_sync = [] {
@@ -322,10 +337,22 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
                 buffer_cache.ReadMemory(dst.base_address, size, false, true);
             }
         } else if (both && size < 1_MB) {
-            if (src_written && sync) {
+            const bool sync =
+                sync_all || (group_size == 64 && (sync_64 == 1 ||
+                                                  (sync_64 == 2 && buffer_cache.IsRegionCpuModified(
+                                                                       dst.base_address, size))));
+            // The raycaster's copy waits for nobody here: the guest part is copied now, the
+            // GPU-written bytes land in guest memory when the GPU has made them, and the labels
+            // the game learns of it from wait for that (BufferCache::DeferGuestCopy,
+            // landing_gate.h). BB_SCALAR_COPY64_DEFER=0 waits for the GPU here instead.
+            bool deferred = false;
+            if (src_written && sync && group_size == 64 && !sync_all && sync_64 == 2) {
+                deferred = buffer_cache.DeferGuestCopy(src.base_address, dst.base_address, size);
+            }
+            if (src_written && sync && !deferred) {
                 buffer_cache.ReadMemory(src.base_address, size, false, true);
             }
-            if ((!src_written || sync) && memory->IsValidGpuMapping(src.base_address, size) &&
+            if (!deferred && (!src_written || sync) && memory->IsValidGpuMapping(src.base_address, size) &&
                 memory->IsValidGpuMapping(dst.base_address, size)) {
                 memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
                                         reinterpret_cast<const void*>(src.base_address), size);

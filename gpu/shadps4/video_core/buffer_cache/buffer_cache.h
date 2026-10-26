@@ -5,8 +5,13 @@
 
 #include "bbport_copy.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -100,11 +105,31 @@ public:
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    /// g2-arm64 (from uncharted_Linux c443a3b): copies up to 64 GPU-written bytes to guest
+    /// memory once the GPU has run the commands recorded so far, without waiting for it here
+    /// (small compute results the game's CPU code reads, e.g. Uncharted's auto-exposure
+    /// value). Skipped while the region is not GPU-written or every slot is in flight.
+    void ReadMemoryAsync(VAddr device_addr, u32 size);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
+
+    /// bbport: the 64-dword copy of the game's mesh raycasters moves GPU results into a record
+    /// array the guest CPU reads. Instead of waiting for the GPU at the dispatch, the guest part
+    /// of the copy is made now and the GPU-written bytes of the source land on a worker thread
+    /// once the GPU work that wrote them has completed; the labels the guest learns of the GPU's
+    /// progress from wait for it (landing_gate.h). False when not deferred (no side queue,
+    /// BB_SCALAR_COPY64_DEFER=0): the caller reads back as before.
+    bool DeferGuestCopy(VAddr src, VAddr dst, u64 size);
+    u64 PendingLanding() const;
+    bool LandingGateActive() const;
+    void WaitLanding(u64 seq);
+    void RunAfterLanding(u64 seq, std::function<void()> fn);
+    /// Ends the landing thread: nothing more is deferred, every wait on it lets go, what is
+    /// pending is dropped (~BufferCache; idempotent).
+    void StopLanding();
 
     /// bbport diagnosis (BB_STABLE_CHECK=1): at an end-of-pipe fence, reports read-only
     /// bindings since the last one whose guest data changed meanwhile.
@@ -176,6 +201,10 @@ private:
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
+    /// ReadMemoryAsync: host-visible slots the GPU copies into, and which are still in flight.
+    std::unique_ptr<Buffer> async_readback;
+    std::unique_ptr<std::atomic<bool>[]> async_slot_busy;
+    u32 async_next_slot{};
     Vulkan::Scheduler& scheduler;
     // bbport: texel buffer ranges known not to alias an image, per image registry generation.
     struct ImageMiss {
@@ -213,6 +242,26 @@ private:
     std::unique_ptr<SideQueue> side_queue;
     bool DownloadOnSideQueue(VAddr page, u64 length);
 
+    /// bbport: deferred raycaster copies (DeferGuestCopy).
+    struct Landing;
+    struct GatedLabel {
+        u64 seq;
+        std::function<void()> fn;
+    };
+    std::mutex landing_mutex;
+    std::condition_variable landing_cv, landing_done_cv;
+    std::deque<std::shared_ptr<Landing>> landing_queue; ///< registered, not yet landed
+    std::deque<GatedLabel> gated_labels;                 ///< labels waiting for a landing
+    u64 landing_registered_seq{0}, landing_done_seq{0};
+    std::atomic<u64> landing_registered{0}, landing_done{0};
+    bool landing_stop{false}, gate_running{false};
+    std::atomic<u32> gate_outstanding{0}; ///< labels queued or running on the landing thread
+    std::thread landing_thread;
+    void LandingWorker();
+    bool ExecuteLanding(Landing& landing);
+    bool WaitLandingTick(u64 tick);
+    std::atomic<bool> landing_exited{false};
+
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
 
@@ -244,7 +293,19 @@ private:
     };
     IntervalList<Backing> resident_ranges;
 
+    /// bbport: arena memory chunks (see AllocateArenaMemory).
+    struct ArenaChunk {
+        vk::DeviceMemory memory;
+        u64 size;
+        u64 used;
+        bool host;
+    };
+    std::vector<ArenaChunk> arena_chunks;
+    bool host_arena_active{};
+    u64 AllocateArenaMemory(u64 size, vk::DeviceMemory& memory);
+
     u32 arena_memory_type_index{};
+    u32 arena_host_memory_type_index{~0u}; ///< bbport: system memory fallback
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};

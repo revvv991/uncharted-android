@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <filesystem>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <variant>
 #include <boost/container/static_vector.hpp>
@@ -79,6 +85,7 @@ struct DrawIndirectParams {
 
 namespace AmdGpu {
 union Regs;
+struct ComputeProgram;
 }
 
 namespace Vulkan {
@@ -94,6 +101,8 @@ struct PipelineSelection {
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
     DrawIndirectParams draw_indirect_params{};
+    /// Compute program state of a worker's dispatch (the GPU thread reads its queue's own).
+    const AmdGpu::ComputeProgram* cs{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };
 
@@ -110,6 +119,8 @@ struct PrepWorker {
     std::unordered_map<const Program*, Shader::Info> infos;
     boost::container::static_vector<Stage, MaxShaderStages> stages;
     bool failed = false;
+    bool compile = false; ///< may translate missing programs and build pipelines
+    std::unique_ptr<Shader::Pools> pools; ///< the worker's own translation pools
 };
 
 struct PreparedDraw;
@@ -120,12 +131,23 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
-    void WarmUp();
+    /// bbport: starts the preload of the stored pipelines on background threads. Called by the
+    /// rasterizer once the object motion buffers exist (the stored motion shaders need their
+    /// addresses). Selection and creation wait for the preload to finish (EnsureWarm).
+    void StartWarmUp();
     void Sync();
+    /// bbport: writes the driver's pipeline cache and flushes the queued blobs; called as the
+    /// process ends (the window thread ends it with _Exit).
+    void SaveForExit();
 
-    bool LoadComputePipeline(Serialization::Archive& ar);
-    bool LoadGraphicsPipeline(Serialization::Archive& ar);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    /// bbport: a pipeline or shader was compiled within the last second (draw-preparation
+    /// helpers then assist; see vk_draw_prep.cpp).
+    [[nodiscard]] static bool CompilingRecently();
+
+    /// bbport: true once the preload is done (or was never started).
+    [[nodiscard]] bool IsWarm() const noexcept {
+        return warm_done.load(std::memory_order_acquire);
+    }
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
                                                 const PreparedDraw* prepared = nullptr);
@@ -133,6 +155,8 @@ public:
     /// bbport: worker side of draw preparation: selects the pipeline key for `sel.regs` without
     /// creating anything. False when a program or permutation does not exist yet.
     bool PrepareGraphicsPipeline(PipelineSelection& sel);
+    /// bbport: builds the selected graphics pipeline for a worker when it does not exist yet.
+    void EnsureWorkerPipeline(PipelineSelection& sel);
 
     /// bbport: GPU-thread side: the pipeline for a prepared draw after checking that registers
     /// and flattened user data match; null to take the regular path.
@@ -152,6 +176,10 @@ public:
     /// 8f067540) is ~300 dispatches a frame of one 1024-invocation workgroup, one shader core.
     /// Returns the requested factor (1 = none).
     static u32 CsSplitRequest(u64 hash, const AmdGpu::ComputeProgram& cs_pgm);
+
+    /// bbport: worker side of a dispatch: translates the compute program and builds its pipeline
+    /// when they do not exist yet, so the GPU thread finds them (sel.cs is the program state).
+    void PrepareComputePipeline(PipelineSelection& sel);
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;
@@ -173,13 +201,45 @@ private:
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
 
+    void WarmUpThread();
+    void EnsureWarm() {
+        if (!warm_done.load(std::memory_order_acquire)) {
+            WaitWarm();
+        }
+    }
+    void WaitWarm();
+    /// The driver cache blob was written by this device and driver version.
+    bool DriverCacheHeaderMatches(const std::vector<char>& data) const;
+    void SaveDriverCache();
+    size_t DriverCacheSize();
+    void DriverCacheSaver(std::stop_token stop);
+
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding,
+                                   Shader::Pools& translate_pools);
+    struct NewProgram {
+        Program* program;
+        vk::ShaderModule module;
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+        u64 perm_hash;
+    };
+    NewProgram CreateProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                             const Shader::ShaderParams& params, Shader::RuntimeInfo& runtime_info,
+                             Shader::Backend::Bindings& binding, Shader::Pools& translate_pools);
+    bool WorkerTranslate(PrepWorker& worker, Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params, Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& binding,
+                         Shader::StageSpecialization* spec);
+    Program* FindProgram(u64 hash);
+    /// Serializes the creation of one program/permutation or pipeline: who finds the id taken
+    /// waits for the creator and then finds the result.
+    void AcquireClaim(u64 id);
+    void ReleaseClaim(u64 id);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
     bool compute_direct = false; // g2-arm64: BB_CS_SPLIT
@@ -203,16 +263,35 @@ private:
     std::shared_mutex programs_mutex;
     u64 prepared_hits = 0, prepared_misses = 0;
     const PreparedDraw* used_prepared = nullptr;
+    /// bbport: guards graphics_pipelines (draw-preparation workers insert into it).
+    std::shared_mutex pipelines_mutex;
+    static constexpr u64 PipelineClaimTag = 0x9E3779B97F4A7C15ull;
+    std::mutex claim_mutex;
+    std::condition_variable claim_cv;
+    std::unordered_set<u64> claims;
+    bool worker_compile = true; ///< BB_PREP_COMPILE=0 keeps all compiles on the GPU thread
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
-    u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    std::atomic<u32> num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // bbport: preload on background threads and the driver's pipeline cache on disk.
+    std::atomic<bool> warm_done{true};
+    std::thread warm_thread;
+    std::filesystem::path driver_cache_path;
+    std::mutex driver_cache_mutex;
+    std::atomic<u32> driver_cache_dirty{0}; ///< pipelines created since the last save
+    size_t driver_cache_loaded_size = 0;
+    std::jthread driver_cache_saver;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
 };
+
+/// bbport: the process is about to end: saves the driver's pipeline cache, flushes the queued blobs.
+void FlushPipelineCacheForExit();
 
 } // namespace Vulkan

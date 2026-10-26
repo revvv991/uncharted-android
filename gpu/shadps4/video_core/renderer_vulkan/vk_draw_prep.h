@@ -9,7 +9,12 @@
 // the graphics pipeline and resource sharps of each direct draw. All helpers run as
 // SCHED_IDLE: they only use idle cores. The GPU thread uses a prepared draw only when the
 // running register checksums match and the flattened user data it computes itself equals the
-// worker's; otherwise it takes the regular path. Workers never create or compile anything.
+// worker's; otherwise it takes the regular path. Workers also translate the programs and build the
+// pipelines a draw needs and the GPU thread does not have yet (PipelineCache::GetProgram,
+// EnsureWorkerPipeline), and while that goes on the idle ones help with the same buffer
+// (compile assist), so a scene's new pipelines compile on several threads at once. Dispatches of
+// the graphics queue get the same: the scanner also replays the compute program registers, and
+// the worker builds the compute pipeline of each dispatch (PipelineCache::PrepareComputePipeline).
 
 #pragma once
 
@@ -106,8 +111,10 @@ public:
     void Enqueue(u64 seq, std::shared_ptr<Submission> submission);
 
     /// GPU thread: brackets the processing of submission `seq`. The first call hands the
-    /// workers the exact register state and checksum they start replaying from.
-    void BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum);
+    /// workers the exact register state and checksum they start replaying from (`cs`: the
+    /// graphics queue's compute program state).
+    void BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum,
+                         const AmdGpu::ComputeProgram& cs);
     void EndSubmission();
 
     /// GPU thread: the prepared state for the next direct draw of the current submission.
@@ -121,12 +128,17 @@ public:
         std::vector<u32> commands;
         std::unique_ptr<PreparedDraw[]> draws;
         u32 num_draws{};
+        u32 num_dispatches{};
         std::vector<std::unique_ptr<u32[]>> flat_chunks; ///< from the claiming worker
         u64 start_checksum{}, end_checksum{}; ///< set by the scanner
         AmdGpu::RegDelta delta;                ///< registers written, values at the end
+        AmdGpu::ComputeProgram cs_start{}, cs_end{}; ///< compute program state, set by the scanner
         std::atomic<bool> scanned{false};
         std::atomic<bool> claimed{false};
         std::atomic<bool> gpu_done{false};
+        /// Draws a helper already took for pipeline compilation (see WorkerLoop, assist).
+        std::unique_ptr<std::atomic<bool>[]> draw_taken;
+        std::unique_ptr<std::atomic<bool>[]> dispatch_taken; ///< likewise for dispatches
     };
 
 private:
@@ -141,6 +153,7 @@ private:
     /// State at the start of the oldest queued buffer (`tail_seq`): a worker whose position
     /// was collected restarts from here. Guarded by `mutex`.
     std::unique_ptr<AmdGpu::Regs> tail_regs;
+    AmdGpu::ComputeProgram initial_cs{}, tail_cs{}; ///< compute program state, like the two above
     u64 tail_seq{};
     u64 tail_checksum{};
     u64 rebases = 0; ///< scanner restarts from the GPU thread state (BB_FRAME_STATS)

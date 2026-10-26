@@ -89,6 +89,11 @@ struct MotionVectors {
     /// the position array (vec4 per vertex; element 0 is scratch), fixed for the session.
     static inline u64 params_address = 0;
     static inline u64 positions_address = 0;
+    /// The emitted SPIR-V holds these stand-ins for the two addresses (params + 0..16 for the
+    /// two u32x4 halves of a record), so a cached shader does not depend on the session's
+    /// buffers; CompileSPV patches in the real values (PatchMotionAddresses).
+    static constexpr u64 ParamsPlaceholder = 0x5EC0DE0000000000ull;
+    static constexpr u64 PositionsPlaceholder = 0x5EC0DF0000000000ull;
     static constexpr u32 FlagStore = 1;
     static constexpr u32 FlagLoad = 2;
 };

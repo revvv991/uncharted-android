@@ -15,12 +15,14 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
 
@@ -172,6 +174,11 @@ private:
     [[nodiscard]] bool Active() const;
     [[nodiscard]] bool ReactiveOn() const;
     bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
+    /// bbport: creates the upscaler's pipelines and (make_context) the FSR 3 context for the expected
+    /// scene size on a background thread, so the first 3D scene does not wait for them
+    /// (EnsureResources adopts the context when the size matches).
+    void StartContextPrecreate(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr,
+                               bool make_context);
     void CreatePipelines();
     /// Records the reactive mask pass; false when there is no snapshot this frame.
     bool RecordReactive(vk::ImageView color_view);
@@ -183,6 +190,12 @@ private:
     bool RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource& color,
                     const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
                     bool hdr);
+    /// bbport: Intel XeSS selected and libxess.dll is ready.
+    [[nodiscard]] bool UseXess() const;
+    /// Records XeSS into output_image (General). Moves color, depth and the motion vectors to
+    /// ShaderReadOnlyOptimal for it and back to General; on a failure FSR 3 takes over.
+    bool RecordXess(vk::CommandBuffer cmdbuf, const Xess::Resource& color,
+                    const Xess::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, bool hdr);
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);
@@ -261,12 +274,21 @@ private:
     std::mutex display_mutex;
     std::unordered_map<VAddr, DisplayImage> displays;
     FfxVkPortableUpscaleContext* context = nullptr;
+    struct PrecreatedContext {
+        FfxVkPortableUpscaleContext* context = nullptr;
+        u32 width = 0, height = 0, out_width = 0, out_height = 0;
+        bool hdr = false;
+    };
+    PrecreatedContext precreated{}; ///< written by precreate_thread, read after joining it
+    std::jthread precreate_thread;
+    bool precreate_started = false;
     bool resources_ready = false; ///< images below match width/height/out size
     bool resources_fsr4 = false;  ///< made for FSR 4 (no FSR 3 context)
     bool resources_taa = false;
     std::unique_ptr<Fsr4Upscaler> fsr4;
     bool fsr4_failed = false;
     bool dlss_failed = false;
+    bool xess_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
     vk::UniqueImageView motion_view;

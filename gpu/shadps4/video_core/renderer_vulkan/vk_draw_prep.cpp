@@ -26,6 +26,11 @@ bool IsDirectDraw(AmdGpu::PM4ItOpcode opcode) {
            opcode == PM4ItOpcode::DrawIndexAuto;
 }
 
+bool IsDispatch(AmdGpu::PM4ItOpcode opcode) {
+    return opcode == AmdGpu::PM4ItOpcode::DispatchDirect ||
+           opcode == AmdGpu::PM4ItOpcode::DispatchIndirect;
+}
+
 /// Walks the type-3 packets of a command buffer (type-2 padding skipped).
 template <typename Func>
 void ForEachPacket(std::span<const u32> commands, Func&& func) {
@@ -230,8 +235,12 @@ std::shared_ptr<DrawPreparation::Submission> DrawPreparation::Build(
     submission->commands.assign(commands.begin(), commands.end());
     ForEachPacket(submission->commands, [&](const AmdGpu::PM4Header* header) {
         submission->num_draws += IsDirectDraw(header->type3.opcode);
+        submission->num_dispatches += IsDispatch(header->type3.opcode);
     });
     submission->draws = std::make_unique<PreparedDraw[]>(submission->num_draws);
+    submission->draw_taken = std::make_unique<std::atomic<bool>[]>(submission->num_draws);
+    submission->dispatch_taken =
+        std::make_unique<std::atomic<bool>[]>(submission->num_dispatches);
     return submission;
 }
 
@@ -247,7 +256,8 @@ void DrawPreparation::Enqueue(u64 seq, std::shared_ptr<Submission> submission) {
     cv.notify_all();
 }
 
-void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum) {
+void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum,
+                                      const AmdGpu::ComputeProgram& cs) {
     current_draw = 0;
     current.reset();
     if (!Enabled()) {
@@ -259,6 +269,7 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
         initial_regs = std::make_unique<AmdGpu::Regs>(regs);
         tail_regs = std::make_unique<AmdGpu::Regs>(regs);
         initial_checksum = tail_checksum = reg_checksum;
+        initial_cs = tail_cs = cs;
         baseline_seq = tail_seq = seq;
         baseline_ready = true;
         cv.notify_all();
@@ -269,6 +280,7 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
     if (!submissions.empty() && seq > tail_seq + MaxScanLag &&
         submissions.front()->seq < seq && !submissions.front()->scanned.load()) {
         *tail_regs = regs;
+        tail_cs = cs;
         tail_seq = seq;
         tail_checksum = reg_checksum;
         while (!submissions.empty() && submissions.front()->seq < seq) {
@@ -317,6 +329,7 @@ void DrawPreparation::Collect() {
                 break;
             }
             front->delta.Apply(*tail_regs);
+            tail_cs = front->cs_end;
             tail_seq = front->seq + 1;
             tail_checksum = front->end_checksum;
         }
@@ -328,6 +341,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
     Common::SetCurrentThreadName("bb:DrawScan");
     BbThreads::MakeBackground();
     std::unique_ptr<AmdGpu::Regs> regs;
+    auto cs = std::make_unique<AmdGpu::ComputeProgram>();
     u64 checksum = 0;
     u64 next_seq = 0;
     {
@@ -337,6 +351,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
             return;
         }
         regs = std::make_unique<AmdGpu::Regs>(*initial_regs);
+        *cs = initial_cs;
         checksum = initial_checksum;
         next_seq = baseline_seq;
     }
@@ -355,6 +370,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
             if (next_seq < tail_seq) {
                 // Rebased by the GPU thread: continue from its state.
                 *regs = *tail_regs;
+                *cs = tail_cs;
                 checksum = tail_checksum;
                 next_seq = tail_seq;
                 continue;
@@ -363,12 +379,15 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
             submission = submissions[next_seq - submissions.front()->seq];
         }
         submission->start_checksum = checksum;
+        submission->cs_start = *cs;
         dirty.Clear();
         ForEachPacket(submission->commands, [&](const AmdGpu::PM4Header* header) {
             AmdGpu::Liverpool::ApplyGraphicsRegisterPacket(*regs, header, checksum, &dirty);
+            AmdGpu::Liverpool::ApplyComputeRegisterPacket(*cs, header);
         });
         submission->delta.Capture(*regs, dirty);
         submission->end_checksum = checksum;
+        submission->cs_end = *cs;
         {
             std::scoped_lock lk{mutex};
             submission->scanned.store(true, std::memory_order_release);
@@ -386,8 +405,14 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     u64 position = NoPosition; ///< `regs` holds the state at the start of this buffer
     PipelineSelection sel{};
     sel.regs = regs.get();
+    auto cs = std::make_unique<AmdGpu::ComputeProgram>();
+    sel.cs = cs.get();
     PrepWorker prep_worker{};
     sel.worker = &prep_worker;
+    static const bool compute_prep = [] {
+        const char* env = std::getenv("BB_PREP_COMPUTE"); // 0: dispatches are left to the GPU thread
+        return !env || env[0] != '0';
+    }();
     FlatArena arena;
     std::vector<std::shared_ptr<Submission>> path;
 
@@ -404,19 +429,52 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         return {};
     };
 
+    // Compile assist: while pipelines are being compiled (the GPU thread and the owner of a
+    // buffer meet them one after another), the other helpers replay the same buffer and build
+    // the pipelines of the draws they take, so several compile at once.
+    u64 assisted_seq = 0;
+    bool assisted_any = false;
+    const auto assistable = [&]() -> std::shared_ptr<Submission> {
+        if (!pipeline_cache.CompilingRecently()) {
+            return {};
+        }
+        const u64 gpu = gpu_seq.load(std::memory_order_acquire);
+        for (const auto& submission : submissions) {
+            if (submission->seq >= gpu && submission->seq <= gpu + 1 &&
+                submission->seq >= tail_seq && (!assisted_any || submission->seq > assisted_seq) &&
+                submission->scanned.load(std::memory_order_acquire) &&
+                submission->claimed.load(std::memory_order_relaxed) &&
+                !submission->gpu_done.load(std::memory_order_acquire) && submission->num_draws) {
+                return submission;
+            }
+        }
+        return {};
+    };
+
     while (!stop.stop_requested()) {
         std::shared_ptr<Submission> target;
+        bool assisting = false;
         {
             std::unique_lock lk{mutex};
             // gpu_seq moves without the lock: keep the candidate the predicate found.
             cv.wait(lk, stop, [&] {
                 target = baseline_ready ? claimable() : nullptr;
+                assisting = false;
+                if (!target && baseline_ready) {
+                    target = assistable();
+                    assisting = target != nullptr;
+                }
                 return target != nullptr;
             });
             if (stop.stop_requested() || !target) {
                 return;
             }
-            target->claimed.store(true, std::memory_order_relaxed);
+            if (assisting) {
+                assisted_seq = target->seq;
+                assisted_any = true;
+            } else {
+                target->claimed.store(true, std::memory_order_relaxed);
+            }
             // Buffers between this worker's state and the target: their deltas. A position
             // already collected (or past the target) restarts from the queue's tail state.
             if (position == NoPosition || position < tail_seq || position > target->seq) {
@@ -434,16 +492,62 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         }
         path.clear();
         u64 checksum = target->start_checksum;
+        *cs = target->cs_start;
         u32 ordinal = 0;
+        u32 dispatch_ordinal = 0;
         arena = FlatArena{};
+        bool abandoned = false;
         ForEachPacket(target->commands, [&](const AmdGpu::PM4Header* header) {
+            if (abandoned) {
+                return;
+            }
             AmdGpu::Liverpool::ApplyGraphicsRegisterPacket(*regs, header, checksum);
+            AmdGpu::Liverpool::ApplyComputeRegisterPacket(*cs, header);
+            if (IsDispatch(header->type3.opcode)) {
+                // Only the pipeline is wanted. Past the GPU thread nothing is worth building.
+                if (header->type3.opcode == AmdGpu::PM4ItOpcode::DispatchDirect) {
+                    const auto* dispatch =
+                        reinterpret_cast<const AmdGpu::PM4CmdDispatchDirect*>(header);
+                    cs->dim_x = dispatch->dim_x;
+                    cs->dim_y = dispatch->dim_y;
+                    cs->dim_z = dispatch->dim_z;
+                    cs->dispatch_initiator = dispatch->dispatch_initiator;
+                }
+                const u32 index = dispatch_ordinal++;
+                if (target->gpu_done.load(std::memory_order_acquire) ||
+                    target->seq < gpu_seq.load(std::memory_order_acquire)) {
+                    if (assisting) {
+                        abandoned = true;
+                    }
+                } else if (compute_prep && index < target->num_dispatches &&
+                           (cs->dispatch_initiator & 1) &&
+                           !target->dispatch_taken[index].exchange(true)) {
+                    pipeline_cache.PrepareComputePipeline(sel);
+                }
+                return;
+            }
             if (!IsDirectDraw(header->type3.opcode)) {
+                return;
+            }
+            if (assisting) {
+                // Only the pipeline is wanted; the buffer's owner prepares the draw itself.
+                if (target->gpu_done.load(std::memory_order_acquire) ||
+                    target->seq < gpu_seq.load(std::memory_order_acquire)) {
+                    abandoned = true;
+                } else if (ordinal < target->num_draws &&
+                           !target->draw_taken[ordinal].exchange(true)) {
+                    prep_worker.stages.clear();
+                    prep_worker.failed = false;
+                    sel.draw_indirect_params = {};
+                    pipeline_cache.PrepareGraphicsPipeline(sel);
+                }
+                ++ordinal;
                 return;
             }
             // Past the GPU thread the draws are no longer worth preparing.
             if (ordinal < target->num_draws &&
                 target->seq >= gpu_seq.load(std::memory_order_acquire)) {
+                target->draw_taken[ordinal].store(true, std::memory_order_relaxed);
                 auto& draw = target->draws[ordinal];
                 prep_worker.stages.clear();
                 prep_worker.failed = false;
@@ -477,6 +581,11 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
             }
             ++ordinal;
         });
+        if (assisting) {
+            arena = FlatArena{};
+            position = abandoned ? NoPosition : target->seq + 1;
+            continue;
+        }
         // The arena's chunks live as long as the submission.
         target->flat_chunks = std::move(arena.chunks);
         position = target->seq + 1;

@@ -776,11 +776,19 @@ public:
             return;
         }
         if (!record_chunk->Push(std::forward<Func>(func))) {
-            full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
+            RetireChunk();
             const bool pushed = record_chunk->Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
+    }
+
+    /// g2-arm64 (from uncharted_Linux 53fba30): replaces the current chunk with a fresh one. The
+    /// replacement is taken first, so `record_chunk` is never null: code that re-enters the
+    /// recording side in between (a guest memory fault handled inline on this thread) found it
+    /// null (BB_GPU_MERGE=0: a read at 0x20000 in KickRecording on the DrawRec thread).
+    void RetireChunk() {
+        auto next = AcquireChunk();
+        full_chunks.push_back(std::exchange(record_chunk, std::move(next)));
     }
 
     /// True when Record() defers commands (and RecordData() copies into chunks).
@@ -799,8 +807,7 @@ public:
             bytes = 0; // RecordData puts it in the chunk's overflow storage; keep room for the command
         }
         if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
-            full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
+            RetireChunk();
         }
     }
 
@@ -899,7 +906,9 @@ public:
     /// bbport: runs `signal` once the guest memory copies issued so far are done, without
     /// waiting here: the recording thread reaches it after the copies queued before it and hands
     /// it to the copy threads' completion (BbCopy::AfterCopies).
-    void SignalAfterHostCopies(std::function<void()> signal);
+    /// `landing_seq`: the deferred raycaster copies up to it (landing_gate.h) land before the
+    /// signal runs.
+    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0);
 
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that

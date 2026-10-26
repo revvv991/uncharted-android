@@ -1,0 +1,148 @@
+From c3f515a82d68c05865766798616a327b0b12c81e Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip: keep command streams out of the second page of their
+ BOs (A735 fault workaround)
+
+On by default, TU_PAGE1_SKIP=0 turns it off. On the G2 (A735) every CP fault
+(BR opcode error 0, protected mode, BV opcode error 0x70970001) sat in the
+second 4 KiB page of the IB's BO; with that page unused two faulting processes
+went from 7 and 11 faults to none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc |  5 +++
+ src/freedreno/vulkan/tu_cs.cc         | 48 +++++++++++++++++++++++++++
+ src/freedreno/vulkan/tu_cs.h          | 14 +++++++-
+ 3 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index e966921617f..90621b67db0 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -4162,6 +4162,11 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
+    tu_cs_init(&cmd_buffer->sub_cs, device, TU_CS_MODE_SUB_STREAM, 2048, "draw sub cs");
+    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
+    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
++   /* uncharted-android: the streams that become IBs (tu_page1_skip). */
++   for (struct tu_cs *cs : { &cmd_buffer->cs, &cmd_buffer->draw_cs, &cmd_buffer->tile_store_cs,
++                             &cmd_buffer->draw_epilogue_cs, &cmd_buffer->pre_chain.draw_cs,
++                             &cmd_buffer->pre_chain.draw_epilogue_cs })
++      cs->page1_skip = true;
+ 
+    for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
+       cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index eb6f897bab4..ffcf8868b4d 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -267,6 +267,10 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+ 
+    struct tu_bo *new_bo;
+ 
++   /* Room for the third page (tu_page1_skip). */
++   if (cs->page1_skip && tu_page1_skip())
++      size = MAX2(size, 4096);
++
+    VkResult result =
+       tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+                      (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+@@ -380,6 +384,47 @@ tu_ib2_split_dwords(void)
+    return v;
+ }
+ 
++bool
++tu_page1_skip(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = getenv("TU_PAGE1_SKIP");
++      on = !env || env[0] != '0';
++      if (!on)
++         fprintf(stderr, "tu: command streams may use the second page of their BOs (TU_PAGE1_SKIP=0)\n");
++   }
++   return on;
++}
++
++/* A reservation that would reach into the second page of the BO ends the entry and goes on at
++ * the third page, like a switch to a new BO (CP_COND_REG_EXEC sizes and packets included). */
++static void
++tu_cs_skip_page1(struct tu_cs *cs, uint32_t reserved_size)
++{
++   uint32_t *map = (uint32_t *) tu_cs_current_bo(cs)->map;
++   const uint32_t cond = 3 * cs->cond_stack_depth;
++   const uint32_t off = cs->cur - map;
++   if (off >= 2048 || off + reserved_size + cond <= 1024)
++      return;
++   uint32_t *page = map + 2048;
++   if (page + reserved_size + cond > cs->end)
++      return;
++
++   if (!tu_cs_is_empty(cs))
++      tu_cs_add_entry(cs);
++   for (uint32_t i = 0; i < cs->cond_stack_depth; i++)
++      *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
++   cs->start = cs->cur = page;
++   cs->reserved_end = cs->cur + reserved_size + cond;
++   for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
++      tu_cs_emit(cs, pm4_pkt7_hdr(CP_COND_REG_EXEC, 2));
++      tu_cs_emit(cs, cs->cond_flags[i]);
++      cs->cond_dwords[i] = cs->cur;
++      tu_cs_emit(cs, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(0));
++   }
++}
++
+ void
+ tu_cs_split_entry(struct tu_cs *cs)
+ {
+@@ -608,6 +653,9 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+    if (unlikely(cs->status != VK_SUCCESS))
+       return cs->status;
+ 
++   if (unlikely(cs->page1_skip) && cs->mode == TU_CS_MODE_GROW && cs->end && tu_page1_skip())
++      tu_cs_skip_page1(cs, reserved_size);
++
+    if (tu_cs_get_space(cs) < reserved_size) {
+       if (cs->mode == TU_CS_MODE_EXTERNAL) {
+          UNREACHABLE("cannot grow external buffer");
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 5e2723fc731..4dd925942f4 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -116,6 +116,10 @@ struct tu_cs
+ 
+    uint32_t breadcrumb_emit_after;
+ 
++   /* uncharted-android: the stream's IBs leave the second page of their BOs unused (see
++    * tu_page1_skip()). */
++   bool page1_skip;
++
+    tu_pkt *pkt;
+ 
+    tu_crb crb(uint32_t nregs);
+@@ -239,6 +243,14 @@ tu_ib2_split_dwords(void);
+ void
+ tu_cs_split_entry(struct tu_cs *cs);
+ 
++/* uncharted-android: on by default, TU_PAGE1_SKIP=0 turns it off. The command streams that
++ * become IBs (tu_cs.page1_skip) put nothing in the second 4 KiB page of their BOs: a stream
++ * reaching it ends its IB there and goes on at the third page. On the A735 (Retroid Pocket G2)
++ * the CP faults (BR "opcode error" 0, "Protected mode error", BV "opcode error" 0x70970001)
++ * sat in that page of the IB's BO, and with it unused a faulting process stopped faulting. */
++bool
++tu_page1_skip(void);
++
+ static inline struct tu_draw_state
+ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
+ {
+@@ -379,7 +391,7 @@ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+    }
+ 
+    if (tu_cs_get_space(cs) >= reserved_size &&
+-       cs->entry_count < cs->entry_capacity) {
++       cs->entry_count < cs->entry_capacity && likely(!cs->page1_skip)) {
+       cs->reserved_end = cs->cur + reserved_size;
+       return;
+    }
+-- 
+2.43.0
+

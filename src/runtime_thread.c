@@ -2,7 +2,7 @@
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
  * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
  * keeps FS. Affinity is recorded, not enforced by a PS4 scheduler; priorities below the default
- * become host nice values on Linux (apply_priority).
+ * become host nice values on Linux (apply_nice).
  * Windows: GS is the TEB and cannot be moved. The guest TCB lives in a TLS slot of the TEB
  * instead, and the loader rewrites the load to `mov rax, gs:[0x1480+8*slot]` (TlsSlots),
  * the same 9-byte instruction with another displacement. */
@@ -69,11 +69,12 @@ static _Thread_local GuestThread *current;
 static _Thread_local int32_t guest_errno;
 static void apply_affinity(GuestThread *t,int current_thread);
 static void apply_name_nice(GuestThread *t);
-static void apply_priority(GuestThread *t);
+static void apply_nice(GuestThread *t);
+static void apply_priority(GuestThread *t,int current_thread);
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
 static size_t created, joined_count, exited;
-static int base_nice; /* g2-arm64: the main thread's nice value (apply_priority) */
+static int base_nice; /* g2-arm64: the main thread's nice value (apply_nice) */
 
 void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64_t align) {
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
@@ -312,11 +313,12 @@ static void *host_start(void *p) {
     attach(t);
     set_host_name(t->name);
     runtime_set_guest_fpu();
+    if (t->attr.prio!=DEFAULT_PRIO) apply_priority(t,1);
     if (t->attr.affinity!=0x7f) apply_affinity(t,1);
 #if defined(__linux__)
     /* g2-arm64: also undoes the nice value a new thread inherits from its creator. */
     pthread_mutex_lock(&lock); t->tid=(int)syscall(SYS_gettid); pthread_mutex_unlock(&lock);
-    apply_priority(t);
+    apply_nice(t);
     apply_name_nice(t);
 #endif
     if (!exit_setjmp(t)) t->result=(void *)(uintptr_t)GUEST_CALL(t->entry,(uint64_t)(uintptr_t)t->argument);
@@ -399,10 +401,38 @@ static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
     if (!prio) return ERR(22);
     *prio=t->attr.prio; return 0;
 }
+/* PS4 priorities run from 256 (highest) to 767 (lowest); 700 is the default and what nearly every
+ * game thread uses. The Nd job workers are created at 767 and the file I/O threads at 260-272.
+ * Windows has fewer levels, so the guest range is cut into bands around NORMAL. Without this the
+ * spinning idle workers ran at the same priority as the threads doing real work (and starved
+ * the GPU command thread on CPUs with few cores). BB_THREAD_PRIO=0 keeps every thread at normal. */
+static int host_priority(int prio) {
+#ifdef _WIN32
+    static int enabled=-1;
+    if (enabled<0) { const char *env=getenv("BB_THREAD_PRIO"); enabled=!(env && env[0]=='0'); }
+    if (!enabled) return THREAD_PRIORITY_NORMAL;
+    if (prio<=300) return THREAD_PRIORITY_ABOVE_NORMAL;
+    if (prio<720) return THREAD_PRIORITY_NORMAL;
+    if (prio<0x2f0) return THREAD_PRIORITY_BELOW_NORMAL;
+    return THREAD_PRIORITY_LOWEST;
+#else
+    (void)prio; return 0;
+#endif
+}
+static void apply_priority(GuestThread *t,int current_thread) {
+#ifdef _WIN32
+    if (t->finished) return;
+    HANDLE handle=current_thread ? GetCurrentThread() : (HANDLE)pthread_gethandle(t->host);
+    if (handle) SetThreadPriority(handle,host_priority(t->attr.prio));
+#else
+    (void)t; (void)current_thread;
+#endif
+}
 static ABI int32_t thread_set_prio(GuestThread *t,int prio) {
     if (!find_thread(t)) return ERR(3);
     t->attr.prio=prio;
-    apply_priority(t);
+    apply_priority(t,t==current);
+    apply_nice(t);
     return 0;
 }
 /* g2-arm64: PS4 priorities below the default (701..767, 767 the lowest) as host nice values, linear
@@ -421,7 +451,7 @@ static int nice_lowest(void) {
     }
     return value;
 }
-static void apply_priority(GuestThread *t) {
+static void apply_nice(GuestThread *t) {
 #if defined(__linux__)
     int lowest=nice_lowest();
     if (!lowest) return;
@@ -495,7 +525,7 @@ void runtime_thread_system_priority_end(int changed) {
 /* BB_AFFINITY=1: the guest's core masks are applied, PS4 core i on host logical processor 2*i
  * (one per physical core where SMT pairs neighbour). Off by default: the PS4 scheduler's
  * guarantees (threads on one core never run at once) are not otherwise reproduced. */
-static int affinity_enabled(void) {
+static int __attribute__((unused)) affinity_enabled(void) {
     static int value=-1;
     if (value<0) { const char *env=getenv("BB_AFFINITY"); value=env && env[0]=='1'; }
     return value;
