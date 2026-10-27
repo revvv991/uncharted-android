@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Experimental, an early preview (version 0.2.6).** Tested on one device so far (Retroid Pocket G2).
+> **Experimental, an early preview (version 0.2.7).** Tested on one device so far (Retroid Pocket G2).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -14,8 +14,10 @@ Tested on one device so far: the Retroid Pocket G2 (Snapdragon G2 Gen 2, Adreno 
 at 1280x720.
 
 - **Uncharted: Drake's Fortune**: playable, about 30-37 FPS in the places measured (GPU-bound).
-- **Uncharted 2: Among Thieves**: playable, 30 FPS in a heavy spot (Istanbul palace), 45-48 with
-  the camera up.
+- **Uncharted 2: Among Thieves**: playable, about 30 FPS in heavy places (the museum's rooftops),
+  50 with the camera up (no frame limit). It runs with accurate GPU memory, as upstream does: its
+  grenade explosions, vehicle damage and chapter 21's convoy need it (a few percent of the frame
+  rate; the launcher's settings turn it off).
 - **Uncharted 3: Drake's Deception**: playable at 25-30 FPS in the first chapter's fight. It is
   limited by the CPU: the game's job workers spin while idle, as designed for the PS4's dedicated
   cores, and leave little CPU time for the port's renderer threads.
@@ -70,7 +72,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.2.6.apk` from
+1. Install the APK (`uncharted-android-0.2.7.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
@@ -88,7 +90,9 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
    Adreno 8xx of the Snapdragon 8 Elite); they are untested with these games - on the G2 one of
    three worked. Showing each frame at once, the frame rate counter, the frame rate limit
    (30 / 60 / 120 / off; the panel in the game has it too), the on-screen gamepad (Auto: shown
-   while no gamepad is connected), extra environment variables for the port (for example
+   while no gamepad is connected), Uncharted 2's accurate GPU memory (on: its grenade explosions,
+   vehicle damage and chapter 21's convoy need it; off is a few percent faster in busy scenes),
+   extra environment variables for the port (for example
    `TU_DEBUG=sysmem` for a driver package).
 5. **Play**: the collection's menu starts; Uncharted 2 and 3 are started from it (the app
    restarts itself).
@@ -104,6 +108,13 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
    are at the bottom right, L1/L2 and R1/R2 in the top corners, the D-pad on the left, L3/R3 at
    the bottom middle, the touch pad button and Options at the top. Several fingers at once.
    Opacity, size and the camera drag's sensitivity are in the panel.
+8. **Updates**: when the app starts it asks this repository's releases for a newer version (once
+   an hour at most; **Updates** in the launcher turns that off and has **Check now**) and offers
+   it with its notes. **Update** downloads the APK from the release, checks its checksum and that
+   it is this app signed with the same key, and Android installs it over the app, keeping the
+   settings and saves; the first time Android asks to let the app install apps. A build of your
+   own (signed with another key) is not offered the releases: Android would not install them
+   over it.
 
 In the game, L3+R3 opens the port's menu. The first time a place is shown its shaders are compiled
 (stutters). The saves live in the app's folder, which Android deletes with the app: **Back up

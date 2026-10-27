@@ -40,6 +40,7 @@ int runtime_fiber_describe(char* out, size_t size, uint64_t rsp);
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <mutex>
 #include <algorithm>
@@ -56,6 +57,7 @@ using FEXCore::X86State::REG_RDX;
 using FEXCore::X86State::REG_RSI;
 using FEXCore::X86State::REG_RDI;
 using FEXCore::X86State::REG_RSP;
+using FEXCore::X86State::REG_RBP;
 using FEXCore::X86State::REG_R8;
 using FEXCore::X86State::REG_R9;
 using FEXCore::X86State::REG_R10;
@@ -183,8 +185,27 @@ struct HostThread {
   FEXCore::Core::CpuStateFrame* hle_frame = nullptr; // inside a host function the guest called
   uint32_t hle_id = 0;
   bool hle_replaced = false;                    // guest_context_set during that call
+  uint32_t tid = 0;                             // gettid(), for the host function trace
 };
 thread_local HostThread t_host;
+
+// g2-arm64: the host function trace (diagnosis), HleTraceStart below: each record one call.
+struct HleRecord {
+  uint32_t id, tid;
+  uint64_t caller;             // the guest's call site
+  uint64_t args[3];            // the first three integer arguments
+  uint64_t enter_ns, leave_ns; // CLOCK_MONOTONIC
+};
+constexpr size_t kHleMaxRecords = 1 << 20;
+HleRecord* g_hle = nullptr;
+std::atomic<size_t> g_hle_n {0};
+std::atomic<bool> g_hle_on {false};
+
+uint64_t MonotonicNs() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
 
 FEXCore::Context::Context* g_context = nullptr;
 FEXCore::HostFeatures g_features {};
@@ -224,7 +245,17 @@ public:
     const uint32_t saved_id = t.hle_id;
     const bool saved_replaced = t.hle_replaced;
     t.hle_frame = frame; t.hle_id = id; t.hle_replaced = false;
+    const bool trace = g_hle_on.load(std::memory_order_relaxed);
+    uint64_t caller = 0, enter = 0;
+    if (trace) {
+      std::memcpy(&caller, reinterpret_cast<const void*>(rsp), sizeof(caller));
+      enter = MonotonicNs();
+    }
     bb_call_host(f.fn, x, d, out, stack);
+    if (trace) {
+      const size_t i = g_hle_n.fetch_add(1, std::memory_order_relaxed);
+      if (i < kHleMaxRecords) g_hle[i] = {id, t.tid, caller, {x[0], x[1], x[2]}, enter, MonotonicNs()};
+    }
     const bool replaced = t.hle_replaced;
     t.hle_frame = saved_frame; t.hle_id = saved_id; t.hle_replaced = saved_replaced;
     if (replaced) return st.gregs[REG_RAX]; // guest_context_set wrote the whole state
@@ -291,8 +322,11 @@ void EnsureThread() {
 // that long; the handler maps the host pc in translated code back to the guest rip
 // (RestoreRIPFromHostPC). The log gets the hottest guest rips with their code bytes, the host
 // functions the guest was inside, and samples per thread.
+// g2-arm64: a host function's samples carry the guest's call site (and the frame above it through
+// rbp), and each thread gets its own top entries: where each game thread waits, called from where.
 struct ProfSample {
   uint64_t key; // guest rip, or host function id
+  uint64_t caller, caller2; // a host function's: the guest's return address, the one above it
   uint32_t tid;
   uint8_t kind; // 0 translated code, 1 host function, 2 elsewhere (dispatcher, JIT compiler)
 };
@@ -304,19 +338,34 @@ ProfSample* g_prof = nullptr;
 std::atomic<size_t> g_prof_n {0};
 std::atomic<bool> g_prof_on {false};
 
+// Guest memory without a fault on a bad address (a signal handler reading a guessed frame).
+bool ProfRead(void* out, uint64_t address, size_t size) {
+  iovec local {out, size}, remote {reinterpret_cast<void*>(address), size};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
+}
+
 void ProfSignal(int, siginfo_t*, void* ctx) {
   if (!g_prof_on.load(std::memory_order_relaxed)) return;
   const int saved_errno = errno;
   HostThread& t = t_host;
   if (t.fex) {
     const auto pc = static_cast<uint64_t>(static_cast<ucontext_t*>(ctx)->uc_mcontext.pc);
-    ProfSample sample {0, static_cast<uint32_t>(gettid()), 2};
+    ProfSample sample {0, 0, 0, static_cast<uint32_t>(gettid()), 2};
     if (g_context->IsAddressInCodeBuffer(t.fex, pc)) {
       sample.kind = 0;
       sample.key = g_context->RestoreRIPFromHostPC(t.fex, pc);
     } else if (t.hle_frame) {
       sample.kind = 1;
       sample.key = t.hle_id;
+      // [rsp] at the veneer's syscall is the call site; rbp, when it looks like the caller's
+      // frame pointer, gives the frame above it.
+      const auto& st = t.hle_frame->State;
+      const uint64_t rsp = st.gregs[REG_RSP], rbp = st.gregs[REG_RBP];
+      uint64_t frame[2];
+      ProfRead(&sample.caller, rsp, 8);
+      if (rbp > rsp && rbp - rsp < (64u << 10) && !(rbp & 7) && ProfRead(frame, rbp, sizeof(frame))) {
+        sample.caller2 = frame[1];
+      }
     } else {
       sample.key = t.fex->CurrentFrame->State.rip;
     }
@@ -327,51 +376,75 @@ void ProfSignal(int, siginfo_t*, void* ctx) {
 }
 
 void ProfRegisterThread() {
+  t_host.tid = static_cast<uint32_t>(gettid());
   const uint32_t i = g_prof_ntids.fetch_add(1);
-  if (i < kProfMaxThreads) g_prof_tids[i].store(static_cast<uint32_t>(gettid()));
+  if (i < kProfMaxThreads) g_prof_tids[i].store(t_host.tid);
+}
+
+struct ProfEntry {
+  uint8_t kind;
+  uint64_t key, caller, caller2;
+  size_t count;
+};
+
+bool ProfSame(const ProfSample& a, const ProfSample& b) {
+  return a.kind == b.kind && a.key == b.key && a.caller == b.caller && a.caller2 == b.caller2;
+}
+
+// Entries of sorted samples (equal ones adjacent), the most frequent first.
+std::vector<ProfEntry> ProfGroup(const ProfSample* begin, const ProfSample* end, size_t* per_kind) {
+  std::vector<ProfEntry> entries;
+  for (const ProfSample* i = begin; i < end;) {
+    const ProfSample* j = i;
+    while (j < end && ProfSame(*j, *i)) ++j;
+    entries.push_back({i->kind, i->key, i->caller, i->caller2, static_cast<size_t>(j - i)});
+    if (per_kind) per_kind[i->kind] += j - i;
+    i = j;
+  }
+  std::sort(entries.begin(), entries.end(), [](const ProfEntry& a, const ProfEntry& b) { return a.count > b.count; });
+  return entries;
+}
+
+void ProfPrint(const char* indent, const ProfEntry& e, double percent, bool bytes) {
+  if (e.kind == 1) {
+    const char* name = e.key < g_functions.size() ? g_functions[e.key].name : nullptr;
+    std::printf("%s%5.1f%%  host function %s from %#llx", indent, percent, name ? name : "?",
+                (unsigned long long)e.caller);
+    if (e.caller2) std::printf(" (above it %#llx)", (unsigned long long)e.caller2);
+    std::printf("\n");
+    return;
+  }
+  std::printf("%s%5.1f%%  %s rip %#llx", indent, percent, e.kind == 0 ? "guest" : "other", (unsigned long long)e.key);
+  if (bytes) {
+    // The code around it, for a disassembler: 32 bytes before, 64 from the rip.
+    std::printf("  bytes@-32:");
+    const auto* code = reinterpret_cast<const uint8_t*>(e.key - 32);
+    for (int k = 0; k < 96; ++k) std::printf("%s%02x", k == 32 ? "|" : "", code[k]);
+  }
+  std::printf("\n");
 }
 
 void ProfReport(size_t n, double secs) {
   std::sort(g_prof, g_prof + n, [](const ProfSample& a, const ProfSample& b) {
-    return a.kind != b.kind ? a.kind < b.kind : a.key < b.key;
+    if (a.kind != b.kind) return a.kind < b.kind;
+    if (a.key != b.key) return a.key < b.key;
+    return a.caller != b.caller ? a.caller < b.caller : a.caller2 < b.caller2;
   });
-  struct Entry {
-    uint8_t kind;
-    uint64_t key;
-    size_t count;
-  };
-  std::vector<Entry> entries;
   size_t per_kind[3] = {};
-  for (size_t i = 0; i < n;) {
-    size_t j = i;
-    while (j < n && g_prof[j].kind == g_prof[i].kind && g_prof[j].key == g_prof[i].key) ++j;
-    entries.push_back({g_prof[i].kind, g_prof[i].key, j - i});
-    per_kind[g_prof[i].kind] += j - i;
-    i = j;
-  }
-  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.count > b.count; });
+  const auto entries = ProfGroup(g_prof, g_prof + n, per_kind);
   std::printf("Guest profile: %zu samples in %.1f s: translated code %.1f%%, host functions %.1f%%, "
               "elsewhere %.1f%%\n",
               n, secs, 100.0 * per_kind[0] / n, 100.0 * per_kind[1] / n, 100.0 * per_kind[2] / n);
   int shown = 0, dumped = 0;
   for (const auto& e : entries) {
     if (shown++ == 60) break;
-    if (e.kind == 1) {
-      const char* name = e.key < g_functions.size() ? g_functions[e.key].name : nullptr;
-      std::printf("  %5.1f%%  host function %s\n", 100.0 * e.count / n, name ? name : "?");
-      continue;
-    }
-    std::printf("  %5.1f%%  %s rip %#llx", 100.0 * e.count / n, e.kind == 0 ? "guest" : "other",
-                (unsigned long long)e.key);
-    if (e.kind == 0 && dumped++ < 16) {
-      // The code around it, for a disassembler: 32 bytes before, 64 from the rip.
-      std::printf("  bytes@-32:");
-      const auto* code = reinterpret_cast<const uint8_t*>(e.key - 32);
-      for (int k = 0; k < 96; ++k) std::printf("%s%02x", k == 32 ? "|" : "", code[k]);
-    }
-    std::printf("\n");
+    const bool bytes = e.kind == 0 && dumped < 16;
+    dumped += bytes;
+    ProfPrint("  ", e, 100.0 * e.count / n, bytes);
   }
-  std::sort(g_prof, g_prof + n, [](const ProfSample& a, const ProfSample& b) { return a.tid < b.tid; });
+  // Per thread (a stable sort keeps each thread's samples in the order above): its entries of 2%
+  // and up.
+  std::stable_sort(g_prof, g_prof + n, [](const ProfSample& a, const ProfSample& b) { return a.tid < b.tid; });
   for (size_t i = 0; i < n;) {
     size_t j = i, k0 = 0, k1 = 0;
     while (j < n && g_prof[j].tid == g_prof[i].tid) {
@@ -387,6 +460,11 @@ void ProfReport(size_t n, double secs) {
     }
     std::printf("  thread %u %-16s %6zu samples (%.0f%% of the ticks): translated %zu, host %zu\n",
                 g_prof[i].tid, name, j - i, 100.0 * (j - i) / (secs * 1000.0), k0, k1);
+    int k = 0;
+    for (const auto& e : ProfGroup(g_prof + i, g_prof + j, nullptr)) {
+      if (k++ == 8 || e.count * 50 < j - i) break;
+      ProfPrint("      ", e, 100.0 * e.count / (j - i), false);
+    }
     i = j;
   }
   std::fflush(stdout);
@@ -430,6 +508,68 @@ void ProfStart() {
   sigaction(SIGPROF, &sa, nullptr);
   std::thread(ProfThread, std::atof(secs), std::string(trigger)).detach();
   std::printf("Guest profile: armed (%s s), trigger file %s\n", secs, trigger);
+}
+
+// g2-arm64: the host function trace (diagnosis). BB_HLE_TRACE=<seconds> with
+// BB_HLE_TRACE_FILE=<file>: once <file>.trigger appears (it is deleted), every host function call
+// of the guest is recorded for that long (at most 1M calls; one that has not returned 200 ms after
+// the window is not): the function, the thread, the guest's call site, the first three integer
+// arguments, when it was entered and left. Written to <file> (HleRecord's) with the functions'
+// names in <file>.names and the threads' in <file>.threads ("<id> <name>" lines); read by
+// scripts/g2/hle_trace.py (what blocks which thread how long; the frame pacing).
+void HleTraceThread(double secs, std::string file) {
+  const std::string trigger = file + ".trigger";
+  for (;;) {
+    while (access(trigger.c_str(), F_OK) != 0) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    unlink(trigger.c_str());
+    std::printf("Host function trace: recording for %.1f s\n", secs);
+    std::fflush(stdout);
+    g_hle_n = 0;
+    g_hle_on = true;
+    std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+    g_hle_on = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // calls in flight
+    const size_t calls = g_hle_n.load(), n = std::min(calls, kHleMaxRecords);
+    bool written = false;
+    if (FILE* out = std::fopen(file.c_str(), "wb")) {
+      written = std::fwrite(g_hle, sizeof(HleRecord), n, out) == n;
+      written = std::fclose(out) == 0 && written;
+    }
+    if (FILE* names = std::fopen((file + ".names").c_str(), "w")) {
+      std::scoped_lock lock {g_functions_mutex};
+      for (size_t i = 0; i < g_functions.size(); ++i)
+        std::fprintf(names, "%zu %s\n", i, g_functions[i].name ? g_functions[i].name : "?");
+      std::fclose(names);
+    }
+    if (FILE* threads = std::fopen((file + ".threads").c_str(), "w")) {
+      const uint32_t count = std::min<uint32_t>(g_prof_ntids.load(), kProfMaxThreads);
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t tid = g_prof_tids[i].load();
+        char path[64], name[32] = "?";
+        std::snprintf(path, sizeof(path), "/proc/self/task/%u/comm", tid);
+        if (FILE* f = std::fopen(path, "r")) {
+          if (std::fgets(name, sizeof(name), f)) name[strcspn(name, "\n")] = 0;
+          std::fclose(f);
+        }
+        std::fprintf(threads, "%u %s\n", tid, name);
+      }
+      std::fclose(threads);
+    }
+    std::printf("Host function trace: %zu calls%s, %s %s\n", calls,
+                calls > n ? " (the buffer kept the first 1M)" : "", written ? "written to" : "NOT written to",
+                file.c_str());
+    std::fflush(stdout);
+  }
+}
+
+void HleTraceStart() {
+  const char* secs = std::getenv("BB_HLE_TRACE");
+  const char* file = std::getenv("BB_HLE_TRACE_FILE");
+  if (!secs || !file) return;
+  g_hle = static_cast<HleRecord*>(std::calloc(kHleMaxRecords, sizeof(HleRecord)));
+  if (!g_hle) return;
+  std::thread(HleTraceThread, std::atof(secs), std::string(file)).detach();
+  std::printf("Host function trace: armed (%s s), trigger file %s.trigger\n", secs, file);
 }
 
 } // namespace
@@ -491,6 +631,7 @@ int guest_cpu_init(void) {
   if (!g_context->InitCore()) return -1;
   std::printf("Guest CPU: FEXCore (AVX %s)\n", g_features.SupportsAVX ? "yes" : "no");
   ProfStart();
+  HleTraceStart();
   return 0;
 }
 

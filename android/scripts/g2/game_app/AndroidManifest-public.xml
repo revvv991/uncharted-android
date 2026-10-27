@@ -7,11 +7,18 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.INTERNET" /> <!-- driver packages from GitHub (the launcher) -->
+    <uses-permission android:name="android.permission.INTERNET" /> <!-- driver packages and updates from GitHub (the launcher) -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" /> <!-- updates (Updater.java) -->
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <application android:label="uncharted-android" android:hasCode="true" android:extractNativeLibs="true"
         android:hardwareAccelerated="true" android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <!-- Updates (Updater.java): the releases of this repository, offered only to an app signed
+             with the release key (this certificate's SHA-256; Android installs an update only over
+             an app signed with the same key, so a build of your own is not offered them). -->
+        <meta-data android:name="update_repo" android:value="revvv991/uncharted-android" />
+        <meta-data android:name="update_signer"
+            android:value="e9f4c3735869e415fbf21647eafb7991b05d6e926f9daf0eea0f88fc3e7bc60b" />
         <!-- singleTask: one launcher, which finishes when it starts the game; the icon then makes
              a new one, and that brings a running game back to the front (Launcher.resumeGame). -->
         <activity android:name="dev.unchartedg2.game.Launcher" android:exported="true"

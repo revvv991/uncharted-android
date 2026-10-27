@@ -8,7 +8,7 @@ the port's `scripts/`).
 | `scripts/build_all.sh` | The public APK from source in one go (pinned sources, our patches) |
 | `scripts/publish/` | The public repository's release commit, made locally (nothing is pushed) |
 | `scripts/port-arm64/` | The Android build: dependencies, FEXCore, Turnip, loader and renderer |
-| `scripts/port-arm64/patches/` | FEX and Mesa patches; the list of the port's changes 0001-0103 |
+| `scripts/port-arm64/patches/` | FEX and Mesa patches; the list of the port's changes 0001-0104 |
 | `scripts/g2/game_app/` | The APK (no Gradle): build, install, run |
 | `scripts/g2/` | G2 tools: resolution recipes and patches, profiles, temperatures, data collection |
 | `scripts/g2/runs/` | Scripted runs and A/B tests |

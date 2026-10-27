@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.ActivityManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInstaller;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Color;
@@ -25,10 +26,12 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
@@ -44,6 +47,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import org.json.JSONArray;
@@ -54,6 +58,7 @@ import org.json.JSONObject;
  *  (libbbprepare.so: the port's scripts/prepare.py and link_modules.py in C), a few settings,
  *  then GameActivity with files/args*.txt and env*.txt written from them. Nothing of the game
  *  ships with the app: the patch presets are checked against the user's executables first.
+ *  New versions come from the project's GitHub releases (Updater.java).
  *  adb automation: am start -n <app>/dev.unchartedg2.game.Launcher --es game_dir <path> [--ez backup_saves true]
  *  [--es driver turnip|system|pkg:<name>] [--es driver_zip <path>: install and select that package]
  *  [--es extra_env "KEY=VALUE\\nKEY=VALUE": the extra environment field]
@@ -100,7 +105,7 @@ public class Launcher extends Activity {
     private RadioGroup resolution;
     private RadioGroup fpsLimit;
     private RadioGroup touchPad;
-    private CheckBox showFps, uncapped;
+    private CheckBox showFps, uncapped, accurateGpu;
     private LinearLayout driverList;
     private RadioGroup drivers;
     private volatile boolean busy;
@@ -137,6 +142,7 @@ public class Launcher extends Activity {
         files = d != null ? d : getFilesDir();
         buildViews();
         handle(getIntent());
+        initUpdates(getIntent());
     }
 
     @Override
@@ -165,8 +171,13 @@ public class Launcher extends Activity {
         return false;
     }
 
-    /** The adb automation extras: game_dir, backup_saves, prepare, play. */
+    /** The adb automation extras: game_dir, backup_saves, prepare, play; the package installer's
+     *  answers about an update. */
     private void handle(Intent intent) {
+        if (Updater.ACTION_INSTALL_STATUS.equals(intent.getAction())) {
+            onInstallStatus(intent);
+            return;
+        }
         String dir = intent.getStringExtra("game_dir");
         if (dir != null) setFolder(dir);
         refresh();
@@ -183,6 +194,8 @@ public class Launcher extends Activity {
     protected void onResume() {
         super.onResume();
         refresh(); // back from the system's "all files access" screen
+        // Back from "install unknown apps" with an update waiting for it.
+        if (pendingInstall != null && getPackageManager().canRequestPackageInstalls()) installUpdate(pendingInstall);
     }
 
     // ---- views ----
@@ -319,6 +332,17 @@ public class Launcher extends Activity {
                  + "decrypted (a dump of CUSA02344, CUSA02320 or CUSA02343, version 01.02 for the "
                  + "sizes below 1920x1080).");
 
+        // A newer release (Updater.java): shown by showUpdates, tinted with the accent.
+        updateCard = card(root, null);
+        ((GradientDrawable) updateCard.getBackground()).setColor((accent & 0x00FFFFFF) | 0x26000000);
+        updateTitle = text(updateCard, "", 17, true);
+        updateTitle.setPadding(0, 0, 0, dp(2));
+        updateInfo = note(updateCard, "");
+        LinearLayout updateRow = row(updateCard);
+        button(updateRow, "Update", v -> startUpdate());
+        button(updateRow, "What's new", v -> offerUpdate(true));
+        updateCard.setVisibility(View.GONE);
+
         LinearLayout folder = card(root, "Game folder");
         folderText = text(folder, "", 15, false);
         folderInfo = note(folder, "");
@@ -446,6 +470,9 @@ public class Launcher extends Activity {
         text(root, "Auto: shown while no gamepad is connected (phones). Left half of the screen: a stick under "
                  + "the finger; right half: drag to look around; the buttons at the edges. The panel in the game "
                  + "has the same setting with opacity and size.", 14, false);
+        accurateGpu = check(root, "Uncharted 2: accurate GPU memory", "u2_accurate_gpu", true);
+        text(root, "Uncharted 2 reads the results of some GPU work back: grenade explosions, vehicle damage, the "
+                 + "convoy of chapter 21. Off: a few percent faster in busy scenes, and those break.", 14, false);
         note(root, "In the game, swipe in from the right edge of the screen (or press L3+R3) for the settings "
                  + "panel: upscaling, sharpening, frame generation and more, applied at once.");
         text(root, "More environment for the port (KEY=VALUE per line, optional):", 14, false);
@@ -475,6 +502,18 @@ public class Launcher extends Activity {
             String done = exportLog();
             status(done != null ? "Log copied to " + done : "No log yet (the game has not run), or no access.");
         });
+        String repo = Updater.repo(this);
+        if (repo != null) {
+            LinearLayout updatesCard = card(root, "Updates");
+            note(updatesCard, "This is version " + Updater.installed(this) + ". New versions come from github.com/" + repo
+                              + "/releases: the app downloads the APK from there and checks it (its checksum, and that it is "
+                              + "this app signed with the same key), then Android installs it over this one and keeps the "
+                              + "settings and saves. The first time, Android asks to let this app install apps.");
+            check(updatesCard, "Check for a new version when the app starts", "update_check", true);
+            button(updatesCard, "Check now", v -> checkUpdates(true));
+            updateCheckText = note(updatesCard, "");
+            updateCheckText.setVisibility(View.GONE);
+        }
         button(root, "Licenses", v -> showLicenses());
         setContentView(scroll);
     }
@@ -839,6 +878,11 @@ public class Launcher extends Activity {
             // only, as upstream does (issue #7; it costs elsewhere). More environment overrides.
             if (g[0].equals("u2") && !extraEnv.getText().toString().contains("BB_TINY_READBACK"))
                 env[i] += "BB_TINY_READBACK=1\n";
+            // U2 reads GPU results back from memory it also writes (grenades, vehicle damage,
+            // chapter 21's convoy), which merging leaves on the GPU: accurate GPU memory, as
+            // upstream runs U2. More environment overrides.
+            if (g[0].equals("u2") && accurateGpu.isChecked() && !extraEnv.getText().toString().contains("BB_GPU_MERGE"))
+                env[i] += "BB_GPU_MERGE=0\n";
         }
         StringBuilder e = new StringBuilder();
         e.append("# Written by the launcher on every start; edit the settings there.\n");
@@ -1059,7 +1103,7 @@ public class Launcher extends Activity {
             .setNegativeButton("Cancel", null).show();
     }
 
-    private static HttpURLConnection open(String url) throws IOException {
+    static HttpURLConnection open(String url) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(15000);
         c.setReadTimeout(60000);
@@ -1069,10 +1113,221 @@ public class Launcher extends Activity {
         return c;
     }
 
-    private static String fetch(String url) throws IOException {
+    static String fetch(String url) throws IOException {
         try (InputStream in = open(url).getInputStream()) {
             return new String(in.readAllBytes(), "UTF-8");
         }
+    }
+
+    // ---- updates (Updater.java) ----
+
+    /** How often the app looks by itself; the last answer is shown meanwhile. */
+    private static final long UPDATE_INTERVAL_MS = 60 * 60 * 1000L;
+
+    private LinearLayout updateCard;
+    private TextView updateTitle, updateInfo, updateCheckText;
+    private List<Updater.Release> updates = new ArrayList<>(); // newer than this version, the newest first
+    private volatile boolean updating;
+    private boolean updateOffered; // the dialog by itself once per launcher
+    private File pendingInstall; // an update waiting for "install unknown apps"
+
+    /** The last check's answer, then a check when one is due, or the offer from that answer
+     *  (with the automatic check on; not for adb automation or the installer's answers). */
+    private void initUpdates(Intent intent) {
+        if (Updater.repo(this) == null) return;
+        List<Updater.Release> known = new ArrayList<>();
+        try {
+            JSONArray cached = new JSONArray(prefs.getString("update_releases", "[]"));
+            for (int i = 0; i < cached.length(); i++) {
+                Updater.Release r = Updater.Release.fromJson(cached.getJSONObject(i));
+                if (Updater.compareVersions(r.version, Updater.installed(this)) > 0) known.add(r);
+            }
+        } catch (Exception e) {
+            known.clear();
+        }
+        showUpdates(known);
+        if (intent.hasExtra("play") || intent.hasExtra("prepare") || Updater.ACTION_INSTALL_STATUS.equals(intent.getAction())
+                || !prefs.getBoolean("update_check", true)) return;
+        if (System.currentTimeMillis() - prefs.getLong("update_checked", 0) > UPDATE_INTERVAL_MS) checkUpdates(false);
+        else offerUpdate(false);
+    }
+
+    /** Asks the releases API in the background; `manual` (the button) reports every outcome. */
+    private void checkUpdates(boolean manual) {
+        String repo = Updater.repo(this);
+        if (repo == null) return;
+        if (manual) checkAnswer("Looking for a new version ...");
+        new Thread(() -> {
+            try {
+                List<Updater.Release> found = Updater.newer(repo, Updater.installed(this));
+                JSONArray cache = new JSONArray();
+                for (Updater.Release r : found) cache.put(r.toJson());
+                prefs.edit().putString("update_releases", cache.toString())
+                    .putLong("update_checked", System.currentTimeMillis()).apply();
+                runOnUiThread(() -> {
+                    showUpdates(found);
+                    if (manual) checkAnswer(found.isEmpty() ? "This is the newest version (" + Updater.installed(this) + ")." : "");
+                    offerUpdate(manual);
+                });
+            } catch (Exception e) {
+                if (manual) checkAnswer("Looking for a new version failed: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    /** Check now answers under its button: the status line is far above it. */
+    private void checkAnswer(String s) {
+        runOnUiThread(() -> {
+            updateCheckText.setText(s);
+            updateCheckText.setVisibility(s.isEmpty() ? View.GONE : View.VISIBLE);
+        });
+    }
+
+    /** The card at the top: the newest version there is, when newer than this one. */
+    private void showUpdates(List<Updater.Release> found) {
+        updates = found;
+        if (found.isEmpty()) {
+            updateCard.setVisibility(View.GONE);
+            deleteTree(updateDir()); // the download of a version now installed
+            return;
+        }
+        Updater.Release r = found.get(0);
+        boolean skipped = r.version.equals(prefs.getString("update_skip", ""));
+        updateTitle.setText("Version " + r.version + " is available");
+        updateInfo.setText("This is " + Updater.installed(this) + ". The update: " + Math.max(1, r.size >> 20) + " MB"
+                           + (r.published.isEmpty() ? "" : ", published " + r.published) + "."
+                           + (skipped ? " Skipped: not offered when the app starts." : ""));
+        updateCard.setVisibility(View.VISIBLE);
+    }
+
+    /** What is new, with Update and Later (and Skip when it comes by itself: once per launcher,
+     *  not for a skipped version). */
+    private void offerUpdate(boolean manual) {
+        if (updates.isEmpty() || updating || isFinishing() || isDestroyed()) return;
+        Updater.Release r = updates.get(0);
+        if (!manual && (updateOffered || r.version.equals(prefs.getString("update_skip", "")))) return;
+        updateOffered = true;
+        StringBuilder s = new StringBuilder("This is version " + Updater.installed(this) + ". The update is "
+                                            + Math.max(1, r.size >> 20) + " MB; Android installs it over this one and "
+                                            + "keeps the settings and saves.");
+        for (Updater.Release n : updates)
+            s.append("\n\n").append(n.version).append(n.published.isEmpty() ? "" : " (" + n.published + ")")
+             .append("\n\n").append(Updater.plainNotes(n.notes));
+        ScrollView scroll = new ScrollView(this);
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextSize(14);
+        t.setLineSpacing(0, 1.1f);
+        t.setPadding(dp(24), dp(8), dp(24), dp(8));
+        t.setTextIsSelectable(true);
+        scroll.addView(t);
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+            .setTitle("uncharted-android " + r.version + " is available").setView(scroll)
+            .setPositiveButton("Update", (d, w) -> startUpdate())
+            .setNegativeButton("Later", null);
+        if (!manual) b.setNeutralButton("Skip this version", (d, w) -> {
+            prefs.edit().putString("update_skip", r.version).apply();
+            showUpdates(updates);
+        });
+        b.show();
+    }
+
+    /** The newest release's APK downloaded (a progress dialog) and checked, then installUpdate. */
+    private void startUpdate() {
+        if (updates.isEmpty() || updating) return;
+        Updater.Release r = updates.get(0);
+        updating = true;
+        AtomicBoolean cancel = new AtomicBoolean();
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24), dp(8), dp(24), dp(4));
+        TextView label = new TextView(this);
+        label.setText("Downloading " + r.apkName + " ...");
+        box.addView(label);
+        ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        bar.setMax(100);
+        box.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this).setTitle("Updating to " + r.version)
+            .setView(box).setCancelable(false).setNegativeButton("Cancel", (d, w) -> cancel.set(true)).show();
+        long[] shown = {-1};
+        new Thread(() -> {
+            try {
+                File apk = Updater.download(r, updateDir(), (done, total) -> {
+                    long percent = total > 0 ? done * 100 / total : 0;
+                    if (percent == shown[0]) return;
+                    shown[0] = percent;
+                    runOnUiThread(() -> {
+                        bar.setProgress((int) percent);
+                        label.setText((done >> 20) + " of " + (total >> 20) + " MB");
+                    });
+                }, cancel);
+                runOnUiThread(() -> label.setText("Checking the download ..."));
+                String problem = Updater.checkApk(this, apk);
+                if (problem != null) {
+                    apk.delete();
+                    throw new IOException(problem);
+                }
+                runOnUiThread(() -> {
+                    dialog.dismiss();
+                    updating = false;
+                    installUpdate(apk);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    dialog.dismiss();
+                    updating = false;
+                    updateStatus(cancel.get() ? "Update cancelled." : "Updating failed: " + e.getMessage());
+                });
+            }
+        }).start();
+    }
+
+    /** Android's installer, once this app may install apps (Android asks the user once). */
+    private void installUpdate(File apk) {
+        if (!getPackageManager().canRequestPackageInstalls()) {
+            pendingInstall = apk;
+            new android.app.AlertDialog.Builder(this).setTitle("Allow the update")
+                .setMessage("Android installs the update once this app may install apps: turn on \"Allow from this "
+                            + "source\" on the next screen, then come back here.")
+                .setPositiveButton("Open the setting", (d, w) -> startActivity(
+                    new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()))))
+                .setNegativeButton("Cancel", (d, w) -> pendingInstall = null).show();
+            return;
+        }
+        pendingInstall = null;
+        try {
+            Updater.install(this, apk);
+            updateStatus("Installing " + apk.getName() + " ... The app closes when Android has installed it: open it "
+                         + "again from its icon.");
+        } catch (Exception e) {
+            updateStatus("Installing failed: " + e.getMessage());
+        }
+    }
+
+    /** The installer's answers (Updater.ACTION_INSTALL_STATUS): its confirmation screen first. */
+    private void onInstallStatus(Intent intent) {
+        int code = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (code == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class);
+            if (confirm != null) startActivity(confirm);
+        } else if (code == PackageInstaller.STATUS_SUCCESS) {
+            updateStatus("Updated to " + Updater.installed(this) + ".");
+        } else if (code == PackageInstaller.STATUS_FAILURE_ABORTED) {
+            updateStatus("Update cancelled.");
+        } else {
+            String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+            updateStatus("Installing the update failed" + (message != null ? ": " + message : "."));
+        }
+    }
+
+    /** An update's outcome: on the status line and as a toast (the page may be scrolled away from it). */
+    private void updateStatus(String s) {
+        status(s);
+        runOnUiThread(() -> Toast.makeText(this, s, Toast.LENGTH_LONG).show());
+    }
+
+    private File updateDir() {
+        return new File(getCacheDir(), "update");
     }
 
     // ---- saves ----

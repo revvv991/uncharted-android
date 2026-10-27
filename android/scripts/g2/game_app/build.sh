@@ -23,10 +23,12 @@ KEYSTORE=${KEYSTORE:-$HOME/android/debug.keystore}
 KEYSTORE_PASS=${KEYSTORE_PASS:-pass:android}
 MANIFEST=$HERE/AndroidManifest.xml
 # The version: android/VERSION (major.minor.patch); the code is major*10000 + minor*100 + patch.
+# VERSION_SUFFIX (test builds, e.g. -test) goes into the name only: the launcher's updates take
+# such a build for older than the release of the same number.
 VERSION=$(tr -d '[:space:]' < "$HERE/../../../VERSION")
 V1=${VERSION%%.*} V3=${VERSION##*.} V2=${VERSION#*.}
 V2=${V2%.*}
-LINK_EXTRA=(--version-name "$VERSION" --version-code $((V1 * 10000 + V2 * 100 + V3)) --replace-version)
+LINK_EXTRA=(--version-name "$VERSION${VERSION_SUFFIX:-}" --version-code $((V1 * 10000 + V2 * 100 + V3)) --replace-version)
 if [ "$PUBLIC" = 1 ]; then
     MANIFEST=$HERE/AndroidManifest-public.xml
     LINK_EXTRA+=(--rename-manifest-package "$APP_ID")
@@ -37,7 +39,7 @@ if [ -n "$ASSETS_DIR" ]; then cp -r "$ASSETS_DIR"/. "$W/assets/"; fi
 LINK_EXTRA+=(-A "$W/assets")
 cd "$W"
 javac -nowarn -source 11 -target 11 -classpath "$JAR" -d classes \
-    $(find "$SDLJAVA" -name '*.java') "$HERE/GameActivity.java" "$HERE/Launcher.java" 2>&1 | grep -v "^warning\|^Note:" || true
+    $(find "$SDLJAVA" -name '*.java') "$HERE/GameActivity.java" "$HERE/Launcher.java" "$HERE/Updater.java" 2>&1 | grep -v "^warning\|^Note:" || true
 "$BT/d8" --release --min-api 33 --lib "$JAR" --output . $(find classes -name '*.class')
 "$BT/aapt2" link -o base.apk -I "$JAR" --manifest "$MANIFEST" \
     --min-sdk-version 33 --target-sdk-version 35 "${LINK_EXTRA[@]}"
