@@ -32,6 +32,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include "bbport_tsc.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
@@ -1870,6 +1871,57 @@ LiveShaderDebug& LiveDebug() {
     return state;
 }
 } // namespace
+
+// g2-arm64 diagnosis: BB_NULL_TEXTURE_LOG=1 names each shader binding that samples a null T#
+// once, with where the T#'s first dword comes from in the flat buffer ("unknown": the translation
+// could not place it, so it reads as null). A black material with a valid-looking draw.
+static void NoteNullTexture(const Shader::Info& stage, u32 index, const Shader::ImageResource& res,
+                            const AmdGpu::Image& sharp) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_NULL_TEXTURE_LOG");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = u64(u32(stage.pgm_hash)) << 8 | index;
+    {
+        std::scoped_lock lock{mutex};
+        if (!seen.insert(key).second) {
+            return;
+        }
+    }
+    const auto location = res.sharp_fetch.offsets[0];
+    char where[32];
+    if (!(res.sharp_fetch.load_mask & 1)) {
+        std::snprintf(where, sizeof(where), "an immediate");
+    } else if (location == Shader::UNKNOWN_LOCATION) {
+        std::snprintf(where, sizeof(where), "unknown");
+    } else {
+        std::snprintf(where, sizeof(where), "flat dword %u", u32(location));
+    }
+    std::printf("Null texture: %s %08x image %u (T# from %s, words %08x %08x, flat size %zu)\n",
+                stage.sw_stage == Shader::SwStage::Compute ? "cs" : "gfx", u32(stage.pgm_hash),
+                index, where, reinterpret_cast<const u32*>(&sharp)[0],
+                reinterpret_cast<const u32*>(&sharp)[1], stage.FlatUserData().size());
+    std::fflush(stdout);
+}
+
+// g2-arm64: runs `read` (diagnostic reads through values that may be no pointers) under a
+// recovery point: a fault in it returns false instead of stopping the game (probe.c).
+template <typename Read>
+static bool ReadGuarded(Read&& read) {
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        return false;
+    }
+    runtime_fault_recover = &recover;
+    read();
+    runtime_fault_recover = nullptr;
+    return true;
+}
 
 // bbport: BB_JITTER_PS=<pixel shader hash>,... (run.py, Uncharted): full-screen passes that
 // rebuild positions from the scene depth through an interpolated texture coordinate, jittered
@@ -3758,10 +3810,25 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         const char* env = std::getenv("BB_TRACE_FROM");
         return env ? std::strtoull(env, nullptr, 10) : 0ull;
     }();
-    if (trace_hash && u32(stage.pgm_hash) == u32(trace_hash) &&
-        checkpoint_seq.load(std::memory_order_relaxed) + 1 >= trace_from) {
-        static std::atomic<u32> traced{0};
-        if (traced.fetch_add(1, std::memory_order_relaxed) < 6) {
+    // g2-arm64: the live "trace <hash>" line of BB_SHADER_DEBUG_FILE traces the buffers too: the
+    // next 8 draws after each change, 64 words each.
+    u64 live_hash = 0;
+    u32 live_generation = 0;
+    if (LiveShaderDebugFile()) {
+        auto& live = LiveDebug();
+        live_hash = live.trace.load(std::memory_order_relaxed);
+        live_generation = live.trace_generation.load(std::memory_order_relaxed);
+    }
+    const bool live_match = live_hash && u32(stage.pgm_hash) == u32(live_hash);
+    if (live_match || (trace_hash && u32(stage.pgm_hash) == u32(trace_hash) &&
+                       checkpoint_seq.load(std::memory_order_relaxed) + 1 >= trace_from)) {
+        static std::atomic<u32> traced{0}, live_traced{0}, traced_generation{0};
+        if (live_match && traced_generation.exchange(live_generation, std::memory_order_relaxed) !=
+                              live_generation) {
+            live_traced.store(0, std::memory_order_relaxed);
+        }
+        if (live_match ? live_traced.fetch_add(1, std::memory_order_relaxed) < 8
+                       : traced.fetch_add(1, std::memory_order_relaxed) < 6) {
             std::printf("Trace %08x buffers of draw #%llu:\n", u32(stage.pgm_hash),
                         static_cast<unsigned long long>(checkpoint_seq.load() + 1));
             for (u32 i = 0; i < stage.buffers.size(); ++i) {
@@ -3779,11 +3846,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     const char* env = std::getenv("BB_TRACE_WORDS");
                     return env ? std::max(1u, u32(std::strtoul(env, nullptr, 10))) : 15u;
                 }();
-                if (v.base_address && memory->IsValidGpuMapping(v.base_address, trace_words * 4)) {
-                    const auto* words = reinterpret_cast<const u32*>(v.base_address);
-                    for (u32 w = 0; w < trace_words; ++w) {
-                        std::printf(" %08x", words[w]);
-                    }
+                const u32 words_n = live_match ? std::max(trace_words, 64u) : trace_words;
+                if (v.base_address && memory->IsValidGpuMapping(v.base_address, words_n * 4) &&
+                    !ReadGuarded([&] {
+                        const auto* words = reinterpret_cast<const u32*>(v.base_address);
+                        for (u32 w = 0; w < words_n; ++w) {
+                            std::printf(" %08x", words[w]);
+                        }
+                    })) {
+                    std::printf(" (unreadable)");
                 }
                 std::printf("\n");
             }
@@ -4086,7 +4157,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             // The constant blocks behind the user data pointer (SGPR0-1): its words, and the
             // first 16 floats of the blocks its pointer pairs 2/3, 4/5 and 6/7 lead to.
             const auto ud = stage.UserData();
-            if (ud.size() >= 2) {
+            // g2-arm64: a pair that is no pointer can lead to unreadable memory (0x3fe000 on U2's
+            // rooftops, a host fault that stopped the game): the reads are guarded.
+            if (ud.size() >= 2 && !ReadGuarded([&] {
                 const VAddr p = VAddr(ud[0]) | VAddr(ud[1]) << 32;
                 if (memory->IsValidGpuMapping(p, 32)) {
                     const auto* pw = reinterpret_cast<const u32*>(p);
@@ -4112,6 +4185,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                         std::printf("\n");
                     }
                 }
+            })) {
+                std::printf(" (unreadable)\n");
             }
             for (u32 i = 0; i < stage.samplers.size(); ++i) {
                 const auto s = stage.samplers[i].GetSharp(stage);
@@ -4207,6 +4282,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            NoteNullTexture(stage, image_index, image_desc, tsharp);
             image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
             image_binding_entries.push_back(nullptr);
             binding_proxy_ok.push_back(false);

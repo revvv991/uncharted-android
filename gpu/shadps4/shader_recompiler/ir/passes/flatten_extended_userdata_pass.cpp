@@ -44,9 +44,9 @@ u32 ReadConstWindowSize(u64 pgm_hash) {
         // The tiled light of U1/U2 (cs 43b8ee5e) reads 224-byte light records (56 dwords) from
         // the start of its block, light i at dword 56 * i, up to 127 lights (a 128-bit mask in
         // LDS). The default window held lights 0-3 whole; the others read its last dword. Its
-        // lights' cookie T#s follow at dword 7220 + 8 * i: 7476 covers 32 of them (the T# table
-        // the resource patching pass binds).
-        std::vector<std::pair<u64, u32>> list{{0x43b8ee5eull, 7476}};
+        // lights' cookie T#s follow at dword 7220 + 8 * i: 8244 covers all 128 of them (the T#
+        // table the resource patching pass binds).
+        std::vector<std::pair<u64, u32>> list{{0x43b8ee5eull, 8244}};
         const char* p = std::getenv("BB_RC_WINDOW");
         while (p && *p) {
             char* end = nullptr;

@@ -247,8 +247,10 @@ struct SharpTable {
     u32 stride_dw;
     u32 count;
 };
-/// image_infos and the bindings of a pipeline hold 64 images (Shader::NUM_IMAGES).
-constexpr u32 MaxSharpTable = 32;
+/// The tiled light draws up to 127 lights (a 128-bit mask): with 32 entries its lights 32 and
+/// up took light 31's cookie, a lamp lighting all around it (U2's rooftops at night, 45-49
+/// lights). The rasterizer binds Shader::NUM_IMAGE_DESCRIPTORS images.
+constexpr u32 MaxSharpTable = 128;
 
 /// The offset ((index * stride + base) >> 2) (+ 0), as the T#'s first dword computes it.
 static bool MatchTableOffset(IR::Value value, IR::Value& index, u32& stride_bytes,

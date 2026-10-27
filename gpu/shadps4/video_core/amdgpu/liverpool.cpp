@@ -1771,7 +1771,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
-                        pixel_counter += OcclusionCounterStep;
+                        // g2-arm64 diagnosis: toggle bit 60 stops the counter, so a query's
+                        // end equals its begin: "nothing visible".
+                        if (!BbToggle::Disabled(BbToggle::OcclusionHidden)) {
+                            pixel_counter += OcclusionCounterStep;
+                        }
+                        BbStats::occlusion_dumps.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
                 break;

@@ -108,8 +108,8 @@ public:
     /// g2-arm64 (from uncharted_Linux c443a3b): copies up to 64 GPU-written bytes to guest
     /// memory once the GPU has run the commands recorded so far, without waiting for it here
     /// (small compute results the game's CPU code reads, e.g. Uncharted's auto-exposure
-    /// value). Skipped while the region is not GPU-written or every slot is in flight.
-    void ReadMemoryAsync(VAddr device_addr, u32 size);
+    /// value). Skipped while the region is not GPU-written or every slot is in flight (false).
+    bool ReadMemoryAsync(VAddr device_addr, u32 size);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -234,6 +234,11 @@ private:
     std::unordered_map<VAddr, std::vector<ShadowRange>> shadows;
     std::atomic<u32> shadow_pages{0};
     void ShadowGpuData(VAddr page, u64 length);
+    /// g2-arm64 (from Uncharted-arm 27fbd42): a guest write next to a few GPU-written bytes of
+    /// the page (not on them): those bytes reach guest memory once the GPU has written them
+    /// (ReadMemoryAsync), and the write does not wait. False when the page holds more GPU data,
+    /// or the write lands on it.
+    bool DeliverSmallGpuDataLater(VAddr page, u64 length, VAddr address, u64 size);
 
     /// bbport: GPU data a guest write lands on, written by GPU work that has completed: read
     /// back on a second queue of the graphics family, which waits for nothing queued since
@@ -241,6 +246,16 @@ private:
     struct SideQueue;
     std::unique_ptr<SideQueue> side_queue;
     bool DownloadOnSideQueue(VAddr page, u64 length);
+    /// g2-arm64 (from Uncharted-arm 34d7e4d): without a side queue, on a GPU whose memory the
+    /// CPU reaches (unified memory: Adreno), the same read back is a copy from the GPU memory
+    /// itself once the writing work has completed (BB_UMA_READBACK=0: off; only with
+    /// BB_GPU_MERGE=0). The arena memory is mapped as it is allocated.
+    bool uma_read_back{};
+    bool uma_coherent{};
+    std::mutex mapped_mutex;
+    std::unordered_map<VkDeviceMemory, u8*> mapped_backings;
+    void MapBacking(vk::DeviceMemory memory, u32 type_index);
+    bool ReadMapped(VAddr addr, u64 size);
 
     /// bbport: deferred raycaster copies (DeferGuestCopy).
     struct Landing;

@@ -13,6 +13,9 @@ namespace Shader {
 
 static constexpr u32 NUM_USER_DATA_REGS = 16;
 static constexpr u32 NUM_IMAGES = 64;
+/// g2-arm64: image descriptors a pipeline binds: its images, a T# table (ImageResource::
+/// table_count, up to 128 entries) counted entry by entry.
+static constexpr u32 NUM_IMAGE_DESCRIPTORS = 192;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
 static constexpr u32 NUM_FMASKS = 8;

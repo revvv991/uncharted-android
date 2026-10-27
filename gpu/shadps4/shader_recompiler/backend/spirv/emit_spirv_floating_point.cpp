@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "bbport_nan_guard.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -165,6 +166,11 @@ static bool SaturateNan() {
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {
     const Id zero{ctx.ConstF32(f32{0.0})};
     const Id one{ctx.ConstF32(f32{1.0})};
+    // g2-arm64: fragment shaders always (BbNanGuard::SaturateNanFragment), as NMin(NMax(x, 0), 1):
+    // NaN -> 0 for 3 more Turnip instructions in U1's statue shader, the IsNan select for 24.
+    if (ctx.sw_stage == Shader::SwStage::Fragment && BbNanGuard::SaturateNanFragment()) {
+        return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);
+    }
     const Id clamped{ctx.OpFClamp(ctx.F32[1], value, zero, one)};
     if (!SaturateNan() || ctx.sw_stage != Shader::SwStage::Vertex) {
         return clamped;

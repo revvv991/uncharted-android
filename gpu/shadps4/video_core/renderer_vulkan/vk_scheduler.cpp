@@ -615,6 +615,23 @@ bool DeferredSubmitWanted() {
 }
 } // namespace
 
+namespace {
+/// g2-arm64: ends a command buffer that is about to be submitted; with read backs from mapped
+/// GPU memory (g_host_read_barrier) its writes are made visible to the host first.
+void EndForSubmission(vk::CommandBuffer cmdbuf) {
+    if (g_host_read_barrier) {
+        const vk::MemoryBarrier2 to_host = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+    }
+    Check(cmdbuf.end());
+}
+} // namespace
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     // g2-arm64: a deferred submission takes submit_mutex on the recording thread: none may be
     // pending while this thread holds it and waits for that thread. Direct recording (or
@@ -703,7 +720,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).
     WaitHostCopies();
-    Check(current_cmdbuf.end());
+    EndForSubmission(current_cmdbuf);
     QueueSubmit(current_cmdbuf, info, signal_value);
     work_semaphore.Refresh();
     AllocateWorkerCommandBuffers();
@@ -716,7 +733,7 @@ void Scheduler::SubmitRecorded(vk::CommandBuffer cmdbuf, SubmitInfo& info, u64 s
     // Guest memory copies into staging read by this submission: this thread ran its own
     // (RecordHostCopy) before; the copy threads' may still run.
     BbCopy::WaitAsync();
-    Check(cmdbuf.end());
+    EndForSubmission(cmdbuf);
     {
         std::scoped_lock lk{submit_mutex};
         QueueSubmit(cmdbuf, info, signal_value);

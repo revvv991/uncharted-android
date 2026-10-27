@@ -28,10 +28,11 @@ namespace Serialization {
 // g2-arm64: 10 BB_CS_SPLIT; 11 constant windows per shader and sharps read through them (0047,
 // 0048: cached shaders with windowed reads kept the old clamp and a null cookie); 12 merged with
 // upstream 0.3.9's 10 (motion shaders hold address stand-ins) and 11 (scalar instructions split
-// EXEC scopes)
-static constexpr u32 ShaderBinaryVersion = 12u;
-// g2-arm64: 8 Info::cs_split_safe, 9 T# tables, 10 merged with upstream 0.3.9
-static constexpr u32 ShaderMetaVersion = 10u;
+// EXEC scopes); 13 T# tables of 128 entries; 14 the output clamp's NaN -> 0 in fragment shaders
+static constexpr u32 ShaderBinaryVersion = 14u;
+// g2-arm64: 8 Info::cs_split_safe, 9 T# tables, 10 merged with upstream 0.3.9, 11 T# tables of
+// 128 entries
+static constexpr u32 ShaderMetaVersion = 11u;
 // g2-arm64: 6 HwComputeRuntimeInfo::split_factor, 7 merged with upstream 0.3.9
 static constexpr u32 PipelineKeyVersion = 7u;
 /// bbport (BilalReloaded): the cache name of a shader's SPIR-V. Shaders that gained multi-wave

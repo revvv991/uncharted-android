@@ -35,6 +35,11 @@ class VkCtxScope;
 
 namespace Vulkan {
 
+/// g2-arm64 (from Uncharted-arm 34d7e4d): each submission ends with its writes made visible to
+/// the host, so that GPU data can be read from mapped memory once its tick has completed
+/// (BufferCache, unified memory).
+inline bool g_host_read_barrier = false;
+
 class Instance;
 
 struct RenderAttachment {

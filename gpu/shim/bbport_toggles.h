@@ -74,6 +74,8 @@ enum : std::uint64_t {
     PoolLog = 1ull << 58,
     /// One upscaler frame start per frame (Uncharted draws twice into its display buffer).
     OneFrameStart = 1ull << 59,
+    /// g2-arm64 diagnosis: set: every occlusion query reads "nothing visible" (liverpool.cpp).
+    OcclusionHidden = 1ull << 60,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
@@ -91,6 +93,10 @@ inline std::atomic<std::uint64_t> dead_gpu_drops{0}, gpu_read_backs{0};
 inline std::atomic<std::uint64_t> gpu_merges{0};
 /// ... or read back on the second queue (GPU work done; BufferCache::DownloadOnSideQueue).
 inline std::atomic<std::uint64_t> gpu_side_downloads{0}, gpu_side_download_ns{0};
+/// ... or a few GPU-written bytes next to it delivered once written (DeliverSmallGpuDataLater).
+inline std::atomic<std::uint64_t> gpu_late_deliveries{0};
+/// g2-arm64: occlusion query counter dumps (ZPASS_DONE) the guest asked for.
+inline std::atomic<std::uint64_t> occlusion_dumps{0};
 inline std::atomic<std::int64_t> hot_pages{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};

@@ -189,10 +189,29 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (instance.GetSideQueue() && !(side_env && side_env[0] == '0')) {
         side_queue = std::make_unique<SideQueue>(instance, instance.GetSideQueue());
     }
+    // g2-arm64 (from Uncharted-arm 34d7e4d, 218ab28): how read backs of GPU data (accurate GPU
+    // memory, BB_GPU_MERGE=0) avoid waiting for all the work queued for graphics, if they can.
+    {
+        const auto flags =
+            instance.GetMemoryProperties().memoryTypes[arena_memory_type_index].propertyFlags;
+        const char* merge_env = std::getenv("BB_GPU_MERGE");
+        const char* uma_env = std::getenv("BB_UMA_READBACK");
+        uma_read_back = !side_queue && merge_env && merge_env[0] == '0' &&
+                        !(uma_env && uma_env[0] == '0') &&
+                        bool(flags & vk::MemoryPropertyFlagBits::eHostVisible);
+        uma_coherent = bool(flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    Vulkan::g_host_read_barrier = uma_read_back;
+    const char* read_backs =
+        side_queue       ? "on a side queue"
+        : !uma_read_back ? "no side queue, they wait for the graphics queue"
+        : uma_coherent   ? "from mapped GPU memory (unified memory)"
+                         : "from mapped GPU memory (unified memory, non-coherent)";
+    std::printf("GPU read backs: %s\n", read_backs);
 }
 
 bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
-    if (!side_queue) {
+    if (!side_queue && !uma_read_back) {
         return false;
     }
     const auto start_time = std::chrono::steady_clock::now();
@@ -277,11 +296,19 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
             total += end - start;
         });
     }
-    auto& side = *side_queue;
-    if (total > SideQueue::StagingSize) {
+    if (!side_queue) {
+        // g2-arm64 (from Uncharted-arm 34d7e4d): unified memory: the completed GPU writes are
+        // read where they are. A range not mapped leaves the read back to the full path.
+        for (const auto& copy : copies) {
+            if (!ReadMapped(arena->cpu_addr + copy.srcOffset, copy.size)) {
+                return false;
+            }
+        }
+    } else if (total > SideQueue::StagingSize) {
         return false;
     }
-    if (total != 0) {
+    if (side_queue && total != 0) {
+        auto& side = *side_queue;
         std::scoped_lock lk{side.mutex};
         Vulkan::Check(side.device.resetCommandPool(*side.pool));
         Vulkan::Check(side.cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
@@ -329,6 +356,65 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
             .count(),
         std::memory_order_relaxed);
     return true;
+}
+
+void BufferCache::MapBacking(vk::DeviceMemory device_memory, u32 type_index) {
+    const auto flags = instance.GetMemoryProperties().memoryTypes[type_index].propertyFlags;
+    if (!uma_read_back || !(flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+        return;
+    }
+    void* data = nullptr;
+    if (instance.GetDevice().mapMemory(device_memory, 0, VK_WHOLE_SIZE, {}, &data) ==
+            vk::Result::eSuccess &&
+        data) {
+        std::scoped_lock lk{mapped_mutex};
+        mapped_backings[static_cast<VkDeviceMemory>(device_memory)] = static_cast<u8*>(data);
+    }
+}
+
+bool BufferCache::ReadMapped(VAddr addr, u64 size) {
+    const VAddr end = addr + size;
+    VAddr at = addr;
+    bool ok = true;
+    resident_ranges.ForEachInRange(addr >> block_shift, ((end - 1) >> block_shift) + 1,
+                                   [&](const Backing& backing) {
+        if (!ok || at >= end) {
+            return;
+        }
+        const VAddr from = std::max<VAddr>(at, backing.start << block_shift);
+        const VAddr to = std::min<VAddr>(end, backing.end << block_shift);
+        if (from != at || from >= to) { // not resident in between
+            ok = false;
+            return;
+        }
+        u8* mapped = nullptr;
+        {
+            std::scoped_lock lk{mapped_mutex};
+            const auto it = mapped_backings.find(static_cast<VkDeviceMemory>(backing.memory));
+            mapped = it == mapped_backings.end() ? nullptr : it->second;
+        }
+        if (!mapped) {
+            ok = false;
+            return;
+        }
+        const u64 offset = backing.offset + (from - (backing.start << block_shift));
+        if (!uma_coherent) {
+            const u64 atom = instance.NonCoherentAtomSize();
+            const u64 first = Common::AlignDown(offset, atom);
+            const vk::MappedMemoryRange range = {
+                .memory = backing.memory,
+                .offset = first,
+                .size = Common::AlignUp(offset + (to - from), atom) - first,
+            };
+            if (instance.GetDevice().invalidateMappedMemoryRanges(range) != vk::Result::eSuccess) {
+                ok = false;
+                return;
+            }
+        }
+        memory->TryWriteBacking(std::bit_cast<u8*>(from), mapped + offset, to - from);
+        at = to;
+    });
+    return ok && at == end;
 }
 
 // bbport: deferred raycaster copies (see landing_gate.h). The guest part of the copy is made at
@@ -704,7 +790,7 @@ struct FaultEvent {
     u32 frame;
     u32 gpu_write;
     u32 gpu_use;
-    u32 kind; // 1 dropped, 2 merged, 3 read back
+    u32 kind; // 1 dropped, 2 merged, 3 read back, 4 on the side queue, 5 delivered later
 };
 constexpr u64 FaultHistorySize = 1u << 16;
 std::unique_ptr<FaultEvent[]> fault_history;
@@ -761,6 +847,14 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
             const u32 frames = g_guest_frames.load(std::memory_order_relaxed);
             const u32 gpu_write = memory_tracker->LatestGpuWriteFrame(page, length);
             const u32 gpu_use = LastGpuUse(page, length);
+            // g2-arm64 (from Uncharted-arm 27fbd42): with accurate GPU memory, a few GPU-written
+            // bytes beside the write reach guest memory once written, and the write goes on.
+            if (!merge && DeliverSmallGpuDataLater(page, length, device_addr, size)) {
+                memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+                BbStats::gpu_late_deliveries.fetch_add(1, std::memory_order_relaxed);
+                NoteFault(page, length, frames, gpu_write, gpu_use, 5);
+                return;
+            }
             if (DownloadOnSideQueue(page, length)) {
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
                 BbStats::gpu_side_downloads.fetch_add(1, std::memory_order_relaxed);
@@ -815,7 +909,8 @@ void PrintFaultHistory(VAddr address, u64 size) {
         return;
     }
     static constexpr const char* kinds[] = {"?", "dropped", "merged", "read back",
-                                            "read back on the side queue"};
+                                            "read back on the side queue",
+                                            "delivered once written"};
     const u64 total = fault_events.load();
     const u64 oldest = total > FaultHistorySize ? total - FaultHistorySize : 0;
     const u32 now = g_guest_frames.load();
@@ -825,7 +920,7 @@ void PrintFaultHistory(VAddr address, u64 size) {
         if (e.page < address + size && address < e.page + e.length) {
             std::printf("GPU crash:       page 0x%llx+0x%x %s %u frames ago (GPU write frame %u, "
                         "last bound %u, fault frame %u)\n",
-                        static_cast<unsigned long long>(e.page), e.length, kinds[std::min<u32>(e.kind, 4)],
+                        static_cast<unsigned long long>(e.page), e.length, kinds[std::min<u32>(e.kind, 5)],
                         now - e.frame, e.gpu_write, e.gpu_use, e.frame);
             ++printed;
         }
@@ -966,11 +1061,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
-void BufferCache::ReadMemoryAsync(VAddr device_addr, u32 size) {
+bool BufferCache::ReadMemoryAsync(VAddr device_addr, u32 size) {
     static constexpr u32 SlotSize = 64;
     static constexpr u32 NumSlots = 4096;
     if (size == 0 || size > SlotSize || !IsRegionGpuModified(device_addr, size)) {
-        return;
+        return false;
     }
     if (!async_readback) {
         async_readback = std::make_unique<Buffer>(instance, 0, u64{SlotSize} * NumSlots,
@@ -979,14 +1074,14 @@ void BufferCache::ReadMemoryAsync(VAddr device_addr, u32 size) {
     }
     const u32 slot = async_next_slot++ % NumSlots;
     if (async_slot_busy[slot].load(std::memory_order_acquire)) {
-        return; // the copy before it has not landed yet; the next end-of-pipe event copies again
+        return false; // the copy before it has not landed yet; the next event copies again
     }
     const u32 first_block = device_addr >> block_shift;
     const u32 last_block = (device_addr + size - 1) >> block_shift;
     const Buffer* arena = GetArena(first_block, last_block);
     if (!arena || device_addr < arena->cpu_addr ||
         device_addr + size > arena->cpu_addr + arena->size_bytes) {
-        return;
+        return false;
     }
     const vk::BufferCopy copy{
         .srcOffset = device_addr - arena->cpu_addr,
@@ -1003,6 +1098,55 @@ void BufferCache::ReadMemoryAsync(VAddr device_addr, u32 size) {
                                 async_readback->mapped_data.data() + offset, size);
         async_slot_busy[slot].store(false, std::memory_order_release);
     });
+    return true;
+}
+
+bool BufferCache::DeliverSmallGpuDataLater(VAddr page, u64 length, VAddr address, u64 size) {
+    // Uncharted 2 copies a GPU counter (GDS) into a slot of a page where its CPU code writes a
+    // ring of records every frame, never over the slots: with accurate GPU memory each record
+    // waited ~9 ms for the GPU (8 submissions behind) on the Odin 3. The slot reaches guest
+    // memory once the GPU has written it, as small compute results do at end-of-pipe events
+    // (Rasterizer::ReadBackSmallWrittenBuffers). Only a few bytes (64) keep the rest exact:
+    // large GPU results the game reads back still wait. BB_LATE_GPU_DATA=0: off.
+    static constexpr u64 MaxBytes = 64;
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_LATE_GPU_DATA");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || length != TRACKER_BYTES_PER_PAGE) {
+        return false;
+    }
+    {
+        std::scoped_lock lk{shadow_mutex};
+        if (shadows.contains(page)) {
+            return false;
+        }
+    }
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 8> ranges;
+    u64 total = 0;
+    bool overlaps = false;
+    gpu_modified_ranges.ForEachInRange(page, length, [&](VAddr start, VAddr end) {
+        ranges.emplace_back(start, end);
+        total += end - start;
+        overlaps |= start < address + size && address < end;
+    });
+    // GPU data running on into the next or previous page is part of something larger.
+    const bool isolated = ranges.empty() ||
+                          ((ranges.front().first != page ||
+                            !gpu_modified_ranges.Intersects(page - 1, 1)) &&
+                           (ranges.back().second != page + length ||
+                            !gpu_modified_ranges.Intersects(page + length, 1)));
+    if (ranges.empty() || overlaps || total > MaxBytes || !isolated) {
+        return false;
+    }
+    for (const auto& [start, end] : ranges) {
+        if (!ReadMemoryAsync(start, u32(end - start))) {
+            return false; // copies already recorded only land early: the full path follows
+        }
+    }
+    gpu_modified_ranges.Subtract(page, length);
+    memory_tracker->UnmarkRegionAsGpuModified(page, length);
+    return true;
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -1490,6 +1634,7 @@ u64 BufferCache::AllocateArenaMemory(u64 size, vk::DeviceMemory& memory) {
             const auto r = instance.GetDevice().allocateMemory(alloc_info);
             result = r.result;
             if (result == vk::Result::eSuccess) {
+                MapBacking(r.value, alloc_info.memoryTypeIndex);
                 arena_chunks.push_back({r.value, try_size, size, false});
                 Vulkan::Vram::arena_bytes.fetch_add(try_size, std::memory_order_relaxed);
                 Vulkan::Vram::arena_count.fetch_add(1, std::memory_order_relaxed);
@@ -1506,6 +1651,7 @@ u64 BufferCache::AllocateArenaMemory(u64 size, vk::DeviceMemory& memory) {
         alloc_info.allocationSize = std::max(size, chunk_size);
         const auto r = instance.GetDevice().allocateMemory(alloc_info);
         if (r.result == vk::Result::eSuccess) {
+            MapBacking(r.value, alloc_info.memoryTypeIndex);
             arena_chunks.push_back({r.value, alloc_info.allocationSize, size, false});
             Vulkan::Vram::arena_bytes.fetch_add(alloc_info.allocationSize,
                                                 std::memory_order_relaxed);
@@ -1524,6 +1670,7 @@ u64 BufferCache::AllocateArenaMemory(u64 size, vk::DeviceMemory& memory) {
     Vulkan::Vram::host_fallbacks.fetch_add(1, std::memory_order_relaxed);
     Vulkan::Vram::urgent.store(true, std::memory_order_relaxed);
     const auto host_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    MapBacking(host_memory, alloc_info.memoryTypeIndex);
     arena_chunks.push_back({host_memory, alloc_info.allocationSize, size, true});
     const u64 host_total =
         Vulkan::Vram::arena_host_bytes.fetch_add(alloc_info.allocationSize) +
