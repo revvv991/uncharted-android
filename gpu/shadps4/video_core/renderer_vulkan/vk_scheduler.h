@@ -921,6 +921,10 @@ public:
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
     void WaitDeferredSignals();
 
+    /// g2-arm64: the stall report: the copies, submissions and signals deferred to the
+    /// recording thread (issued and done) and its queue (stderr; racy reads).
+    void DescribeStall() const;
+
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;

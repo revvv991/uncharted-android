@@ -1,4 +1,5 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -186,6 +187,11 @@ bool WindowSDL::OnAppEvent(void* userdata, SDL_Event* event) {
         break;
     case SDL_EVENT_WILL_ENTER_FOREGROUND:
     case SDL_EVENT_DID_ENTER_FOREGROUND:
+        if (self->background.load(std::memory_order_acquire)) {
+            // Before the flag clears: the stall report counts from here, not from the last flip.
+            self->foreground_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                      std::memory_order_release);
+        }
         if (self->background.exchange(false, std::memory_order_acq_rel)) {
             std::printf("Window: the app is back in the foreground\n");
             runtime_audio_background(0);

@@ -195,11 +195,14 @@ struct HleRecord {
   uint64_t caller;             // the guest's call site
   uint64_t args[3];            // the first three integer arguments
   uint64_t enter_ns, leave_ns; // CLOCK_MONOTONIC
+  uint64_t result;             // the integer result
 };
 constexpr size_t kHleMaxRecords = 1 << 20;
 HleRecord* g_hle = nullptr;
 std::atomic<size_t> g_hle_n {0};
 std::atomic<bool> g_hle_on {false};
+std::atomic<bool> g_hle_ring {false}; // BB_HLE_TRACE_RING: the last kHleMaxRecords calls are kept
+std::string g_hle_file;
 
 uint64_t MonotonicNs() {
   timespec ts;
@@ -254,7 +257,8 @@ public:
     bb_call_host(f.fn, x, d, out, stack);
     if (trace) {
       const size_t i = g_hle_n.fetch_add(1, std::memory_order_relaxed);
-      if (i < kHleMaxRecords) g_hle[i] = {id, t.tid, caller, {x[0], x[1], x[2]}, enter, MonotonicNs()};
+      if (i < kHleMaxRecords || g_hle_ring.load(std::memory_order_relaxed))
+        g_hle[i % kHleMaxRecords] = {id, t.tid, caller, {x[0], x[1], x[2]}, enter, MonotonicNs(), out[0]};
     }
     const bool replaced = t.hle_replaced;
     t.hle_frame = saved_frame; t.hle_id = saved_id; t.hle_replaced = saved_replaced;
@@ -514,9 +518,45 @@ void ProfStart() {
 // BB_HLE_TRACE_FILE=<file>: once <file>.trigger appears (it is deleted), every host function call
 // of the guest is recorded for that long (at most 1M calls; one that has not returned 200 ms after
 // the window is not): the function, the thread, the guest's call site, the first three integer
-// arguments, when it was entered and left. Written to <file> (HleRecord's) with the functions'
-// names in <file>.names and the threads' in <file>.threads ("<id> <name>" lines); read by
-// scripts/g2/hle_trace.py (what blocks which thread how long; the frame pacing).
+// arguments, when it was entered and left, the integer result. Written to <file> (HleRecord's) with
+// the functions' names in <file>.names and the threads' in <file>.threads ("<id> <name>" lines);
+// read by scripts/g2/hle_trace.py (what blocks which thread how long; the frame pacing).
+// BB_HLE_TRACE_RING=1 with BB_HLE_TRACE_FILE instead: a flight recorder for hangs, the last 1M calls
+// (a few seconds) kept from the start and written when the stall report (probe.c) runs.
+
+// Writes the records of `calls` calls (the ring's last ones, oldest first, once it wrapped).
+bool HleTraceWrite(const std::string& file, size_t calls) {
+  const size_t n = std::min(calls, kHleMaxRecords);
+  const size_t first = calls > kHleMaxRecords ? calls % kHleMaxRecords : 0;
+  bool written = false;
+  if (FILE* out = std::fopen(file.c_str(), "wb")) {
+    written = std::fwrite(g_hle + first, sizeof(HleRecord), n - first, out) == n - first &&
+              std::fwrite(g_hle, sizeof(HleRecord), first, out) == first;
+    written = std::fclose(out) == 0 && written;
+  }
+  if (FILE* names = std::fopen((file + ".names").c_str(), "w")) {
+    std::scoped_lock lock {g_functions_mutex};
+    for (size_t i = 0; i < g_functions.size(); ++i)
+      std::fprintf(names, "%zu %s\n", i, g_functions[i].name ? g_functions[i].name : "?");
+    std::fclose(names);
+  }
+  if (FILE* threads = std::fopen((file + ".threads").c_str(), "w")) {
+    const uint32_t count = std::min<uint32_t>(g_prof_ntids.load(), kProfMaxThreads);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t tid = g_prof_tids[i].load();
+      char path[64], name[32] = "?";
+      std::snprintf(path, sizeof(path), "/proc/self/task/%u/comm", tid);
+      if (FILE* f = std::fopen(path, "r")) {
+        if (std::fgets(name, sizeof(name), f)) name[strcspn(name, "\n")] = 0;
+        std::fclose(f);
+      }
+      std::fprintf(threads, "%u %s\n", tid, name);
+    }
+    std::fclose(threads);
+  }
+  return written;
+}
+
 void HleTraceThread(double secs, std::string file) {
   const std::string trigger = file + ".trigger";
   for (;;) {
@@ -530,31 +570,7 @@ void HleTraceThread(double secs, std::string file) {
     g_hle_on = false;
     std::this_thread::sleep_for(std::chrono::milliseconds(200)); // calls in flight
     const size_t calls = g_hle_n.load(), n = std::min(calls, kHleMaxRecords);
-    bool written = false;
-    if (FILE* out = std::fopen(file.c_str(), "wb")) {
-      written = std::fwrite(g_hle, sizeof(HleRecord), n, out) == n;
-      written = std::fclose(out) == 0 && written;
-    }
-    if (FILE* names = std::fopen((file + ".names").c_str(), "w")) {
-      std::scoped_lock lock {g_functions_mutex};
-      for (size_t i = 0; i < g_functions.size(); ++i)
-        std::fprintf(names, "%zu %s\n", i, g_functions[i].name ? g_functions[i].name : "?");
-      std::fclose(names);
-    }
-    if (FILE* threads = std::fopen((file + ".threads").c_str(), "w")) {
-      const uint32_t count = std::min<uint32_t>(g_prof_ntids.load(), kProfMaxThreads);
-      for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t tid = g_prof_tids[i].load();
-        char path[64], name[32] = "?";
-        std::snprintf(path, sizeof(path), "/proc/self/task/%u/comm", tid);
-        if (FILE* f = std::fopen(path, "r")) {
-          if (std::fgets(name, sizeof(name), f)) name[strcspn(name, "\n")] = 0;
-          std::fclose(f);
-        }
-        std::fprintf(threads, "%u %s\n", tid, name);
-      }
-      std::fclose(threads);
-    }
+    const bool written = HleTraceWrite(file, calls);
     std::printf("Host function trace: %zu calls%s, %s %s\n", calls,
                 calls > n ? " (the buffer kept the first 1M)" : "", written ? "written to" : "NOT written to",
                 file.c_str());
@@ -565,9 +581,19 @@ void HleTraceThread(double secs, std::string file) {
 void HleTraceStart() {
   const char* secs = std::getenv("BB_HLE_TRACE");
   const char* file = std::getenv("BB_HLE_TRACE_FILE");
-  if (!secs || !file) return;
+  const char* ring = std::getenv("BB_HLE_TRACE_RING");
+  const bool ring_mode = ring && ring[0] == '1';
+  if (!file || (!secs && !ring_mode)) return;
   g_hle = static_cast<HleRecord*>(std::calloc(kHleMaxRecords, sizeof(HleRecord)));
   if (!g_hle) return;
+  if (ring_mode) {
+    g_hle_file = file;
+    g_hle_ring = true;
+    g_hle_on = true;
+    std::printf("Host function trace: the last %zu calls kept, written to %s at a stall report\n",
+                kHleMaxRecords, file);
+    return;
+  }
   std::thread(HleTraceThread, std::atof(secs), std::string(file)).detach();
   std::printf("Host function trace: armed (%s s), trigger file %s.trigger\n", secs, file);
 }
@@ -575,6 +601,16 @@ void HleTraceStart() {
 } // namespace
 
 extern "C" {
+
+void guest_cpu_hle_trace_save(void) {
+  if (!g_hle_ring.load() || !g_hle_on.exchange(false)) return;
+  std::this_thread::sleep_for(std::chrono::milliseconds(200)); // calls in flight
+  const size_t calls = g_hle_n.load();
+  const bool written = HleTraceWrite(g_hle_file, calls);
+  std::printf("Host function trace: the last %zu of %zu calls %s %s\n", std::min(calls, kHleMaxRecords),
+              calls, written ? "written to" : "NOT written to", g_hle_file.c_str());
+  std::fflush(stdout);
+}
 
 int guest_cpu_init(void) {
   if (g_context) return 0;

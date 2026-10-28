@@ -676,6 +676,45 @@ s64 LastFlipIntervalNs() {
     return last_flip_interval_ns.load(std::memory_order_relaxed);
 }
 
+s64 LastFlipSubmitNs() {
+    return last_flip_submit_ns.load(std::memory_order_relaxed);
+}
+
+s64 LastMovieFrameNs() {
+    return movie_frame_ns.load(std::memory_order_relaxed);
+}
+
+void VideoOutDriver::DescribeStall() {
+    const auto& port = main_port;
+    char labels[160] = "";
+    int at = 0;
+    for (int i = 0; i < MaxDisplayBuffers && at < int(sizeof(labels)) - 16; ++i) {
+        if (port.buffer_slots[i].group_index >= 0) {
+            at += std::snprintf(labels + at, sizeof(labels) - at, " %d:%llu", i,
+                                static_cast<unsigned long long>(port.buffer_labels[i]));
+        }
+    }
+    long queued = -1, swaps = -1;
+    if (mutex.try_lock()) {
+        queued = long(requests.size());
+        mutex.unlock();
+    }
+    if (swap_mutex.try_lock()) {
+        swaps = long(swap_queue.size()) + (swap_busy ? 1 : 0);
+        swap_mutex.unlock();
+    }
+    std::fprintf(stderr,
+                 "STALL: video out: %ld flip requests queued, %ld presenter jobs; flips pending "
+                 "%d (from the GPU %d), %llu done, current buffer %d, previous %d; labels%s; flip "
+                 "rate %d, vblank count %llu, movie mode %s, EOP flips reached %llu\n",
+                 queued, swaps, port.flip_status.flip_pending_num, port.flip_status.gc_queue_num,
+                 static_cast<unsigned long long>(port.flip_status.count),
+                 port.flip_status.current_buffer, port.prev_index, labels, port.flip_rate,
+                 static_cast<unsigned long long>(port.vblank_status.count),
+                 MovieActive(std::chrono::steady_clock::now()) ? "on" : "off",
+                 static_cast<unsigned long long>(EopFlipsReached()));
+}
+
 void VideoOutDriver::PresentThread(std::stop_token token) {
     const std::chrono::nanoseconds vblank_period(1000000000 /
                                                  EmulatorSettings.GetVblankFrequency());

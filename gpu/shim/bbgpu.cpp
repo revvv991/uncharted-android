@@ -30,6 +30,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
+#include "core/platform.h"
 #include "core/signals.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -332,6 +333,66 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
 
 extern "C" unsigned bbgpu_symbol_count(void) {
     return unsigned(g_symbols.size());
+}
+
+namespace Libraries::VideoOut {
+s64 LastFlipSubmitNs();
+s64 LastFlipIntervalNs();
+s64 LastMovieFrameNs();
+void DescribeStall();
+} // namespace Libraries::VideoOut
+namespace AmdGpu {
+u64 VoWaitLabel();
+} // namespace AmdGpu
+
+// g2-arm64: the stall report (src/probe.c): the flip and display buffer state, the label the
+// command processor sleeps on, the flip interrupts the guest's flips still wait for.
+extern "C" void bbgpu_dump_stall_state(void) {
+    Libraries::VideoOut::DescribeStall();
+    auto& irq = *Platform::IrqC::Instance();
+    const u64 label = AmdGpu::VoWaitLabel();
+    std::fprintf(stderr,
+                 "STALL: command processor %s %#llx; flip interrupts awaited by %ld handlers, "
+                 "end-of-pipe by %ld\n",
+                 label ? "sleeps on the display buffer label at" : "is not on a display buffer label",
+                 static_cast<unsigned long long>(label),
+                 irq.PendingOnce(Platform::InterruptId::GfxFlip),
+                 irq.PendingOnce(Platform::InterruptId::GfxEop));
+    using Platform::InterruptId;
+    std::fprintf(stderr,
+                 "STALL: interrupts signaled: end-of-pipe %llu, flip %llu, compute %llu %llu %llu "
+                 "%llu %llu %llu %llu\n",
+                 irq.Signals(InterruptId::GfxEop), irq.Signals(InterruptId::GfxFlip),
+                 irq.Signals(InterruptId::Compute0RelMem), irq.Signals(InterruptId::Compute1RelMem),
+                 irq.Signals(InterruptId::Compute2RelMem), irq.Signals(InterruptId::Compute3RelMem),
+                 irq.Signals(InterruptId::Compute4RelMem), irq.Signals(InterruptId::Compute5RelMem),
+                 irq.Signals(InterruptId::Compute6RelMem));
+    if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+        rasterizer->DescribeStall();
+    }
+    BbCopy::DescribeStall();
+}
+
+// g2-arm64: the stall report (src/probe.c, BB_STALL_REPORT_SECONDS).
+extern "C" int bbgpu_seconds_without_frame(char* note, uint64_t note_size) {
+    const s64 last_flip = Libraries::VideoOut::LastFlipSubmitNs();
+    if (last_flip == 0 || !g_window || g_window->InBackground()) {
+        return -1;
+    }
+    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (note && note_size) {
+        const s64 movie = Libraries::VideoOut::LastMovieFrameNs();
+        char movie_text[48] = "none so far";
+        if (movie) {
+            std::snprintf(movie_text, sizeof(movie_text), "%.1f s ago", double(now - movie) / 1e9);
+        }
+        std::snprintf(note, note_size,
+                      "the game's last flip %.1f s ago (%.1f ms after the one before), the last "
+                      "movie frame decoded %s\n",
+                      double(now - last_flip) / 1e9,
+                      double(Libraries::VideoOut::LastFlipIntervalNs()) / 1e6, movie_text);
+    }
+    return int((now - std::max(last_flip, g_window->ForegroundSinceNs())) / 1'000'000'000);
 }
 
 // Kernel service thread: runs boost::asio timers for equeue timer events.

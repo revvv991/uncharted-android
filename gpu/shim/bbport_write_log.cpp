@@ -171,3 +171,31 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     }
     std::fprintf(stderr, "Write log: %llu writes logged\n", (unsigned long long)n);
 }
+
+// g2-arm64: the stall report (probe.c): the last `count` logged writes, newest first. A hang
+// that waits for a label shows whether the GPU emulation wrote it and what wrote there after.
+extern "C" void bbgpu_dump_recent_writes(unsigned count) {
+    using namespace BbWriteLog;
+    if (Mode() == 0) {
+        return;
+    }
+#if defined(__aarch64__)
+    std::uint64_t frequency;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+#else
+    const std::uint64_t frequency = 3000000000ull; // the TSC's rate is not known here
+#endif
+    const char* sources[] = {"backing",      "WriteData",           "fence",
+                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)"};
+    const std::uint64_t now = bb_rdtsc();
+    const std::uint64_t n = head.load();
+    const std::uint64_t oldest = n > Size ? n - Size : 0;
+    for (std::uint64_t i = n; i-- > oldest && n - i <= count;) {
+        const Entry& e = ring[i % Size];
+        std::fprintf(stderr, "Write log: %s %#llx +%llu first %#llx tid %u, %.4f s ago\n",
+                     e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
+                     (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
+                     double(now - e.tsc) / double(frequency));
+    }
+    std::fprintf(stderr, "Write log: %llu writes logged\n", (unsigned long long)n);
+}

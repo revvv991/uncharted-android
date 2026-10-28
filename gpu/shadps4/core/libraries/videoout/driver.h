@@ -27,6 +27,14 @@ void NoteMovieFrame();
 /// bbport diagnosis: the time (ns) between the guest's last two flip submissions.
 s64 LastFlipIntervalNs();
 
+/// g2-arm64 diagnosis: steady_clock time (ns) of the guest's last flip submission and of the last
+/// movie frame decoded, 0 before the first (the stall report, bbgpu_seconds_without_frame).
+s64 LastFlipSubmitNs();
+s64 LastMovieFrameNs();
+
+/// g2-arm64: VideoOutDriver::DescribeStall of the open driver (video_out.cpp).
+void DescribeStall();
+
 /// bbport: end-of-pipe flips the GPU side has reached so far (counted by SubmitFlip).
 u64 EopFlipsReached();
 
@@ -107,6 +115,10 @@ public:
                               const BufferAttribute* attribute);
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+
+    /// g2-arm64: the stall report: the flips queued and pending, the display buffer labels, the
+    /// presenter work queued (stderr; never blocks: try_lock, racy reads).
+    void DescribeStall();
 
 private:
     struct Request {

@@ -55,6 +55,9 @@ int guest_cpu_describe_stack(char *out, size_t size);
  * the last sync in guest code) and 256 bytes of guest memory at rbx; the guest rsp. */
 int guest_cpu_describe_registers(char *out, size_t size);
 uint64_t guest_cpu_guest_rsp(void);
+/* g2-arm64: BB_HLE_TRACE_RING=1: writes the host function trace's last calls (the stall report
+ * calls it once); nothing otherwise. */
+void guest_cpu_hle_trace_save(void);
 #define GUEST_CALL(entry, ...) \
     guest_call((uintptr_t)(entry), (const uint64_t[]){__VA_ARGS__}, \
                sizeof((const uint64_t[]){__VA_ARGS__}) / sizeof(uint64_t))

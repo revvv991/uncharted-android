@@ -323,6 +323,20 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_
     KickRecording(true);
 }
 
+void Scheduler::DescribeStall() const {
+    std::fprintf(stderr,
+                 "STALL: recording thread: %zu chunks queued, %s, %s; host copies %llu of %llu "
+                 "done, deferred submissions %llu of %llu, deferred signals %llu of %llu\n",
+                 queued_chunks.load(std::memory_order_relaxed), recorder_busy ? "busy" : "idle",
+                 recorder_sleeping ? "sleeping" : "awake",
+                 static_cast<unsigned long long>(host_copies_done.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(host_copies_issued),
+                 static_cast<unsigned long long>(deferred_submits_done.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(deferred_submits_issued),
+                 static_cast<unsigned long long>(deferred_signals_done->load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(deferred_signals_issued.load(std::memory_order_relaxed)));
+}
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||

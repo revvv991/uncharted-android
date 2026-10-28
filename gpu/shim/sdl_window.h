@@ -34,6 +34,9 @@ public:
     /// g2-arm64 (Android): the app is in the background (set by an SDL event watch the moment
     /// SDL queues the event, before its event pump blocks for the pause).
     bool InBackground() const { return background.load(std::memory_order_acquire); }
+    /// g2-arm64 (Android): steady_clock time (ns) the app last came back to the foreground, 0
+    /// before that: the stall report counts from it (no flips come in the background).
+    s64 ForegroundSinceNs() const { return foreground_ns.load(std::memory_order_acquire); }
     bool IsOpen() const { return is_open.load(std::memory_order_relaxed); }
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
@@ -53,6 +56,7 @@ private:
     SDL_Window* window{};
     WindowSystemInfo window_info{};
     std::atomic<bool> background{false};
+    std::atomic<s64> foreground_ns{0};
     static bool OnAppEvent(void* userdata, union SDL_Event* event);
 };
 

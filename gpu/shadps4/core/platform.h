@@ -67,6 +67,7 @@ struct IrqController {
                    "Unexpected IRQ signaled");
         auto& ctx = irq_contexts.try_emplace(irq).first->second;
         std::unique_lock lock{ctx.m_lock};
+        ++ctx.signals; // g2-arm64: the stall report
 
         LOG_TRACE(Core, "IRQ signaled: {}", magic_enum::enum_name(irq));
 
@@ -82,11 +83,29 @@ struct IrqController {
         }
     }
 
+    /// g2-arm64: the stall report: one-time handlers waiting for their interrupt (a flip the
+    /// guest submitted that the GPU side has not reached), -1 while a handler runs.
+    long PendingOnce(InterruptId irq) {
+        const auto it = irq_contexts.find(irq);
+        if (it == irq_contexts.end()) {
+            return 0;
+        }
+        std::unique_lock lock{it->second.m_lock, std::try_to_lock};
+        return lock ? long(it->second.one_time_subscribers.size()) : -1;
+    }
+
+    /// g2-arm64: the stall report: how often the interrupt was signaled (racy read).
+    unsigned long long Signals(InterruptId irq) {
+        const auto it = irq_contexts.find(irq);
+        return it == irq_contexts.end() ? 0 : it->second.signals;
+    }
+
 private:
     struct IrqContext {
         std::unordered_map<void*, IrqHandler> persistent_handlers{};
         std::queue<IrqHandler> one_time_subscribers{};
         std::mutex m_lock{};
+        unsigned long long signals = 0;
     };
     std::unordered_map<InterruptId, IrqContext> irq_contexts{};
 };

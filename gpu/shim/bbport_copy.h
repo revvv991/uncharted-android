@@ -42,4 +42,8 @@ void WaitAsync();
 /// Callbacks run in the order they were registered.
 void AfterCopies(std::function<void()> callback);
 
+/// g2-arm64: the stall report: the copy tasks pending, the epochs (callbacks waiting for copies)
+/// and whether a thread runs callbacks (stderr; try_lock).
+void DescribeStall();
+
 } // namespace BbCopy

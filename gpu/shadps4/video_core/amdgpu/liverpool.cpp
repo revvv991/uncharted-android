@@ -157,12 +157,31 @@ struct WaitTimer {
     VAddr addr;
     std::chrono::steady_clock::time_point start{};
 };
+
+/// g2-arm64: the stall report: notes the label a queue's wait polls while it does (lives across
+/// co_yield in the task's frame, like WaitTimer).
+struct WaitNote {
+    WaitNote(std::atomic<u64>& slot_, VAddr addr) : slot{slot_} {
+        slot.store(addr, std::memory_order_relaxed);
+    }
+    ~WaitNote() {
+        slot.store(0, std::memory_order_relaxed);
+    }
+    std::atomic<u64>& slot;
+};
 } // namespace
 
 // bbport: packets decoded, for the command processor's idle backoff. g2-arm64: was
 // thread_local (a call to the dynamic TLS resolver per packet: libbbgpu is loaded with dlopen);
 // only the command processor thread decodes, plain loads and stores suffice.
 static std::atomic<u64> g_cp_packets{0};
+
+// g2-arm64: the stall report: the display buffer label the command processor sleeps on (a
+// graphics WaitRegMem in WaitVoLabel), 0 when it does not.
+static std::atomic<u64> g_vo_wait_label{0};
+u64 VoWaitLabel() {
+    return g_vo_wait_label.load(std::memory_order_relaxed);
+}
 
 // bbport: a round over all queues that decoded no packet and finished no submission is a poll
 // of waits (WaitRegMem on a label the guest CPU writes, CE/DE counters). Spinning on it keeps a
@@ -1909,7 +1928,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
+                    g_vo_wait_label.store(reinterpret_cast<u64>(wait_addr), std::memory_order_relaxed);
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    g_vo_wait_label.store(0, std::memory_order_relaxed);
                     break;
                 }
                 // bbport: a fence handed to the draw recording thread counts as written: that
@@ -1925,6 +1946,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // catch up before yielding to other queues.
                 if (!wait_reg_mem->Test(regs.reg_array)) {
                     const WaitTimer wait_timer{0, wait_reg_mem->Address<VAddr>()};
+                    const WaitNote wait_note{mapped_queues[GfxQueueId].wait_label,
+                                             wait_reg_mem->Address<VAddr>()};
                     // g2-arm64 diagnosis: BB_WAIT_DIAG=1: the first unmet graphics waits: the
                     // label, the pending fences that write it, and what satisfied the wait.
                     static const bool wait_diag = std::getenv("BB_WAIT_DIAG") != nullptr;
@@ -2366,6 +2389,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 mem_semaphore->Signal();
             } else if (!mem_semaphore->Signaled()) {
                 const WaitTimer wait_timer{2, mem_semaphore->Address<VAddr>()};
+                const WaitNote wait_note{mapped_queues[vqid + 1].wait_label,
+                                         mem_semaphore->Address<VAddr>()};
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -2380,6 +2405,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (!wait_reg_mem->Test(regs.reg_array)) {
                 const WaitTimer wait_timer{1, wait_reg_mem->Address<VAddr>()};
+                const WaitNote wait_note{mapped_queues[vqid + 1].wait_label,
+                                         wait_reg_mem->Address<VAddr>()};
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     // The value may come from work handed to the draw recording thread.
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
@@ -2534,6 +2561,30 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ++num_submits;
     work_retired = false;
     submit_cv.notify_one();
+}
+
+void Liverpool::DescribeStall() {
+    std::fprintf(stderr,
+                 "STALL: command processor: %u submissions, %u commands, %s, %u queues mapped\n",
+                 num_submits.load(std::memory_order_relaxed),
+                 num_commands.load(std::memory_order_relaxed),
+                 submit_done ? "submit done pending" : "no submit done pending", num_mapped_queues);
+    for (u32 i = 0; i < num_mapped_queues && i < NumTotalQueues; ++i) {
+        auto& queue = mapped_queues[i];
+        std::unique_lock lock{queue.m_access, std::try_to_lock};
+        const long queued = lock ? long(queue.submits.size()) : -1;
+        const u64 label = queue.wait_label.load(std::memory_order_relaxed);
+        if (queued == 0 && label == 0) {
+            continue;
+        }
+        if (label) {
+            // The label's value is not read here: its page may be protected (a read back).
+            std::fprintf(stderr, "STALL:   queue %u: %ld submissions, waits on %#llx\n", i, queued,
+                         static_cast<unsigned long long>(label));
+        } else {
+            std::fprintf(stderr, "STALL:   queue %u: %ld submissions\n", i, queued);
+        }
+    }
 }
 
 } // namespace AmdGpu

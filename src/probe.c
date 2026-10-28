@@ -628,7 +628,38 @@ static void *dump_on_request(void *arg) {
         { ssize_t written_=write(2,head,sizeof(head)-1); (void)written_; }
         dump_exec_maps();
         dump_other_threads();
+        { const char fibers[]="DUMP: fibers:\n"; ssize_t w_=write(2,fibers,sizeof(fibers)-1); (void)w_; }
+        runtime_fiber_dump();
         const char tail[]="DUMP: end\n";
+        { ssize_t written_=write(2,tail,sizeof(tail)-1); (void)written_; }
+    }
+    return NULL;
+}
+/* g2-arm64: the stall report. No flip from the game for BB_STALL_REPORT_SECONDS (10; 0 turns it
+ * off) while the app is in the foreground: every thread's stack goes into the log as with
+ * BB_DUMP_REQUEST (the game goes on), at most twice a run. A hang on a player's device then
+ * shows where the game waits in the log they copy, without adb. */
+static void *stall_watch(void *arg) {
+    const int limit=(int)(intptr_t)arg;
+    int reports=0, stalled=0;
+    while (reports<2) {
+        sleep(2);
+        char note[256]="";
+        const int seconds=bbgpu_seconds_without_frame(note,sizeof(note));
+        if (seconds<limit) { stalled=0; continue; }
+        if (stalled) continue;
+        stalled=1; ++reports;
+        char head[128];
+        const int n=snprintf(head,sizeof(head),"STALL: no frame from the game for %d s in the foreground; thread stacks:\nSTALL: ",seconds);
+        { ssize_t written_=write(2,head,(size_t)n); written_=write(2,note,strlen(note)); (void)written_; }
+        bbgpu_dump_stall_state();
+        dump_exec_maps();
+        dump_other_threads();
+        { const char fibers[]="STALL: fibers:\n"; ssize_t w_=write(2,fibers,sizeof(fibers)-1); (void)w_; }
+        runtime_fiber_dump();
+        bbgpu_dump_recent_writes(3000); /* BB_WRITE_LOG=1: what the GPU side wrote last */
+        guest_cpu_hle_trace_save(); /* BB_HLE_TRACE_RING: the calls that led here */
+        const char tail[]="STALL: end\n";
         { ssize_t written_=write(2,tail,sizeof(tail)-1); (void)written_; }
     }
     return NULL;
@@ -1152,6 +1183,133 @@ static int64_t find_unique_pattern(uint64_t image_size, const char *pattern) {
     }
     return found;
 }
+/* g2-arm64 diagnosis (issue #17): BB_COUNTER_LOG=<file> (U2): a ring of the job manager's counter
+ * events - a job or barrier done whose decrement left the counter at or below 0 (0xf3e09c, with
+ * three slots of the worker's frame, rbp-0x88/-0x80/-0x70: an object and a sequence number seen
+ * there, not the job's function), a SetCounter/decrement notify with a value at or below 0
+ * (0xf29440, with its caller) and every counter freed (0xf29230, with its value and caller).
+ * The first value between -15 and -1 (a counter decremented once too often; frame sequence
+ * counters are far below) freezes the ring, and a thread writes it to <file>
+ * (scripts/g2/counter_log.py). The stubs live in the zero tail of the code segment (0x13e3000). */
+typedef struct { uint64_t counter, value, a, b, c, tsc, rsp, kind; } CounterEvent;
+enum { COUNTER_EVENTS = 1 << 16 };
+static struct { volatile uint64_t next, frozen, pad[6]; CounterEvent events[COUNTER_EVENTS]; } counter_log;
+static void *counter_log_writer(void *arg) {
+    const char *path = arg;
+    while (!counter_log.frozen) usleep(200000);
+    usleep(100000); /* events in flight */
+    FILE *f = fopen(path, "wb");
+    const int ok = f && fwrite(&counter_log, sizeof(counter_log), 1, f) == 1;
+    if (f) fclose(f);
+    printf("Counter log: a counter went below 0 (event %" PRIu64 "), ring %s %s\n",
+           (uint64_t)counter_log.next - 1, ok ? "written to" : "NOT written to", path);
+    fflush(stdout);
+    return NULL;
+}
+static void install_counter_log(uint64_t image_size) {
+    const char *path = getenv("BB_COUNTER_LOG");
+    if (!path || !*path) return;
+    const uint64_t base = 0x400000, cave = 0x13e3000 - base;
+    static const struct { uint64_t at; unsigned char bytes[6]; size_t n; } expect[] = {
+        {0xf3e09c, {0xe8, 0x4f, 0xdb, 0xff, 0xff}, 5},       /* call 0xf3bbf0 after the decrement */
+        {0xf29440, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}, 6}, /* the notify's prologue */
+        {0xf29230, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}, 6}, /* FreeCounter's prologue */
+    };
+    if (cave + 1024 > image_size) { printf("Counter log: no code cave\n"); return; }
+    for (size_t i = 0; i < sizeof(expect) / sizeof(expect[0]); ++i)
+        if (memcmp(image + expect[i].at - base, expect[i].bytes, expect[i].n)) {
+            printf("Counter log: %#" PRIx64 " is not U2's code, off\n", expect[i].at);
+            return;
+        }
+    for (size_t i = 0; i < 1024; ++i)
+        if (image[cave + i]) { printf("Counter log: the code cave is not empty, off\n"); return; }
+    unsigned char *t = image + cave;
+    size_t k = 0;
+    const uint64_t log_base = (uint64_t)(uintptr_t)&counter_log;
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+#define REL32(target) do { const int32_t r_ = (int32_t)((int64_t)(target) - (int64_t)(base + cave + k + 4)); memcpy(t + k, &r_, 4); k += 4; } while (0)
+    /* rax: the ring; rcx: the event; a value above 0 or a frozen ring skips (rel8 to `skip`). */
+#define APPEND(skip_positive)                                                                      \
+    do {                                                                                           \
+        if (skip_positive) { B(0x48, 0x85, 0xf6); B(0x7f); jg_at = k; B(0x00); } /* test rsi; jg */ \
+        B(0x48, 0xb8); memcpy(t + k, &log_base, 8); k += 8;      /* movabs rax, ring */           \
+        B(0x48, 0x83, 0x78, 0x08, 0x00); B(0x75); jne_at = k; B(0x00); /* frozen? */             \
+        B(0xb9, 0x01, 0x00, 0x00, 0x00);                        /* mov ecx, 1 */                  \
+        B(0xf0, 0x48, 0x0f, 0xc1, 0x08);                        /* lock xadd [rax], rcx */        \
+        B(0x81, 0xe1, 0xff, 0xff, 0x00, 0x00);                  /* and ecx, 0xffff */             \
+        B(0x48, 0xc1, 0xe1, 0x06);                              /* shl rcx, 6 */                  \
+        B(0x48, 0x8d, 0x4c, 0x08, 0x40);                        /* lea rcx, [rax+rcx+0x40] */     \
+        B(0x48, 0x89, 0x39);                                    /* mov [rcx], rdi */              \
+    } while (0)
+#define FINISH(kind, freeze)                                                                       \
+    do {                                                                                           \
+        B(0x49, 0x89, 0xc0);                                    /* mov r8, rax */                 \
+        B(0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xc2); /* rdtsc; shl rdx,32; or rdx,rax */ \
+        B(0x48, 0x89, 0x51, 0x28);                              /* mov [rcx+40], rdx */           \
+        B(0x48, 0x89, 0x61, 0x30);                              /* mov [rcx+48], rsp */           \
+        B(0x48, 0xc7, 0x41, 0x38, kind, 0x00, 0x00, 0x00);      /* mov qword [rcx+56], kind */    \
+        if (freeze) {                                                                              \
+            B(0x48, 0x83, 0xfe, 0xf0); B(0x7e); jle_at = k; B(0x00); /* cmp rsi,-16; jle skip */ \
+            B(0x48, 0x85, 0xf6); B(0x79); jns_at = k; B(0x00);  /* test rsi; jns skip */          \
+            B(0x49, 0xc7, 0x40, 0x08, 0x01, 0x00, 0x00, 0x00);  /* mov qword [r8+8], 1 */         \
+        }                                                                                          \
+    } while (0)
+#define LAND(at) do { if (at) t[at] = (unsigned char)(k - (at) - 1); } while (0)
+    size_t jg_at = 0, jne_at = 0, jle_at = 0, jns_at = 0;
+    /* A: a job or barrier done (the worker's frame: entry at rbp-0x88). */
+    const uint64_t stub_a = base + cave + k;
+    APPEND(1);
+    B(0x48, 0x89, 0x71, 0x08);                                  /* mov [rcx+8], rsi */
+    B(0x48, 0x8b, 0x95, 0x78, 0xff, 0xff, 0xff, 0x48, 0x89, 0x51, 0x10); /* fn */
+    B(0x48, 0x8b, 0x55, 0x80, 0x48, 0x89, 0x51, 0x18);          /* data */
+    B(0x48, 0x8b, 0x55, 0x90, 0x48, 0x89, 0x51, 0x20);          /* wait counter */
+    FINISH(1, 1);
+    LAND(jg_at); LAND(jne_at); LAND(jle_at); LAND(jns_at);
+    B(0xe9); REL32(0xf3bbf0);                                   /* jmp 0xf3bbf0 */
+    k = (k + 15) & ~(size_t)15;
+    /* B: the notify (rdi counter, rsi value, [rsp] its caller). */
+    jg_at = jne_at = jle_at = jns_at = 0;
+    const uint64_t stub_b = base + cave + k;
+    APPEND(1);
+    B(0x48, 0x89, 0x71, 0x08);                                  /* mov [rcx+8], rsi */
+    B(0x48, 0x8b, 0x14, 0x24, 0x48, 0x89, 0x51, 0x10);          /* caller */
+    B(0x48, 0xc7, 0x41, 0x18, 0, 0, 0, 0, 0x48, 0xc7, 0x41, 0x20, 0, 0, 0, 0);
+    FINISH(2, 1);
+    LAND(jg_at); LAND(jne_at); LAND(jle_at); LAND(jns_at);
+    B(0x55, 0x48, 0x89, 0xe5, 0x41, 0x57);                      /* the moved prologue */
+    B(0xe9); REL32(0xf29446);
+    k = (k + 15) & ~(size_t)15;
+    /* C: FreeCounter (rdi counter, [rsp] its caller): every free, with the value left. */
+    jg_at = jne_at = jle_at = jns_at = 0;
+    const uint64_t stub_c = base + cave + k;
+    APPEND(0);
+    B(0x48, 0x8b, 0x57, 0x20, 0x48, 0x89, 0x51, 0x08);          /* value */
+    B(0x48, 0x8b, 0x14, 0x24, 0x48, 0x89, 0x51, 0x10);          /* caller */
+    B(0x48, 0xc7, 0x41, 0x18, 0, 0, 0, 0, 0x48, 0xc7, 0x41, 0x20, 0, 0, 0, 0);
+    FINISH(4, 0);
+    LAND(jne_at);
+    B(0x55, 0x48, 0x89, 0xe5, 0x41, 0x57);
+    B(0xe9); REL32(0xf29236);
+#undef LAND
+#undef FINISH
+#undef APPEND
+#undef REL32
+#undef B
+    /* The hooks: a call into stub A, jumps into B and C. */
+    unsigned char *p = image + 0xf3e09c - base;
+    int32_t r = (int32_t)((int64_t)stub_a - (int64_t)(0xf3e09c + 5));
+    p[0] = 0xe8; memcpy(p + 1, &r, 4);
+    p = image + 0xf29440 - base;
+    r = (int32_t)((int64_t)stub_b - (int64_t)(0xf29440 + 5));
+    p[0] = 0xe9; memcpy(p + 1, &r, 4); p[5] = 0x90;
+    p = image + 0xf29230 - base;
+    r = (int32_t)((int64_t)stub_c - (int64_t)(0xf29230 + 5));
+    p[0] = 0xe9; memcpy(p + 1, &r, 4); p[5] = 0x90;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, counter_log_writer, (void *)path) == 0) pthread_detach(thread);
+    printf("Counter log: armed (%zu bytes of stubs at %#" PRIx64 ", ring at %p), written to %s\n", k,
+           base + cave, (void *)&counter_log, path);
+}
 /* Naughty Dog's job manager (all three games): the six NdJobWorkerThreads spin on their queues
  * with `pause` unless the manager's sleep flag (byte +0x59, set by its own SetSleepMode) is on.
  * With it on, an idle worker waits on the manager's condition variable after 1000 spins (10 ms
@@ -1519,6 +1677,12 @@ int main(int argc, char **argv) {
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+#ifndef _WIN32
+        { const char *env=getenv("BB_STALL_REPORT_SECONDS");
+          const long limit=env ? strtol(env,NULL,10) : 10;
+          pthread_t stall_thread;
+          if (limit>0 && pthread_create(&stall_thread,NULL,stall_watch,(void *)(intptr_t)limit)==0) pthread_detach(stall_thread); }
+#endif
     }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
@@ -1558,6 +1722,7 @@ int main(int argc, char **argv) {
         patch_eop_tick_wait(image_end);
         patch_frame_params_wait(image_end);
         patch_job_sleep(image_end);
+        install_counter_log(image_end);
         runtime_display_patch(image, image_end);
     }
 #ifdef _WIN32

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -95,6 +96,23 @@ public:
                 std::this_thread::yield();
             }
         }
+    }
+
+    void DescribeStall() {
+        std::unique_lock lk{mutex, std::try_to_lock};
+        if (!lk) {
+            std::fprintf(stderr, "STALL: copy threads: busy (lock held)\n");
+            return;
+        }
+        std::size_t callbacks = 0;
+        for (const auto& epoch : epochs) {
+            callbacks += epoch.callbacks.size();
+        }
+        std::fprintf(stderr,
+                     "STALL: copy threads: %zu tasks pending, %zu queued, %zu epochs, %zu "
+                     "callbacks waiting, %s\n",
+                     pending, async_tasks.size(), epochs.size(), callbacks,
+                     draining ? "callbacks running" : "no callbacks running");
     }
 
     void Run(std::size_t count, const std::function<void(std::size_t)>& task) {
@@ -304,6 +322,10 @@ void ParallelFor(std::size_t count, const std::function<void(std::size_t)>& task
         return;
     }
     GetPool().Run(count, task);
+}
+
+void DescribeStall() {
+    GetPool().DescribeStall();
 }
 
 } // namespace BbCopy

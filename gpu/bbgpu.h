@@ -49,6 +49,16 @@ int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel);
 void bbgpu_trophy_notify(int grade, const char *game, const char *name, const void *png, uint64_t png_size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+/* g2-arm64: seconds since the game's last flip while the app is in the foreground (counted from
+ * its last return there), -1 before the first flip and in the background; `note` (when given)
+ * gets a line on the flips and movie frames for the stall report. */
+int bbgpu_seconds_without_frame(char *note, uint64_t note_size);
+/* g2-arm64: BB_WRITE_LOG: the last `count` writes of the GPU emulation to guest memory, newest
+ * first, for the stall report; nothing when the log is off. */
+void bbgpu_dump_recent_writes(unsigned count);
+/* g2-arm64: the stall report: video out (flips queued and pending, display buffer labels), the
+ * label the command processor sleeps on, the flip interrupts still awaited (stderr). */
+void bbgpu_dump_stall_state(void);
 #ifdef __cplusplus
 }
 #endif

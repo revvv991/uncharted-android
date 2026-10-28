@@ -94,6 +94,8 @@ public:
         DrainDrawPipe();
         scheduler.WaitHostCopies();
     }
+    /// g2-arm64: the stall report (Liverpool and Scheduler::DescribeStall).
+    void DescribeStall() const;
 
     /// bbport: GPU command thread: waits until the draw recording thread has recorded every
     /// draw handed to it (vk_draw_pipe.h); no-op on other threads.

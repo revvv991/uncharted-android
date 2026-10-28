@@ -36,6 +36,10 @@ namespace AmdGpu {
 
 union PM4Header;
 
+/// g2-arm64: the stall report: the display buffer label the command processor sleeps on, 0
+/// when it does not (liverpool.cpp).
+u64 VoWaitLabel();
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -138,6 +142,10 @@ public:
         }();
         return num_submits == 0 && (work_retired || !use_retired);
     }
+
+    /// g2-arm64: the stall report: the submissions each queue holds and the label a queue's
+    /// wait polls (stderr; racy reads, try_lock).
+    void DescribeStall();
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
@@ -267,6 +275,9 @@ private:
         std::queue<std::chrono::steady_clock::time_point> submit_times{};
         bool front_started{};
         ComputeProgram cs_state{};
+        /// g2-arm64: the label a WaitRegMem or MemSemaphore of this queue polls, 0 when none
+        /// (the stall report).
+        std::atomic<u64> wait_label{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available

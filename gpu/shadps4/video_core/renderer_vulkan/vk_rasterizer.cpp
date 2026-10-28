@@ -686,6 +686,11 @@ bool Rasterizer::UseDrawPipe() const {
     return draw_pipe && !host_markers_enabled && !BbToggle::Disabled(BbToggle::DrawPipeline);
 }
 
+void Rasterizer::DescribeStall() const {
+    liverpool->DescribeStall();
+    scheduler.DescribeStall();
+}
+
 bool Rasterizer::OnStageA() const {
 #ifdef _WIN32
     // bbport (Windows): libc++ compares std::thread::id through winpthreads' pthread_equal,

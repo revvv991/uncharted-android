@@ -11,6 +11,7 @@
  *
  * Fibers without their own context run on the calling thread's stack, below the frame of
  * sceFiberRun; they cannot be suspended and start again from their entry next time. */
+#define _GNU_SOURCE
 #include <unistd.h>
 #include "runtime.h"
 #include <unistd.h>
@@ -19,6 +20,8 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/uio.h>
 #endif
 
 #define FIBER_ERROR_NULL ((int32_t)0x80590001)
@@ -133,6 +136,19 @@ int runtime_fiber_describe(char *out,size_t size,uint64_t rsp) {
     return snprintf(out,size,"  fiber '%.32s' stack %#llx-%#llx (%llu KiB), rsp %#llx %s (%lld bytes used), bottom signature %s\n",
                     f->name,(unsigned long long)lo,(unsigned long long)hi,(unsigned long long)(f->size_context>>10),
                     (unsigned long long)rsp,in ? "inside" : "OUTSIDE",(long long)(hi-rsp),bottom);
+}
+
+/* g2-arm64: the fibers the game initialized, for the stall report: a job waiting on a counter is a
+ * suspended fiber, which no thread's stack shows. */
+#define FIBER_REGISTRY 4096
+static GuestFiber *registry[FIBER_REGISTRY];
+static uint32_t registered;
+static void remember(GuestFiber *fiber) {
+    const uint32_t n=__atomic_load_n(&registered,__ATOMIC_ACQUIRE);
+    for (uint32_t i=0;i<n && i<FIBER_REGISTRY;++i)
+        if (__atomic_load_n(&registry[i],__ATOMIC_RELAXED)==fiber) return;
+    const uint32_t at=__atomic_fetch_add(&registered,1,__ATOMIC_ACQ_REL);
+    if (at<FIBER_REGISTRY) __atomic_store_n(&registry[at],fiber,__ATOMIC_RELEASE);
 }
 
 static void fatal(const char *what,const GuestFiber *fiber) {
@@ -252,6 +268,7 @@ static ABI int32_t fiber_initialize(GuestFiber *fiber,const char *name,FiberEntr
     prepare_context(fiber);
     fiber->magic_start=SIGNATURE_START; fiber->magic_end=SIGNATURE_END;
     __atomic_store_n(&fiber->state,STATE_IDLE,__ATOMIC_RELEASE);
+    remember(fiber);
     return 0;
 }
 static ABI int32_t fiber_opt_initialize(uint32_t *opt) {
@@ -499,4 +516,58 @@ static const RuntimeExport exports[]={
 uintptr_t runtime_fiber_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_fiber_report(void) {
     printf("Runtime: fibers started=%llu, switches=%llu\n",(unsigned long long)fibers_started,(unsigned long long)switches);
+}
+
+/* g2-arm64: every registered fiber's state; a suspended one with the guest registers it waits
+ * with (a counter wait keeps its counter in a callee-saved register), the image addresses on its
+ * stack (its calls) and 64 bytes at rbx. Reads go through process_vm_readv: a bad pointer ends
+ * the read instead of faulting. */
+void runtime_fiber_dump(void) {
+#if !defined(__x86_64__) && !defined(_WIN32)
+    const uint32_t n=__atomic_load_n(&registered,__ATOMIC_ACQUIRE);
+    char line[2048];
+    for (uint32_t i=0;i<n && i<FIBER_REGISTRY;++i) {
+        const GuestFiber *f=__atomic_load_n(&registry[i],__ATOMIC_ACQUIRE);
+        if (!f || !valid(f)) continue;
+        const uint32_t state=__atomic_load_n(&f->state,__ATOMIC_ACQUIRE);
+        int len;
+        if (state==STATE_IDLE && f->saved_rsp) {
+            const uint64_t *g=f->saved.gpr;
+            len=snprintf(line,sizeof(line),"  fiber '%.32s' suspended: rsp %#llx rbx %#llx rbp %#llx r12 %#llx r13 %#llx r14 %#llx r15 %#llx\n   stack:",
+                         f->name,(unsigned long long)g[GUEST_RSP],(unsigned long long)g[GUEST_RBX],(unsigned long long)g[GUEST_RBP],
+                         (unsigned long long)g[GUEST_R12],(unsigned long long)g[GUEST_R13],(unsigned long long)g[GUEST_R14],(unsigned long long)g[GUEST_R15]);
+            uint64_t words[256];
+            struct iovec local={words,sizeof(words)}, remote={(void *)(uintptr_t)g[GUEST_RSP],sizeof(words)};
+            const ssize_t got=process_vm_readv(getpid(),&local,1,&remote,1,0);
+            for (ssize_t w=0,shown=0;got>0 && w<got/8 && shown<24 && len+24<(int)sizeof(line);++w) {
+                if (words[w]<0x400000 || words[w]>=UINT64_C(0x80000000)) continue;
+                len+=snprintf(line+len,sizeof(line)-len," [+%#llx] %#llx",(unsigned long long)(w*8),(unsigned long long)words[w]);
+                ++shown;
+            }
+            /* The calls that led to the wait: the guest's rbp frame chain ([rbp] the caller's
+             * rbp, [rbp+8] the return address), as long as it climbs the fiber's stack. */
+            len+=snprintf(line+len,sizeof(line)-len,"\n   calls:");
+            uint64_t rbp=g[GUEST_RBP];
+            for (int depth=0;depth<16 && len+24<(int)sizeof(line);++depth) {
+                uint64_t frame[2];
+                struct iovec local_f={frame,sizeof(frame)}, remote_f={(void *)(uintptr_t)rbp,sizeof(frame)};
+                if (rbp<g[GUEST_RSP] || process_vm_readv(getpid(),&local_f,1,&remote_f,1,0)!=(ssize_t)sizeof(frame)) break;
+                len+=snprintf(line+len,sizeof(line)-len," %#llx",(unsigned long long)frame[1]);
+                if (frame[0]<=rbp) break;
+                rbp=frame[0];
+            }
+            uint64_t at_rbx[8];
+            struct iovec local_rbx={at_rbx,sizeof(at_rbx)}, remote_rbx={(void *)(uintptr_t)g[GUEST_RBX],sizeof(at_rbx)};
+            if (len+200<(int)sizeof(line) && process_vm_readv(getpid(),&local_rbx,1,&remote_rbx,1,0)==(ssize_t)sizeof(at_rbx))
+                len+=snprintf(line+len,sizeof(line)-len,"\n   [rbx] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                              (unsigned long long)at_rbx[0],(unsigned long long)at_rbx[1],(unsigned long long)at_rbx[2],(unsigned long long)at_rbx[3],
+                              (unsigned long long)at_rbx[4],(unsigned long long)at_rbx[5],(unsigned long long)at_rbx[6],(unsigned long long)at_rbx[7]);
+            len+=snprintf(line+len,sizeof(line)-len,"\n");
+        } else {
+            len=snprintf(line,sizeof(line),"  fiber '%.32s' %s\n",f->name,
+                         state==STATE_RUN ? "running" : state==STATE_IDLE ? "idle (starts from its entry)" : "finalized");
+        }
+        if (len>0) { ssize_t w_=write(2,line,(size_t)len<sizeof(line) ? (size_t)len : sizeof(line)-1); (void)w_; }
+    }
+#endif
 }
