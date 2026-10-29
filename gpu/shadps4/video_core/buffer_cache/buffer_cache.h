@@ -120,8 +120,8 @@ public:
     /// array the guest CPU reads. Instead of waiting for the GPU at the dispatch, the guest part
     /// of the copy is made now and the GPU-written bytes of the source land on a worker thread
     /// once the GPU work that wrote them has completed; the labels the guest learns of the GPU's
-    /// progress from wait for it (landing_gate.h). False when not deferred (no side queue,
-    /// BB_SCALAR_COPY64_DEFER=0): the caller reads back as before.
+    /// progress from wait for it (landing_gate.h). False when not deferred
+    /// (BB_SCALAR_COPY64_DEFER=0, the landing ring full): the caller reads back as before.
     bool DeferGuestCopy(VAddr src, VAddr dst, u64 size);
     u64 PendingLanding() const;
     bool LandingGateActive() const;
@@ -276,6 +276,15 @@ private:
     bool ExecuteLanding(Landing& landing);
     bool WaitLandingTick(u64 tick);
     std::atomic<bool> landing_exited{false};
+    /// g2-arm64: without a side queue (Turnip) a GPU copy right behind the work that wrote the
+    /// source puts its GPU-written bytes into this host-cached ring, and the landing takes them
+    /// from there once that command buffer has completed (BB_LANDING_RING=0: off, the copy waits
+    /// for the GPU at the dispatch). Byte positions that only grow, under landing_mutex: the
+    /// head is moved by registrations, the tail by the landing thread.
+    static constexpr u64 LandingRingSize = 8_MB;
+    std::unique_ptr<Buffer> landing_ring;
+    u64 landing_ring_head{0}, landing_ring_tail{0};
+    std::atomic<u32> landing_ring_full{0};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

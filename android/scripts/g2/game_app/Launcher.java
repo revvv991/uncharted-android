@@ -883,6 +883,12 @@ public class Launcher extends Activity {
             // upstream runs U2. More environment overrides.
             if (g[0].equals("u2") && accurateGpu.isChecked() && !extraEnv.getText().toString().contains("BB_GPU_MERGE"))
                 env[i] += "BB_GPU_MERGE=0\n";
+            // U2's mesh raycasters: their GPU results reach the record arrays the game reads,
+            // once the GPU has made them (without it the game asserts "iSubMesh <
+            // m_numSubMeshInstances" when firing, issue #21; port 0108). More environment
+            // overrides.
+            if (g[0].equals("u2") && !extraEnv.getText().toString().contains("BB_SCALAR_COPY64"))
+                env[i] += "BB_SCALAR_COPY64_SYNC=2\nBB_SCALAR_COPY64_DEFER=1\n";
         }
         StringBuilder e = new StringBuilder();
         e.append("# Written by the launcher on every start; edit the settings there.\n");

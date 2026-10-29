@@ -26,6 +26,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -612,6 +613,15 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
     } else {
+        // g2-arm64: an end-of-pipe flip is raised on a GPU thread (SignalFlip), the owner of the
+        // draw scheduler the frame is prepared with; on the Vulkan recording thread one waited
+        // for that thread itself and the game froze (#21). Said once if one comes from elsewhere.
+        if (!AmdGpu::Liverpool::OnProcessorThread() && !Vulkan::DrawPipe::OnStageB()) {
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true, std::memory_order_relaxed)) {
+                std::printf("VideoOut: an end-of-pipe flip raised off the GPU threads\n");
+            }
+        }
         SubmitFlipInternal(port, index, flip_arg, is_eop);
         {
             std::scoped_lock lock{eop_flip_mutex};

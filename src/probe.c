@@ -1194,18 +1194,40 @@ static int64_t find_unique_pattern(uint64_t image_size, const char *pattern) {
 typedef struct { uint64_t counter, value, a, b, c, tsc, rsp, kind; } CounterEvent;
 enum { COUNTER_EVENTS = 1 << 16 };
 static struct { volatile uint64_t next, frozen, pad[6]; CounterEvent events[COUNTER_EVENTS]; } counter_log;
+/* BB_COUNTER_LOG_ARM=<s>: the stubs log nothing until s seconds after the start (U2's level load
+ * takes one counter to -1 every time, deterministically: not what is looked for);
+ * BB_COUNTER_LOG_CAPTURES=<n>: after a ring is written the log starts again, n rings at most
+ * (<file>, <file>.2, ...), so a run counts how often it happens. */
+static long counter_log_arm, counter_log_captures = 1;
 static void *counter_log_writer(void *arg) {
     const char *path = arg;
-    while (!counter_log.frozen) usleep(200000);
-    usleep(100000); /* events in flight */
-    FILE *f = fopen(path, "wb");
-    const int ok = f && fwrite(&counter_log, sizeof(counter_log), 1, f) == 1;
-    if (f) fclose(f);
-    printf("Counter log: a counter went below 0 (event %" PRIu64 "), ring %s %s\n",
-           (uint64_t)counter_log.next - 1, ok ? "written to" : "NOT written to", path);
-    fflush(stdout);
+    if (counter_log_arm > 0) {
+        sleep((unsigned)counter_log_arm);
+        counter_log.next = 0;
+        __atomic_store_n(&counter_log.frozen, 0, __ATOMIC_RELEASE);
+        printf("Counter log: logging from now on (%ld s after the start)\n", counter_log_arm);
+        fflush(stdout);
+    }
+    for (long n = 1; n <= counter_log_captures; ++n) {
+        while (__atomic_load_n(&counter_log.frozen, __ATOMIC_ACQUIRE) != 1) usleep(200000);
+        usleep(100000); /* events in flight */
+        char name[512];
+        if (n == 1) snprintf(name, sizeof(name), "%s", path);
+        else snprintf(name, sizeof(name), "%s.%ld", path, n);
+        FILE *f = fopen(name, "wb");
+        const int ok = f && fwrite(&counter_log, sizeof(counter_log), 1, f) == 1;
+        if (f) fclose(f);
+        printf("Counter log: a counter went below 0 (event %" PRIu64 "), ring %s %s\n",
+               (uint64_t)counter_log.next - 1, ok ? "written to" : "NOT written to", name);
+        fflush(stdout);
+        if (n < counter_log_captures) {
+            counter_log.next = 0; /* the stubs skip while frozen */
+            __atomic_store_n(&counter_log.frozen, 0, __ATOMIC_RELEASE);
+        }
+    }
     return NULL;
 }
+static int route_wait_and_free(uint64_t image_size);
 static void install_counter_log(uint64_t image_size) {
     const char *path = getenv("BB_COUNTER_LOG");
     if (!path || !*path) return;
@@ -1223,6 +1245,7 @@ static void install_counter_log(uint64_t image_size) {
         }
     for (size_t i = 0; i < 1024; ++i)
         if (image[cave + i]) { printf("Counter log: the code cave is not empty, off\n"); return; }
+    route_wait_and_free(image_size); /* WaitAndFree frees through FreeCounter: logged as well */
     unsigned char *t = image + cave;
     size_t k = 0;
     const uint64_t log_base = (uint64_t)(uintptr_t)&counter_log;
@@ -1305,10 +1328,101 @@ static void install_counter_log(uint64_t image_size) {
     p = image + 0xf29230 - base;
     r = (int32_t)((int64_t)stub_c - (int64_t)(0xf29230 + 5));
     p[0] = 0xe9; memcpy(p + 1, &r, 4); p[5] = 0x90;
+    const char *arm = getenv("BB_COUNTER_LOG_ARM"), *captures = getenv("BB_COUNTER_LOG_CAPTURES");
+    counter_log_arm = arm ? strtol(arm, NULL, 10) : 0;
+    const long n = captures ? strtol(captures, NULL, 10) : 1;
+    if (n > 1) counter_log_captures = n;
+    if (counter_log_arm > 0) counter_log.frozen = 2; /* the stubs skip until the writer arms them */
     pthread_t thread;
     if (pthread_create(&thread, NULL, counter_log_writer, (void *)path) == 0) pthread_detach(thread);
     printf("Counter log: armed (%zu bytes of stubs at %#" PRIx64 ", ring at %p), written to %s\n", k,
            base + cave, (void *)&counter_log, path);
+}
+/* g2-arm64 (issue #17): U2's job counters freed while a job still holds them. A job decrements the
+ * counter object it took with its entry, whoever owns it by then: neither free path checks for
+ * pending entries, and the pool (2048 objects, bitmap at mgr+0xb00) hands out the lowest free one
+ * first, so such a job's decrement lands on the next owner: a round reaching its target a job early
+ * (0.2.7's movie stop; 0.2.8's crash in the particles' DrawReg job, its list released before
+ * `UpdateRender` ran), and the error spreads. U2 frees a counter in two places: FreeCounter
+ * (0xf29230) and WaitAndFree (0xf2a040, its own copy of FreeCounter's body), which now calls
+ * FreeCounter instead (route_wait_and_free). A freed counter then waits in a FIFO of
+ * BB_COUNTER_QUARANTINE (1024; 0: off) before it is really freed, so a late decrement lands on an
+ * object nobody owns (U2 in play uses 20-150 of the 2048). A stub in the code segment's zero tail
+ * (0x13e3400) takes FreeCounter's entry: a counter already in the ring is not taken twice (U2's
+ * navigation queries free theirs twice), otherwise it goes into the ring and the one it pushes out
+ * is freed by the rest of FreeCounter. Off with BB_COUNTER_LOG (it hooks the same entry). */
+static const unsigned char free_counter_prologue[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+    0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18, 0x49, 0x89, 0xfc};
+static int route_wait_and_free(uint64_t image_size) {
+    const uint64_t base = 0x400000, wf = 0xf2a040, at = 0xf2a067;
+    /* 0xf2a062: call WaitForCounter; 0xf2a067: the start of its copy of FreeCounter */
+    static const unsigned char call_wait[] = {0xe8, 0xa9, 0xfe, 0xff, 0xff};
+    static const unsigned char old_tail[] = {0x4c, 0x8d, 0x35, 0x12, 0x42, 0x66, 0x00};
+    /* mov rdi, r12; call 0xf29230; jmp 0xf2a219 (the stack guard check and the epilogue) */
+    static const unsigned char new_tail[] = {0x4c, 0x89, 0xe7, 0xe8, 0xc1, 0xf1, 0xff, 0xff,
+                                             0xe9, 0xa5, 0x01, 0x00, 0x00};
+    if (at - base + sizeof(new_tail) > image_size) return 0;
+    if (!memcmp(image + at - base, new_tail, sizeof(new_tail))) return 1;
+    if (memcmp(image + wf - base, free_counter_prologue, sizeof(free_counter_prologue)) ||
+        memcmp(image + 0xf2a062 - base, call_wait, sizeof(call_wait)) ||
+        memcmp(image + at - base, old_tail, sizeof(old_tail)))
+        return 0;
+    memcpy(image + at - base, new_tail, sizeof(new_tail));
+    return 1;
+}
+static struct { volatile uint32_t next, pad; volatile uint64_t ring[1024]; } counter_quarantine;
+static void install_counter_quarantine(uint64_t image_size) {
+    const char *env = getenv("BB_COUNTER_QUARANTINE");
+    long n = env ? strtol(env, NULL, 10) : 1024;
+    if (n <= 0) return;
+    if (n > 1024) n = 1024;
+    uint32_t size = 16;
+    while (size < (uint32_t)n) size <<= 1;
+    const uint64_t base = 0x400000, cave = 0x13e3400 - base, entry = 0xf29230;
+    if (cave + 128 > image_size || entry - base + sizeof(free_counter_prologue) > image_size)
+        return;
+    if (memcmp(image + entry - base, free_counter_prologue, sizeof(free_counter_prologue))) {
+        if (image[entry - base] == 0xe9)
+            printf("Counter quarantine: FreeCounter is hooked already (BB_COUNTER_LOG), off\n");
+        return; /* not U2 1.02 */
+    }
+    for (size_t i = 0; i < 128; ++i)
+        if (image[cave + i]) { printf("Counter quarantine: the code cave is not empty, off\n"); return; }
+    if (!route_wait_and_free(image_size)) {
+        printf("Counter quarantine: WaitAndFree is not U2's, off\n");
+        return;
+    }
+    unsigned char *t = image + cave;
+    size_t k = 0;
+    const uint64_t state = (uint64_t)(uintptr_t)&counter_quarantine;
+    const uint32_t mask = size - 1;
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+    B(0x48, 0xb8); memcpy(t + k, &state, 8); k += 8;       /* movabs rax, state */
+    B(0x31, 0xc9);                                          /* xor ecx, ecx */
+    const size_t loop = k;
+    B(0x48, 0x39, 0x7c, 0xc8, 0x08);                        /* cmp [rax+rcx*8+8], rdi */
+    B(0x74); const size_t je_dup = k; B(0x00);              /* je ret: in the ring already */
+    B(0xff, 0xc1);                                          /* inc ecx */
+    B(0x81, 0xf9); memcpy(t + k, &size, 4); k += 4;         /* cmp ecx, size */
+    B(0x72, (unsigned char)(loop - (k + 2)));               /* jb loop */
+    B(0xb9, 0x01, 0x00, 0x00, 0x00);                        /* mov ecx, 1 */
+    B(0xf0, 0x0f, 0xc1, 0x08);                              /* lock xadd [rax], ecx */
+    B(0x81, 0xe1); memcpy(t + k, &mask, 4); k += 4;         /* and ecx, mask */
+    B(0x48, 0x87, 0x7c, 0xc8, 0x08);                        /* xchg rdi, [rax+rcx*8+8] */
+    B(0x48, 0x85, 0xff);                                    /* test rdi, rdi */
+    B(0x74, 0x0b);                                          /* jz ret: the ring was not full yet */
+    B(0x55, 0x48, 0x89, 0xe5, 0x41, 0x57);                  /* FreeCounter's moved prologue */
+    const int32_t back = (int32_t)((int64_t)(entry + 6) - (int64_t)(base + cave + k + 5));
+    B(0xe9); memcpy(t + k, &back, 4); k += 4;               /* jmp 0xf29236: frees the one out */
+    t[je_dup] = (unsigned char)(k - (je_dup + 1));
+    B(0xc3);                                                /* ret */
+#undef B
+    unsigned char *p = image + entry - base;
+    const int32_t r = (int32_t)((int64_t)(base + cave) - (int64_t)(entry + 5));
+    p[0] = 0xe9; memcpy(p + 1, &r, 4); p[5] = 0x90;         /* FreeCounter: jmp stub; nop */
+    printf("Counter quarantine: freed job counters wait in a FIFO of %u before the pool reuses "
+           "them (%zu bytes of stub at %#" PRIx64 ")\n", size, k, base + cave);
 }
 /* Naughty Dog's job manager (all three games): the six NdJobWorkerThreads spin on their queues
  * with `pause` unless the manager's sleep flag (byte +0x59, set by its own SetSleepMode) is on.
@@ -1723,6 +1837,7 @@ int main(int argc, char **argv) {
         patch_frame_params_wait(image_end);
         patch_job_sleep(image_end);
         install_counter_log(image_end);
+        install_counter_quarantine(image_end);
         runtime_display_patch(image, image_end);
     }
 #ifdef _WIN32

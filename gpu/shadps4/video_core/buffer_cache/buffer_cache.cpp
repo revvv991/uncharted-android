@@ -426,6 +426,10 @@ struct BufferCache::Landing {
     vk::Buffer buffer;
     boost::container::small_vector<vk::BufferCopy, 4> copies; ///< dstOffset: in the side staging
     boost::container::small_vector<VAddr, 4> targets;         ///< guest address of each copy
+    bool ring{};      ///< g2-arm64: the bytes wait in landing_ring (dstOffset: in the ring)
+    u64 ring_end{};   ///< the ring's head after this landing's bytes
+    u64 bytes{};
+    std::chrono::steady_clock::time_point registered;
 };
 
 bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
@@ -433,8 +437,15 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
         const char* env = std::getenv("BB_SCALAR_COPY64_DEFER");
         return env && env[0] == '1'; // run.py: on for Uncharted 2
     }();
-    if (!enabled || !side_queue || land_stopping.load(std::memory_order_acquire) || size == 0 ||
-        size > SideQueue::StagingSize / 2 || !memory->IsValidGpuMapping(src, size) ||
+    // g2-arm64: without a side queue (Turnip has one queue) the GPU-written bytes wait in a
+    // host-cached ring instead. BB_LANDING_RING=0: off.
+    static const bool ring_enabled = [] {
+        const char* env = std::getenv("BB_LANDING_RING");
+        return !(env && env[0] == '0');
+    }();
+    const bool use_ring = !side_queue && ring_enabled;
+    if (!enabled || !(side_queue || use_ring) || land_stopping.load(std::memory_order_acquire) ||
+        size == 0 || size > SideQueue::StagingSize / 2 || !memory->IsValidGpuMapping(src, size) ||
         !memory->IsValidGpuMapping(dst, size)) {
         return false;
     }
@@ -446,6 +457,7 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
     }
     auto landing = std::make_shared<Landing>();
     landing->buffer = arena->Handle();
+    landing->ring = use_ring;
     u64 total = 0;
     gpu_modified_ranges.ForEachInRange(src, size, [&](VAddr start, VAddr end) {
         total = Common::AlignUp(total, 64);
@@ -455,28 +467,109 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
             .size = end - start,
         });
         landing->targets.push_back(dst + (start - src));
+        landing->bytes += end - start;
         total += end - start;
     });
     if (landing->copies.empty() || total > SideQueue::StagingSize) {
         return false;
     }
-    // The tick of the work that wrote the source. Everything is recorded by now (the dispatch
-    // follows a drain of the draw pipe), so a write marked for the next tick is in the open
-    // command buffer; that one is submitted here, so the tick completes without anybody waiting
-    // for something else to submit it.
     u64 tick = memory_tracker->LatestGpuWriteTick(src, size);
-    if (tick != 0) {
+    if (tick == 0) {
+        return false; // page flags and written ranges disagree: nothing says when it lands
+    }
+    if (use_ring) {
+        // A place in the ring behind the landings not made yet (they free it in order); the
+        // bytes of one landing do not wrap around.
+        u64 begin = 0;
+        {
+            std::scoped_lock lk{landing_mutex};
+            if (landing_stop) {
+                return false;
+            }
+            begin = Common::AlignUp(landing_ring_head, 64);
+            if (begin % LandingRingSize + total > LandingRingSize) {
+                begin = Common::AlignUp(begin, LandingRingSize);
+            }
+            if (begin + total - landing_ring_tail > LandingRingSize) {
+                landing_ring_full.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            landing_ring_head = begin + total;
+        }
+        if (!landing_ring) {
+            landing_ring = std::make_unique<Buffer>(instance, 0, LandingRingSize,
+                                                    MemoryType::HostCached, "Landing ring");
+            std::printf("Landing: raycaster copies land from a host-cached ring (no side queue)\n");
+        }
+        for (auto& copy : landing->copies) {
+            copy.dstOffset += begin % LandingRingSize;
+        }
+        landing->ring_end = begin + total;
+        // The ring gets the source's bytes in GPU order: after the work that wrote them (the
+        // copy's first step, in this command buffer or an earlier one) and before the work that
+        // follows, which may write the source again (the next round's first step).
+        scheduler.EndRendering();
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            const vk::MemoryBarrier2 barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                       .pMemoryBarriers = &barrier});
+        });
+        runtime.CopyBuffer(arena, landing_ring.get(), landing->copies);
+        if (!Vulkan::g_host_read_barrier) {
+            // Merging GPU memory: no host-read barrier ends the command buffers.
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                const vk::MemoryBarrier2 to_host = {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                    .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                };
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                           .pMemoryBarriers = &to_host});
+            });
+        }
+        // The copy is in the open command buffer: submitted here, so it completes without
+        // anybody waiting for something else to submit it.
+        tick = scheduler.CurrentTick();
+        scheduler.Flush();
+    } else {
+        // The tick of the work that wrote the source. Everything is recorded by now (the
+        // dispatch follows a drain of the draw pipe), so a write marked for the next tick is in
+        // the open command buffer; that one is submitted here, so the tick completes without
+        // anybody waiting for something else to submit it.
         tick = std::min(tick, scheduler.CurrentTick());
         if (tick >= scheduler.CurrentTick()) {
             scheduler.Flush();
         }
     }
-    if (tick == 0) {
-        return false; // page flags and written ranges disagree: nothing says when it lands
-    }
     landing->tick = tick;
-    // The guest part of the copy now; the GPU-written bytes follow when they have landed.
-    memory->TryWriteBacking(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), size);
+    landing->registered = std::chrono::steady_clock::now();
+    if (use_ring) {
+        // The guest part now: only the bytes the GPU did not write. The ones it wrote keep the
+        // destination's records until theirs land, as before a GPU copy has run.
+        VAddr at = src;
+        for (const auto& copy : landing->copies) {
+            const VAddr start = arena->cpu_addr + copy.srcOffset;
+            if (start > at) {
+                memory->TryWriteBacking(reinterpret_cast<void*>(dst + (at - src)),
+                                        reinterpret_cast<const void*>(at), start - at);
+            }
+            at = start + copy.size;
+        }
+        if (at < src + size) {
+            memory->TryWriteBacking(reinterpret_cast<void*>(dst + (at - src)),
+                                    reinterpret_cast<const void*>(at), src + size - at);
+        }
+    } else {
+        // The guest part of the copy now; the GPU-written bytes follow when they have landed.
+        memory->TryWriteBacking(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src),
+                                size);
+    }
     {
         std::scoped_lock lk{landing_mutex};
         if (landing_stop) {
@@ -538,6 +631,19 @@ bool BufferCache::WaitLandingTick(u64 tick) {
 }
 
 bool BufferCache::ExecuteLanding(Landing& landing) {
+    if (landing.ring) {
+        // g2-arm64: the command buffer with the GPU's copy into the ring has completed.
+        if (!WaitLandingTick(landing.tick)) {
+            return false;
+        }
+        for (size_t i = 0; i < landing.copies.size(); ++i) {
+            const auto& copy = landing.copies[i];
+            landing_ring->Invalidate(copy.dstOffset, copy.size);
+            memory->TryWriteBacking(reinterpret_cast<void*>(landing.targets[i]),
+                                    landing_ring->mapped_data.data() + copy.dstOffset, copy.size);
+        }
+        return true;
+    }
     auto& side = *side_queue;
     if (!WaitLandingTick(landing.tick)) {
         return false;
@@ -606,6 +712,15 @@ bool BufferCache::ExecuteLanding(Landing& landing) {
 
 void BufferCache::LandingWorker() {
     Common::SetCurrentThreadName("bb:Landing");
+    // g2-arm64: runs fence labels gated behind landings (a compute ReleaseMem is a plain store);
+    // a write to a page holding GPU data needs the cache owner (bbport_owner_wait.h).
+    BbOwnerWait::helper_thread = true;
+    // g2-arm64: what landed, every 10 s while copies land.
+    using Clock = std::chrono::steady_clock;
+    auto stats_begin = Clock::now();
+    u32 stats_landings = 0;
+    u64 stats_bytes = 0;
+    double stats_ms_sum = 0, stats_ms_max = 0;
     std::unique_lock lk{landing_mutex};
     for (;;) {
         landing_cv.wait(lk, [&] {
@@ -632,7 +747,29 @@ void BufferCache::LandingWorker() {
         // Lands without data when cancelled at shutdown or when the wait for the GPU failed:
         // the labels behind it go on either way.
         ExecuteLanding(*landing);
+        const auto now = Clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - landing->registered).count();
+        ++stats_landings;
+        stats_bytes += landing->bytes;
+        stats_ms_sum += ms;
+        stats_ms_max = std::max(stats_ms_max, ms);
+        if (now - stats_begin >= std::chrono::seconds(10)) {
+            std::printf("Landing: %u copies (%llu KiB) in %.0f s, registered to landed %.2f ms on "
+                        "average, %.2f ms at most; the ring full %u times\n",
+                        stats_landings, static_cast<unsigned long long>(stats_bytes >> 10),
+                        std::chrono::duration<double>(now - stats_begin).count(),
+                        stats_ms_sum / stats_landings, stats_ms_max,
+                        landing_ring_full.exchange(0, std::memory_order_relaxed));
+            stats_begin = now;
+            stats_landings = 0;
+            stats_bytes = 0;
+            stats_ms_sum = stats_ms_max = 0;
+        }
         lk.lock();
+        if (landing->ring) {
+            landing_ring_tail = landing->ring_end; // landings are made in the order of the ring
+        }
         landing_done_seq = landing->seq;
         landing_done.store(landing->seq, std::memory_order_release);
         landing_done_cv.notify_all();
@@ -705,6 +842,9 @@ void BufferCache::WaitLanding(u64 seq) {
     if (seq == 0 || landing_done.load(std::memory_order_acquire) >= seq) {
         return;
     }
+    // g2-arm64: the helpers' faults may need the owner meanwhile (bbport_owner_wait.h); before
+    // the lock, so the Scope's end never runs while landing_mutex is held.
+    const BbOwnerWait::Scope owner_waits;
     std::unique_lock lk{landing_mutex};
     // Released at shutdown as well; a stall is reported, not ended (the landing thread waits for
     // the GPU, which ends the game when the device is lost).

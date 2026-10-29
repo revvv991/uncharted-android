@@ -346,6 +346,9 @@ void Scheduler::WaitDeferredSignals() {
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     const BbOwnerWait::Scope owner_waits; // g2-arm64: the signals may need the owner
     KickRecording(true);
+    const auto begin = std::chrono::steady_clock::now();
+    u32 spins = 0;
+    bool reported = false;
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         if (VideoCore::LandingGate::Stopped()) {
             break; // shutdown: the labels waiting on the landing thread were dropped
@@ -353,6 +356,15 @@ void Scheduler::WaitDeferredSignals() {
         // Helps the copy threads the signals wait for.
         BbCopy::WaitAsync();
         std::this_thread::yield();
+        // g2-arm64: a wait that never ends leaves a line (the stall report comes later).
+        if (!reported && (++spins & 1023) == 0 &&
+            std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) {
+            reported = true;
+            std::printf("GPU stall: waiting 5 s for the deferred signals (%llu of %llu done)\n",
+                        static_cast<unsigned long long>(
+                            deferred_signals_done->load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(issued));
+        }
     }
 }
 

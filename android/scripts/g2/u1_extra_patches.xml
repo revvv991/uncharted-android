@@ -41,4 +41,20 @@
             <Line Type="bytes" Address="0x0085d281" ExpectedSha256="fb8d6bc4f92233a7e789367fc111aef00798e3fb3528490c052b46e6cd7e71f5" Value="4c895da0bf32000000e871bc30004c8b5da0e938010000"/>
         </PatchList>
     </Metadata>
+    <Metadata Title="Uncharted: The Nathan Drake Collection" Name="Uncharted 1: Job counter waits also end below their target" Note="A wait of the job manager for a counter to equal its target (mode 0: WaitForCounter, the waiting job entries, the job lists whose start waits, the worker&apos;s checks, the fiber wait) also ends when the counter is below the target, as mode 1 (value &lt;= target) does: one opcode byte at each of the 12 places (sete -&gt; setle, jne -&gt; jl or jg). Counters only count down to their targets, so the two tests differ only for a counter decremented once too often - a job of an earlier use of the counter object finishing late: the waiter that checks after the extra decrement then waits for ever (notes/findings.md 2026-10-28, 2026-10-29). The same job manager code as U2&apos;s (its places found by the bytes around each)." Author="uncharted-android" PatchVer="0.1" AppVer="01.02" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x0084a9dc" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x0084aa18" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x0084aa48" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x0085c9f2" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7c"/>
+            <Line Type="bytes" Address="0x0085ca59" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7c"/>
+            <Line Type="bytes" Address="0x0085cc9d" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8c"/>
+            <Line Type="bytes" Address="0x0085cdad" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8c"/>
+            <Line Type="bytes" Address="0x0085d997" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
+            <Line Type="bytes" Address="0x0085e1ef" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
+            <Line Type="bytes" Address="0x0085e22d" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
+            <Line Type="bytes" Address="0x0085c944" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x0085f724" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8f"/>
+        </PatchList>
+    </Metadata>
 </Patch>

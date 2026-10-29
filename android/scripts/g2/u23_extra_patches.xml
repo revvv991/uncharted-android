@@ -213,7 +213,7 @@
             <Line Type="bytes" Address="0x01369421" ExpectedSha256="f56011e3adcf1fbbf03487929cb960aa20e778d97d77d6d55bef653ed5c597a5" Value="e8d1d1e3ff6690"/>
         </PatchList>
     </Metadata>
-    <Metadata Title="Uncharted: The Nathan Drake Collection" Name="Uncharted 2: Job counter waits also end below their target" Note="A wait of the job manager for a counter to equal its target (mode 0: WaitForCounter, the waiting job entries, the job lists whose start waits, the worker&apos;s checks) also ends when the counter is below the target, as mode 1 (value &lt;= target) does: one opcode byte at each of the 11 places (sete -&gt; setle, jne -&gt; jl or jg). Counters only count down to their targets, so the two tests differ only for a counter decremented once too often - a job of an earlier use of the counter object finishing late, which the sleep mode makes likely: the waiter that checks after the extra decrement then waits for ever (U2&apos;s movies froze ~40% of the time: a job list waiting for its stage counter == 0 at -1, notes/findings.md 2026-10-28; U3&apos;s particle stage the same way, 2026-10-22). The one count-up use (increment, wait == 1, decrement @0x10bdb5f, @0x10be1c5) holds its own increment, so &lt;= 1 is == 1 there." Author="uncharted-android" PatchVer="0.1" AppVer="01.02" AppElf="big2-ps4_Shipping.elf" isEnabled="false">
+    <Metadata Title="Uncharted: The Nathan Drake Collection" Name="Uncharted 2: Job counter waits also end below their target" Note="A wait of the job manager for a counter to equal its target (mode 0: WaitForCounter, the waiting job entries, the job lists whose start waits, the worker&apos;s checks, the fiber wait) also ends when the counter is below the target, as mode 1 (value &lt;= target) does: one opcode byte at each of the 12 places (sete -&gt; setle, jne -&gt; jl or jg). Counters only count down to their targets, so the two tests differ only for a counter decremented once too often - a job of an earlier use of the counter object finishing late, which the sleep mode makes likely: the waiter that checks after the extra decrement then waits for ever (U2&apos;s movies froze ~40% of the time: a job list waiting for its stage counter == 0 at -1, notes/findings.md 2026-10-28; U3&apos;s particle stage the same way, 2026-10-22). The one count-up use (increment, wait == 1, decrement @0x10bdb5f, @0x10be1c5) holds its own increment, so &lt;= 1 is == 1 there." Author="uncharted-android" PatchVer="0.1" AppVer="01.02" AppElf="big2-ps4_Shipping.elf" isEnabled="false">
         <PatchList>
             <Line Type="bytes" Address="0x00f29fac" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
             <Line Type="bytes" Address="0x00f29fe8" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
@@ -226,6 +226,23 @@
             <Line Type="bytes" Address="0x00f3d48f" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
             <Line Type="bytes" Address="0x00f3d4cd" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
             <Line Type="bytes" Address="0x00f3bbe4" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x00f3e9c4" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8f"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Uncharted: The Nathan Drake Collection" Name="Uncharted 3: Job counter waits also end below their target" Note="A wait of the job manager for a counter to equal its target (mode 0: WaitForCounter, the waiting job entries, the job lists whose start waits, the worker&apos;s checks, the fiber wait) also ends when the counter is below the target, as mode 1 (value &lt;= target) does: one opcode byte at each of the 12 places (sete -&gt; setle, jne -&gt; jl or jg). Counters only count down to their targets, so the two tests differ only for a counter decremented once too often - a job of an earlier use of the counter object finishing late: the waiter that checks after the extra decrement then waits for ever (notes/findings.md 2026-10-28, 2026-10-29). The same job manager code as U2&apos;s (its places found by the bytes around each)." Author="uncharted-android" PatchVer="0.1" AppVer="01.02" AppElf="big3-ps4_Shipping.elf" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x0119751c" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x01197558" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x01197588" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x011a5cc2" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7c"/>
+            <Line Type="bytes" Address="0x011a5d29" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7c"/>
+            <Line Type="bytes" Address="0x011a5f6d" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8c"/>
+            <Line Type="bytes" Address="0x011a607d" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8c"/>
+            <Line Type="bytes" Address="0x011a6c67" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
+            <Line Type="bytes" Address="0x011a74bf" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
+            <Line Type="bytes" Address="0x011a74fd" ExpectedSha256="0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6" Value="7f"/>
+            <Line Type="bytes" Address="0x011a5c14" ExpectedSha256="67c872d4912c71f15d2d6134ddf1d33d46f4bab2b56fe787522e7e4c9b58657d" Value="9e"/>
+            <Line Type="bytes" Address="0x011a89f4" ExpectedSha256="c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c" Value="8f"/>
         </PatchList>
     </Metadata>
 </Patch>

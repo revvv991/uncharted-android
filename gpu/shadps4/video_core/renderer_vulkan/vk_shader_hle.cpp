@@ -314,11 +314,11 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
         // the records the game read were not the ones this copy made (U2: assertion in
         // GetSubMeshInstance after a checkpoint). The second step, whose destination the guest
         // CPU writes, also copies in guest memory, with the GPU-written bytes of its source;
-        // the first step's destination is GPU-only and needs nothing. BB_SCALAR_COPY64_SYNC=0:
-        // off, 1: both steps, unset: second step only.
+        // the first step's destination is GPU-only and needs nothing. BB_SCALAR_COPY64_SYNC=0 or
+        // unset: off, 1: both steps, 2: second step only.
         static const int sync_64 = [] {
-            // Unset: off. run.py sets 2 for Uncharted 2, which needs it; in U3's Cartagena
-            // square it cost 94 -> 54 FPS.
+            // Unset: off. run.py (and our launcher) set 2 for Uncharted 2, which needs it; in
+            // U3's Cartagena square it cost 94 -> 54 FPS.
             const char* env = std::getenv("BB_SCALAR_COPY64_SYNC");
             return !env ? 0 : env[0] == '0' ? 0 : env[0] == '1' ? 1 : 2;
         }();
@@ -327,7 +327,10 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
             const char* env = std::getenv("BB_SCALAR_COPY_SMALL_SYNC");
             return env && env[0] == '1';
         }();
+        const char* in_guest = ""; // g2-arm64: for the log line below, what was done
+        bool deferred = false;
         if (small_sync && size < 1_MB) {
+            in_guest = " and in guest memory";
             // Both sides into guest memory first, then the copy is made there (below): the
             // destination stops being GPU data, so the next copy from it needs no read back.
             if (src_gpu) {
@@ -345,29 +348,36 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
             // GPU-written bytes land in guest memory when the GPU has made them, and the labels
             // the game learns of it from wait for that (BufferCache::DeferGuestCopy,
             // landing_gate.h). BB_SCALAR_COPY64_DEFER=0 waits for the GPU here instead.
-            bool deferred = false;
             if (src_written && sync && group_size == 64 && !sync_all && sync_64 == 2) {
                 deferred = buffer_cache.DeferGuestCopy(src.base_address, dst.base_address, size);
             }
             if (src_written && sync && !deferred) {
                 buffer_cache.ReadMemory(src.base_address, size, false, true);
+                // g2-arm64: copies deferred before this one (the landing ring full) carry older
+                // records, possibly into this array: they land first. The read back's Finish
+                // completed their ticks, so this waits only for the landing thread's copies.
+                buffer_cache.WaitLanding(buffer_cache.PendingLanding());
             }
             if (!deferred && (!src_written || sync) && memory->IsValidGpuMapping(src.base_address, size) &&
                 memory->IsValidGpuMapping(dst.base_address, size)) {
                 memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
                                         reinterpret_cast<const void*>(src.base_address), size);
             }
+            in_guest = deferred                ? " and in guest memory as it lands"
+                       : !src_written || sync ? " and in guest memory"
+                                              : "";
         }
-        static std::atomic<u32> total{0}, written{0};
+        static std::atomic<u32> total{0}, written{0}, landing{0};
         const u32 count = total.fetch_add(1, std::memory_order_relaxed) + 1;
         const u32 written_count = written.fetch_add(src_written, std::memory_order_relaxed) + src_written;
+        const u32 landing_count = landing.fetch_add(deferred, std::memory_order_relaxed) + deferred;
         if (count <= 4 || (count & 4095) == 0) {
             std::printf("Scalar copy: 0x%llx -> 0x%llx (%llu bytes) next to GPU data: copied on the "
-                        "GPU%s (%u so far, %u with GPU-written sources)\n",
+                        "GPU%s (%u so far, %u with GPU-written sources, %u landing later)\n",
                         static_cast<unsigned long long>(src.base_address),
                         static_cast<unsigned long long>(dst.base_address),
-                        static_cast<unsigned long long>(size),
-                        both && size < 1_MB ? " and in guest memory" : "", count, written_count);
+                        static_cast<unsigned long long>(size), in_guest, count, written_count,
+                        landing_count);
         }
         if (!small_sync || size >= 1_MB) {
             // g2-arm64 diagnosis (BB_COPY_SHADER_LOG=1): the large ones, with addresses - the

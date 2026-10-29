@@ -580,6 +580,18 @@
      "bytes": "9e"
     }
    ]
+  },
+  {
+   "address": "0xf3e9c4",
+   "length": 1,
+   "sha256": "c00e7f889cfc9216ec818bf2e1682fc6af0d89939c91776669478caf27c9727c",
+   "when": "always",
+   "edits": [
+    {
+     "offset": 0,
+     "bytes": "8f"
+    }
+   ]
   }
  ]
 }

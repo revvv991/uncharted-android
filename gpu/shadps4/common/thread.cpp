@@ -193,13 +193,13 @@ void SetThreadName(void* thread, const char* name) {
 #if defined(__linux__)
 namespace {
 /// bbport: BB_RENDER_CPUS=<cpu list, e.g. 3-7 or 3,5-7>: the host GPU threads (command
-/// processor, draw recording and preparation, Vulkan recorder, presentation) run on these CPUs
-/// only. On the Retroid Pocket G2 the scheduler put the draw recorder and the Vulkan recorder
-/// mostly on the slow A520 cores (0-2) while the guest's job workers, idling in WFE spin loops
-/// that count as busy, held the A720/X4 cores.
+/// processor, draw recording and preparation, Vulkan recorder, presentation, the landing of
+/// deferred raycaster copies) run on these CPUs only. On the Retroid Pocket G2 the scheduler put
+/// the draw recorder and the Vulkan recorder mostly on the slow A520 cores (0-2) while the
+/// guest's job workers, idling in WFE spin loops that count as busy, held the A720/X4 cores.
 void ApplyRenderAffinity(const std::string& name) {
-    static const char* const prefixes[] = {"shadPS4:GpuCom", "bb:Draw",
-                                           "bb:VkRecorder", "bb:Present", "shadPS4:Present"};
+    static const char* const prefixes[] = {"shadPS4:GpuCom", "bb:Draw",    "bb:VkRecorder",
+                                           "bb:Present",     "bb:Landing", "shadPS4:Present"};
     bool render = false;
     for (const char* prefix : prefixes) {
         render = render || name.rfind(prefix, 0) == 0;

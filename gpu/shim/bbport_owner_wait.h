@@ -94,8 +94,11 @@ void RunFromHelper(Work&& work, Send&& send) {
     };
     const auto request = std::make_shared<Request>(std::forward<Work>(work));
     send([request] {
+        // The command thread runs commands with the draw pipe empty: no other owner is in a
+        // Scope, so no helper runs owner work meanwhile. Not under `mutex`: work that waits for
+        // the GPU opens a Scope itself (Scheduler::Wait), which takes it - the thread would wait
+        // for itself.
         if (request->Claim()) {
-            std::scoped_lock lk{mutex};
             request->Run();
         }
     });

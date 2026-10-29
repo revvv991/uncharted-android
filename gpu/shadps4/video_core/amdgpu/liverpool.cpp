@@ -832,16 +832,12 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
     // Raycaster copies deferred before the flip land before the guest hears of it (the labels
     // before it wait for them as well, landing_gate.h).
     const u64 landing_seq = VideoCore::LandingGate::Pending();
-    if (VideoCore::LandingGate::Active() && Vulkan::DrawPipe::OnStageB() &&
-        !BbToggle::Disabled(BbToggle::RecorderFences)) {
-        // Behind the deferred fences, which the interrupt must not overtake, without waiting.
-        rasterizer.OnGuestFlip();
-        rasterizer.GetBufferCache().CheckStableBindings();
-        rasterizer.CheckConstants();
-        rasterizer.SignalAfterHostCopies(
-            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); }, landing_seq);
-        return;
-    }
+    // g2-arm64: the flip interrupt prepares the frame with the draw scheduler (the EOP flip's
+    // handler -> Presenter::PrepareFrame), so it is raised here, on the scheduler's owner, and
+    // not deferred behind the landings as upstream does: on the Vulkan recording thread it
+    // waited for that thread itself and the game froze (#21), and on a copy or the landing
+    // thread it would race the owner. The label write right before every flip has already
+    // waited for the deferred labels and the landings, so the waits below are short.
     const bool steps = TaskStepsOn();
     const u64 t0 = steps ? SteadyNs() : 0;
     rasterizer.WaitDeferredSignals();
@@ -875,6 +871,16 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // precede writes the guest sees.
     const bool steps = TaskStepsOn();
     const u64 t0 = steps ? SteadyNs() : 0;
+    // g2-arm64: with a raycaster copy waiting to land (landing_gate.h) the work recorded since is
+    // submitted first, so the GPU goes on with it while this waits (U2 at the owner's checkpoint
+    // without a frame limit: frame median 37.4 against 39.5 ms). BB_LANDING_FLUSH=0: off.
+    static const bool landing_flush = [] {
+        const char* env = std::getenv("BB_LANDING_FLUSH");
+        return !(env && env[0] == '0');
+    }();
+    if (landing_flush && VideoCore::LandingGate::Pending() != 0) {
+        rasterizer.Flush();
+    }
     rasterizer.WaitHostCopies();
     const u64 t1 = steps ? SteadyNs() : 0;
     rasterizer.WaitDeferredSignals();
