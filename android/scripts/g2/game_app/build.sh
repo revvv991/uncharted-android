@@ -38,10 +38,20 @@ cp -r "$HERE/../recipes" "$W/assets/"
 if [ -n "$ASSETS_DIR" ]; then cp -r "$ASSETS_DIR"/. "$W/assets/"; fi
 LINK_EXTRA+=(-A "$W/assets")
 cd "$W"
-javac -nowarn -source 11 -target 11 -classpath "$JAR" -d classes \
-    $(find "$SDLJAVA" -name '*.java') "$HERE/GameActivity.java" "$HERE/Launcher.java" "$HERE/Updater.java" 2>&1 | grep -v "^warning\|^Note:" || true
+# A javac error fails the build (`| grep ... || true` hid it until 2026-10-30: the APK then shipped
+# the previous classes).
+javac_log=$W/javac.log
+if ! javac -nowarn -source 11 -target 11 -classpath "$JAR" -d classes \
+        $(find "$SDLJAVA" -name '*.java') "$HERE/GameActivity.java" "$HERE/Launcher.java" "$HERE/Updater.java" > "$javac_log" 2>&1; then
+    grep -v "^warning\|^Note:" "$javac_log" >&2 || true
+    echo "javac failed" >&2
+    exit 1
+fi
+grep -v "^warning\|^Note:" "$javac_log" || true
 "$BT/d8" --release --min-api 33 --lib "$JAR" --output . $(find classes -name '*.class')
-"$BT/aapt2" link -o base.apk -I "$JAR" --manifest "$MANIFEST" \
+# The app's icon (res/, drawn by icon.py; issue #4): compiled resources go into the link.
+"$BT/aapt2" compile --dir "$HERE/res" -o res.zip
+"$BT/aapt2" link -o base.apk -I "$JAR" --manifest "$MANIFEST" res.zip \
     --min-sdk-version 33 --target-sdk-version 35 "${LINK_EXTRA[@]}"
 STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 for lib in "$BUILD/libmain.so" "$BUILD/libbbgpu.so" "$BUILD/libbbprepare.so" "$DEPS"/lib/{libSDL3,libavutil,libswresample,libswscale,libavcodec,libavformat}.so \

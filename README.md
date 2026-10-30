@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Experimental, an early preview (version 0.2.9).** Tested on one device so far (Retroid Pocket G2).
+> **Experimental, an early preview (version 0.2.10).** Tested on one device so far (Retroid Pocket G2).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -72,12 +72,15 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.2.9.apk` from
+1. Install the APK (`uncharted-android-0.2.10.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
    `big2-ps4_Shipping.elf` and `big3-ps4_Shipping.elf`, `sce_module/` (`libc.prx`,
-   `libSceFios2.prx`) and `sce_sys/param.sfo`. The launcher says what is missing.
+   `libSceFios2.prx`) and `sce_sys/param.sfo`. The launcher says what is missing. A dump that
+   keeps the game's update as a second folder: name it `<game folder>-UPDATE` next to the game's
+   folder (`CUSA02344-UPDATE` next to `CUSA02344`); its files come first, the game folder's
+   where it has none, and either folder can be chosen.
 3. **Prepare**: the launcher makes the loader's files from the game's executables (as the port's
    `scripts/prepare.py` and `link_modules.py` do on a PC), in a few seconds, into the app's
    folder. Run it again after you replace the dump.

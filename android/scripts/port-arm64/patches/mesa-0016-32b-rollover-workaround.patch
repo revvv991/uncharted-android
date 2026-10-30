@@ -1,0 +1,121 @@
+From 2680e69ed6a288c704d659c11b6d6694eea11292 Mon Sep 17 00:00:00 2001
+From: Connor Abbott <cwabbott0@gmail.com>
+Subject: [PATCH] tu: Workaround 32B rollover bug in GPU firmware
+
+The firmware has a bug where it fails to increment the high 32B when
+adding an offset to the IB base address when restoring IB prefetch
+state. It affects all known firmwares/GPUs. This means that in rare
+cases if an IB spans two 4GB ranges and it is preempted in the high
+range it can load from the wrong address when resuming from the
+preemption. Workaround this by avoiding such straddling when allocating
+BOs in tu_cs, which is mostly used for IBs.
+
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43970>
+(cherry picked from commit 118ec7f45b1300d0d5b304bb2b34b53a20f09c9e)
+---
+ src/freedreno/vulkan/tu_cs.cc       |  3 ++-
+ src/freedreno/vulkan/tu_device.cc   |  3 ++-
+ src/freedreno/vulkan/tu_device.h    | 12 ++++++++++++
+ src/freedreno/vulkan/tu_knl.h       |  1 +
+ src/freedreno/vulkan/tu_knl_drm.cc  |  5 +++++
+ src/freedreno/vulkan/tu_knl_kgsl.cc |  7 +++++++
+ 6 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 8eed35124fa..ea57813768a 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -275,7 +275,8 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+       tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+                      (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+                                                    TU_BO_ALLOC_GPU_READ_ONLY) |
+-                                              TU_BO_ALLOC_ALLOW_DUMP),
++                                              TU_BO_ALLOC_ALLOW_DUMP |
++                                              tu_bo_ib_flags(cs->device)),
+                      cs->name);
+    if (result != VK_SUCCESS) {
+       return result;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index e8ef94037dc..157e3e04b34 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3022,7 +3022,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       &device->pipeline_suballoc, device, 128 * 1024,
+       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_GPU_READ_ONLY |
+                                 TU_BO_ALLOC_ALLOW_DUMP |
+-                                TU_BO_ALLOC_INTERNAL_RESOURCE),
++                                TU_BO_ALLOC_INTERNAL_RESOURCE |
++                                tu_bo_ib_flags(device)),
+       "pipeline_suballoc");
+    if (is_kgsl(physical_device->instance)) {
+       tu_bo_suballocator_init(&device->kgsl_profiling_suballoc, device,
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 4ed479ce8c2..9063357fc7d 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -724,4 +724,16 @@ tu_bo_init_new_cached(struct tu_device *dev, struct vk_object_base *base,
+       flags, NULL, name);
+ }
+ 
++/* Return BO flags necessary for IBs */
++static inline enum tu_bo_alloc_flags
++tu_bo_ib_flags(struct tu_device *dev)
++{
++   (void)dev; /* TODO don't do this workaround when newer FW comes out */
++   /* All known firmwares have a bug where preemption can cause the wrong IB
++    * contents to be fetched if there is 32B rollover (i.e. the IB crosses a
++    * 4GB boundary). Avoid rollover here to workaround it.
++    */
++   return TU_BO_ALLOC_NO_32B_ROLLOVER;
++}
++
+ #endif /* TU_DEVICE_H */
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index 4c2bf6a41a7..fb607a1a43c 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -29,6 +29,7 @@ enum tu_bo_alloc_flags {
+    TU_BO_ALLOC_DMABUF = 1 << 4,
+    TU_BO_ALLOC_SHAREABLE = 1 << 5,
+    TU_BO_ALLOC_IMPLICIT_SYNC = 1 << 6,
++   TU_BO_ALLOC_NO_32B_ROLLOVER = 1 << 7,
+ };
+ 
+ enum tu_mem_sync_op {
+diff --git a/src/freedreno/vulkan/tu_knl_drm.cc b/src/freedreno/vulkan/tu_knl_drm.cc
+index 68715b08221..43d5e7d4961 100644
+--- a/src/freedreno/vulkan/tu_knl_drm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm.cc
+@@ -23,6 +23,11 @@ tu_allocate_userspace_iova(struct tu_device *dev,
+ {
+    *iova = 0;
+ 
++   if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER)
++      dev->vma.nospan_shift = 32;
++   else
++      dev->vma.nospan_shift = 0;
++
+    if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       if (client_iova) {
+          if (util_vma_heap_alloc_addr(&dev->vma, client_iova, size)) {
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index dec02f2248d..9c1984ce1ac 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -339,6 +339,13 @@ kgsl_bo_init(struct tu_device *dev,
+    if (flags & TU_BO_ALLOC_REPLAYABLE)
+       req.flags |= KGSL_MEMFLAGS_USE_CPU_MAP;
+ 
++   /* Forcing everything in the first 4GB is overkill, but we don't have many
++    * other options here since we don't control iova addresses and kgsl
++    * doesn't have a flag to avoid 32B rollover.
++    */
++   if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER)
++      req.flags |= KGSL_MEMFLAGS_FORCE_32BIT;
++
+    int ret;
+ 
+    ret = safe_ioctl(dev->physical_device->local_fd,
+-- 
+2.43.0
+

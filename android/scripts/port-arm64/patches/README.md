@@ -19,7 +19,16 @@
   (`TU_KGSL_RECOVER`, on by default: after a series of GPU faults the queue moves to a new context
   and the game goes on; check with `TU_KGSL_FAULT_TEST=<s>`); 0014: **the command streams that become
   IBs leave the second 4 KiB page of their BOs unused** (on by default, `TU_PAGE1_SKIP=0` turns it
-  off): the A735 CP faults sat in that page.
+  off): the A735 CP faults sat in that page; 0015: the variables of 0003-0014 also come from Android
+  properties (`debug.mesa.<name>`, `TU_PAGE1_SKIP` is `debug.mesa.tu.page1.skip`; the environment
+  wins), and the notes about them and the recoveries also go to the Android log: for other apps that
+  load this driver through libadrenotools; 0016: upstream's 118ec7f4 (Connor Abbott, after 26.2),
+  meant to keep command BOs below 4 GB, as all known CP firmwares can fetch wrong IB contents after a
+  preemption when an IB crosses a 4 GB boundary; on KGSL it does nothing (upstream too): its
+  `KGSL_MEMFLAGS_FORCE_32BIT` is 1 << 32 and `kgsl_gpumem_alloc_id` has 32-bit flags; 0017: **those
+  BOs come from `kgsl_gpuobj_alloc`, whose flags carry it, so the command streams do go below 4 GB**
+  (`TU_IB_LOW4G=0` turns it off; without room there the usual allocation): with 0012 and 0014 off,
+  6 U3 processes with it had no CP fault, 3 of 6 without it had 56 (2026-10-30); 0012 and 0014 stay.
   Experiments 0004-0011 are off by default; their variables stay for diagnostics.
 
 The port's changes on top of upstream `b787c10` (uncharted_pc 0.3.6), in the order they were made

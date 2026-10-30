@@ -50,6 +50,28 @@ u64 RoundAllocationSize(u64 size) {
     return Common::AlignUp(size, step);
 }
 
+// g2-arm64 diagnosis: BB_STAGING_LOG=1 prints the pool's large buffers coming and going.
+bool StagingLog() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_STAGING_LOG");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+const char* MemoryTypeName(MemoryType type) {
+    switch (type) {
+    case MemoryType::DeviceLocal:
+        return "device-local";
+    case MemoryType::HostUncached:
+        return "host-uncached";
+    case MemoryType::HostCached:
+        return "host-cached";
+    default:
+        return "other";
+    }
+}
+
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
@@ -145,6 +167,16 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .last_used_frame = frame,
             .held = false,
         });
+        // g2-arm64 diagnosis (BB_STAGING_LOG=1): every large buffer the pool creates, with the
+        // request behind it and the frame: the VMA swings in the Memory line (U3: 128 MiB coming
+        // and going every ~30 s) start here.
+        if (StagingLog()) {
+            std::printf("Staging: new %s buffer of %llu KiB for a request of %llu KiB%s, frame %llu, "
+                        "%zu such buffers\n", MemoryTypeName(type),
+                        (unsigned long long)(best->buffer->SizeBytes() >> 10),
+                        (unsigned long long)(size >> 10), deferred ? " (deferred)" : "",
+                        (unsigned long long)frame, cache.size());
+        }
     }
 
     best->tick = scheduler.CurrentTick();
@@ -211,8 +243,16 @@ void StagingBufferPool::TrimRing(Ring& ring, bool eager) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache, bool eager) {
     std::erase_if(cache, [this, eager](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= (eager ? 240 : LARGE_IDLE_FRAMES) &&
-               scheduler.IsFree(entry.tick);
+        const bool idle = !entry.held &&
+                          frame - entry.last_used_frame >= (eager ? 240 : LARGE_IDLE_FRAMES) &&
+                          scheduler.IsFree(entry.tick);
+        if (idle && StagingLog()) {
+            std::printf("Staging: %llu KiB buffer idle for %llu frames, freed at frame %llu\n",
+                        (unsigned long long)(entry.buffer->SizeBytes() >> 10),
+                        (unsigned long long)(frame - entry.last_used_frame),
+                        (unsigned long long)frame);
+        }
+        return idle;
     });
 }
 

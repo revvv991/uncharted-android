@@ -1,0 +1,108 @@
+From dc768510376bc4253e5f8528f2d22ca901204ba1 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip/kgsl: command BOs below 4 GB through gpuobj_alloc
+ (TU_IB_LOW4G)
+
+KGSL_MEMFLAGS_FORCE_32BIT is 1 << 32 and kgsl_gpumem_alloc_id has 32-bit
+flags, so 118ec7f4 never reached KGSL. kgsl_gpuobj_alloc carries it; no
+room below 4 GB falls back to the usual allocation; TU_IB_LOW4G=0 is off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 69 ++++++++++++++++++++++++-----
+ 1 file changed, 59 insertions(+), 10 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 9c1984ce1ac..370979c2bd4 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -288,6 +288,56 @@ kgsl_sparse_vma_map(struct tu_device *dev,
+    return VK_SUCCESS;
+ }
+ 
++/* uncharted-android: KGSL_MEMFLAGS_FORCE_32BIT is 1 << 32, which the 32-bit flags of
++ * kgsl_gpumem_alloc_id drop, so the rule of TU_BO_ALLOC_NO_32B_ROLLOVER never reached KGSL (on the
++ * Adreno 735 the command BOs stayed above 4 GB). kgsl_gpuobj_alloc has 64-bit flags; it does not
++ * return the address, kgsl_gpuobj_info does, as in kgsl_sparse_vma_init. False when KGSL has no
++ * room below 4 GB (the caller allocates as usual) or with TU_IB_LOW4G=0.
++ */
++static bool
++kgsl_alloc_low4g(struct tu_device *dev, struct kgsl_gpumem_alloc_id *req)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = os_get_option("TU_IB_LOW4G");
++      on = !env || env[0] != '0';
++      if (!on)
++         tu_note("tu/kgsl: command BOs go where KGSL puts them, not below 4 GB (TU_IB_LOW4G=0)");
++   }
++   if (!on)
++      return false;
++
++   struct kgsl_gpuobj_alloc obj = {
++      .size = req->size,
++      .flags = (uint64_t) req->flags | KGSL_MEMFLAGS_FORCE_32BIT,
++   };
++   if (safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &obj)) {
++      static bool noted;
++      if (!noted) {
++         noted = true;
++         tu_note("tu/kgsl: no room below 4 GB for a command BO (%s): it goes where KGSL puts it",
++                 strerror(errno));
++      }
++      return false;
++   }
++
++   struct kgsl_gpuobj_info info = {
++      .id = obj.id,
++   };
++   if (safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_INFO, &info)) {
++      struct kgsl_gpumem_free_id free_req = {
++         .id = obj.id,
++      };
++      safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &free_req);
++      return false;
++   }
++
++   req->id = obj.id;
++   req->mmapsize = obj.mmapsize;
++   req->gpuaddr = info.gpuaddr;
++   return true;
++}
++
+ static VkResult
+ kgsl_bo_init(struct tu_device *dev,
+              struct vk_object_base *base,
+@@ -339,20 +389,19 @@ kgsl_bo_init(struct tu_device *dev,
+    if (flags & TU_BO_ALLOC_REPLAYABLE)
+       req.flags |= KGSL_MEMFLAGS_USE_CPU_MAP;
+ 
++   int ret;
++
+    /* Forcing everything in the first 4GB is overkill, but we don't have many
+     * other options here since we don't control iova addresses and kgsl
+     * doesn't have a flag to avoid 32B rollover.
+     */
+-   if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER)
+-      req.flags |= KGSL_MEMFLAGS_FORCE_32BIT;
+-
+-   int ret;
+-
+-   ret = safe_ioctl(dev->physical_device->local_fd,
+-                    IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
+-   if (ret) {
+-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
++   if (!(flags & TU_BO_ALLOC_NO_32B_ROLLOVER) || !kgsl_alloc_low4g(dev, &req)) {
++      ret = safe_ioctl(dev->physical_device->local_fd,
++                       IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
++      if (ret) {
++         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
++      }
+    }
+ 
+    struct tu_bo* bo = tu_device_lookup_bo(dev, req.id);
+-- 
+2.43.0
+

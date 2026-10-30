@@ -78,6 +78,14 @@ void runtime_file_unmount(const char *guest) {
 }
 static char user_root[512]="user";
 const char *runtime_file_user_dir(void) { return user_root; }
+/* g2-arm64 (issue #10): the game's update as a folder of its own (CUSAxxxxx-UPDATE next to the
+ * game's folder, the layout PS4 emulators use): a file under /app0 (and /hostapp) comes from
+ * there when it has it, from the game's folder otherwise, and a directory lists both. Empty
+ * without such a folder. */
+static char update_root[512];
+void runtime_file_configure_update(const char *update) {
+    snprintf(update_root,sizeof(update_root),"%s",update ? update : "");
+}
 void runtime_file_configure(const char *app0,const char *user) {
     char path[600];
     snprintf(user_root,sizeof(user_root),"%s",user);
@@ -141,9 +149,10 @@ static int translate(const char *guest,char *out,size_t size) {
     }
     int result=0;
     size_t root=0;
+    int game=0;
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
-    else root=strlen(m->host);
+    else { root=strlen(m->host); game=!strcmp(m->guest,"/app0") || !strcmp(m->guest,"/hostapp"); }
     pthread_mutex_unlock(&lock);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
 #ifndef _WIN32
@@ -151,7 +160,31 @@ static int translate(const char *guest,char *out,size_t size) {
 #else
     (void)root;
 #endif
+    /* The update folder first (issue #10): its copy of the file wins; a directory stays the
+       game's (its listing takes the update's entries too, see list_directory). */
+    if (!result && game && update_root[0]) {
+        char alt[1024]; HostStat s;
+        if ((size_t)snprintf(alt,sizeof(alt),"%s%s",update_root,buffer+best)<sizeof(alt)) {
+#ifndef _WIN32
+            fix_case(alt,strlen(update_root));
+#endif
+            if (!host_stat(alt,&s) && !S_ISDIR(s.st_mode) && strlen(alt)<size) memcpy(out,alt,strlen(alt)+1);
+        }
+    }
     return result;
+}
+/* The update folder's counterpart of a game directory, or NULL (issue #10). */
+static const char *update_twin(const char *path,char *alt,size_t size) {
+    if (!update_root[0]) return NULL;
+    pthread_mutex_lock(&lock);
+    const Mount *m=NULL;
+    for (size_t i=0;i<mount_count;++i)
+        if ((!strcmp(mounts[i].guest,"/app0") || !strcmp(mounts[i].guest,"/hostapp")) &&
+            !strncmp(path,mounts[i].host,strlen(mounts[i].host)) &&
+            (path[strlen(mounts[i].host)]=='/' || !path[strlen(mounts[i].host)])) { m=&mounts[i]; break; }
+    int ok=m && (size_t)snprintf(alt,size,"%s%s",update_root,path+strlen(m->host))<size;
+    pthread_mutex_unlock(&lock);
+    return ok ? alt : NULL;
 }
 static int host_flags(int flags) {
     int r;
@@ -169,13 +202,21 @@ static int host_flags(int flags) {
     return r|O_CLOEXEC;
 }
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
-static Listing *list_directory(const char *path) {
+static int listed(const Listing *l,const char *name) {
+    for (size_t i=0;i<l->count;++i) if (!strcasecmp(l->names+l->offsets[i],name)) return 1;
+    return 0;
+}
+/* Appends path's entries to l (made when NULL); with skip_known, names l has already are left out
+   (the update folder's entries after the game's, issue #10). */
+static Listing *list_directory_into(Listing *l,const char *path,int skip_known) {
     DIR *d=opendir(path);
-    if (!d) return NULL;
-    Listing *l=calloc(1,sizeof(*l));
-    size_t capacity=0,bytes=0,cap_names=0;
+    if (!d) return l;
+    if (!l) l=calloc(1,sizeof(*l));
+    size_t capacity=l ? l->count : 0,bytes=0,cap_names=0;
+    if (l && l->count) { bytes=l->offsets[l->count-1]+strlen(l->names+l->offsets[l->count-1])+1; cap_names=bytes; }
     struct dirent *e;
     while (l && (e=readdir(d))) {
+        if (skip_known && listed(l,e->d_name)) continue;
         size_t n=strlen(e->d_name)+1;
         if (l->count==capacity) {
             capacity=capacity ? capacity*2 : 64;
@@ -203,6 +244,12 @@ static Listing *list_directory(const char *path) {
         ++l->count; bytes+=n;
     }
     closedir(d);
+    return l;
+}
+static Listing *list_directory(const char *path) {
+    Listing *l=list_directory_into(NULL,path,0);
+    char alt[1024];
+    if (l && update_twin(path,alt,sizeof(alt))) l=list_directory_into(l,alt,1);
     return l;
 }
 static void convert_stat(const HostStat *s,GuestStat *g) {

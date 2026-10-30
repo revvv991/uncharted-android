@@ -1582,13 +1582,14 @@ int main(int argc, char **argv) {
 #endif
     int cpu_only = 0, strict_imports = 0, list_missing = 0;
     unsigned timeout_seconds = 10;
-    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *guest_argv_file=NULL, *trophy_dir=NULL;
+    const char *content_profile=NULL, *app0=NULL, *app0_update=NULL, *user_dir=NULL, *patch_file=NULL, *guest_argv_file=NULL, *trophy_dir=NULL;
     for (int i = 2; i < argc; ++i) {
         if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
         else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
         else if (!strcmp(argv[i], "--list-missing")) list_missing = 1;
         else if (!strcmp(argv[i], "--content-profile") && i+1<argc) content_profile=argv[++i];
         else if (!strcmp(argv[i], "--app0") && i+1<argc) app0=argv[++i];
+        else if (!strcmp(argv[i], "--app0-update") && i+1<argc) app0_update=argv[++i]; /* issue #10 */
         else if (!strcmp(argv[i], "--user") && i+1<argc) user_dir=argv[++i];
         else if (!strcmp(argv[i], "--patches") && i+1<argc) patch_file=argv[++i];
         else if (!strcmp(argv[i], "--guest-argv") && i+1<argc) guest_argv_file=argv[++i];
@@ -1614,6 +1615,8 @@ int main(int argc, char **argv) {
         runtime_content_configure(values);
     }
     if (app0) {
+        runtime_file_configure_update(app0_update);
+        if (app0_update) printf("Runtime: the update folder %s comes first under /app0\n", app0_update);
         runtime_file_configure(app0, user_dir ? user_dir : "user");
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);

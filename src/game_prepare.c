@@ -60,6 +60,24 @@ static char *dup_string(Ctx *c, const char *s) {
 
 typedef struct { uint8_t *data; uint64_t size; } Buf;
 
+/* g2-arm64 (issue #10): game_dir may be "<update folder>\n<game folder>": a file is taken from the
+ * first folder that has it. The game folder's path for messages and single-folder uses. */
+static const char *game_root(const char *game_dir) {
+    const char *nl = strchr(game_dir, '\n');
+    return nl ? nl + 1 : game_dir;
+}
+/* <game_dir>/<name> from the update folder when it has the file, from the game's folder
+ * otherwise (game_dir as game_root says). */
+static void game_file(char *path, size_t size, const char *game_dir, const char *name) {
+    const char *nl = strchr(game_dir, '\n');
+    if (nl) {
+        snprintf(path, size, "%.*s/%s", (int)(nl - game_dir), game_dir, name);
+        FILE *f = fopen(path, "rb");
+        if (f) { fclose(f); return; }
+    }
+    snprintf(path, size, "%s/%s", game_root(game_dir), name);
+}
+
 static Buf read_file(Ctx *c, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) fail(c, "cannot open %s", path);
@@ -451,7 +469,7 @@ static void prepare_and_link(Ctx *c, const char *game_dir, const char *exe, cons
     char path[4096];
     /* prepare.py: the executable's memory image, its relocations and imports. */
     Module main;
-    snprintf(path, sizeof(path), "%s/%s", game_dir, exe);
+    game_file(path, sizeof(path), game_dir, exe);
     load_module(c, path, &main);
     uint64_t size = 0;
     size_t nloads = 0;
@@ -508,7 +526,7 @@ static void prepare_and_link(Ctx *c, const char *game_dir, const char *exe, cons
     for (size_t i = 0; i < nnames; ++i)
         if (strlen(names[i]) >= 128) fail(c, "import name too long");
     Module libc;
-    snprintf(path, sizeof(path), "%s/sce_module/libc.prx", game_dir);
+    game_file(path, sizeof(path), game_dir, "sce_module/libc.prx");
     load_module(c, path, &libc);
     const uint64_t flags = (uint64_t)init_env_is_ret(c, &libc);
 
@@ -547,7 +565,9 @@ static void prepare_and_link(Ctx *c, const char *game_dir, const char *exe, cons
         if (mi == 0) {
             mod = libc;
         } else {
-            snprintf(path, sizeof(path), "%s/sce_module/%s", game_dir, module_names[mi]);
+            char rel[256];
+            snprintf(rel, sizeof(rel), "sce_module/%s", module_names[mi]);
+            game_file(path, sizeof(path), game_dir, rel);
             load_module(c, path, &mod);
         }
         uint64_t modsize = 0;
@@ -783,7 +803,7 @@ static SfoValue sfo_lookup(Ctx *c, const Buf *b, const char *wanted) {
 /* content_profile.py: explicit offline AppContent metadata, SKU full. */
 static void content_profile(Ctx *c, const char *game_dir, const char *out_dir) {
     char path[4096];
-    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", game_dir);
+    game_file(path, sizeof(path), game_dir, "sce_sys/param.sfo");
     Buf b = read_file(c, path);
     Out o = {0};
     put(c, &o, "BBCONT01", 8);
@@ -834,7 +854,7 @@ int game_sfo_value(const char *game_dir, const char *key, char *out, size_t out_
         return -1;
     }
     char path[4096];
-    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", game_dir);
+    game_file(path, sizeof(path), game_dir, "sce_sys/param.sfo");
     Buf b = read_file(&c, path);
     SfoValue v = sfo_lookup(&c, &b, key);
     if (v.found && out && out_size) snprintf(out, out_size, "%s", v.text);

@@ -41,3 +41,5 @@ CUSA*/
 *.rdc
 *.core
 *.dmp
+# g2-arm64: the launcher icon (drawn by icon.py, issue #4) is not a screenshot
+!android/scripts/g2/game_app/res/**/*.png

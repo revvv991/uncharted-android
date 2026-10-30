@@ -1,0 +1,207 @@
+From f7199c014e15428deba5dfeacbba3f532a0c086f Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip: our switches also from Android properties, notes also
+ in the Android log
+
+os_get_option reads the environment first, then debug.mesa.<name> (TU_PAGE1_SKIP:
+debug.mesa.tu.page1.skip), so they can be set for apps that load this driver through
+libadrenotools. tu_note: stderr and the Android log.
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc |  4 ++--
+ src/freedreno/vulkan/tu_cs.cc         | 22 +++++++++++-----------
+ src/freedreno/vulkan/tu_knl_kgsl.cc   | 18 +++++++++---------
+ src/freedreno/vulkan/tu_memcheck.cc   |  2 +-
+ src/freedreno/vulkan/tu_util.h        |  8 ++++++++
+ 5 files changed, 31 insertions(+), 23 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 90621b67db0..5df2fc1bf43 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -460,10 +460,10 @@ tu7_br_sync_bit(void)
+ {
+    static int on = -1;
+    if (on < 0) {
+-      const char *env = getenv("TU_BR_SYNC");
++      const char *env = os_get_option("TU_BR_SYNC");
+       on = env && env[0] == '1';
+       if (on)
+-         fprintf(stderr, "tu: BV waits for BR at each switch to BR (TU_BR_SYNC)\n");
++         tu_note("tu: BV waits for BR at each switch to BR (TU_BR_SYNC)");
+    }
+    return on ? CP_THREAD_CONTROL_0_SYNC_THREADS : 0;
+ }
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index ffcf8868b4d..8eed35124fa 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -128,10 +128,10 @@ tu_ds_no_cross(void)
+ {
+    static int on = -1;
+    if (on < 0) {
+-      const char *env = getenv("TU_DS_NO_CROSS");
++      const char *env = os_get_option("TU_DS_NO_CROSS");
+       on = env && env[0] == '1';
+       if (on)
+-         fprintf(stderr, "tu: draw states kept within 4 KiB pages (TU_DS_NO_CROSS)\n");
++         tu_note("tu: draw states kept within 4 KiB pages (TU_DS_NO_CROSS)");
+    }
+    return on;
+ }
+@@ -185,12 +185,12 @@ tu_ib_align(void)
+    if (align < 0) {
+       /* Off by default: on the G2 (A735) the padding only moved the CP faults elsewhere
+        * (2026-10-20). TU_IB_ALIGN=1024 turns it on for experiments. */
+-      const char *env = getenv("TU_IB_ALIGN");
++      const char *env = os_get_option("TU_IB_ALIGN");
+       const unsigned v = env ? strtoul(env, NULL, 0) : 0;
+       align = (v >= 64 && v <= 4096 && !(v & (v - 1))) ? (int) v : 0;
+       if (align)
+-         fprintf(stderr, "tu: draw state, register bunch and load state packets kept within "
+-                         "%d-byte blocks (TU_IB_ALIGN)\n", align);
++         tu_note("tu: draw state, register bunch and load state packets kept within "
++                 "%d-byte blocks (TU_IB_ALIGN)", align);
+    }
+    return align;
+ }
+@@ -294,10 +294,10 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+     * fetched before it was written, the faults then change from opcode 0 to stream fragments. */
+    static int fill_nop = -1;
+    if (fill_nop < 0) {
+-      const char *env = getenv("TU_CS_FILL_NOP");
++      const char *env = os_get_option("TU_CS_FILL_NOP");
+       fill_nop = env && env[0] == '1';
+       if (fill_nop)
+-         fprintf(stderr, "tu: new command BOs filled with CP_NOP (TU_CS_FILL_NOP)\n");
++         tu_note("tu: new command BOs filled with CP_NOP (TU_CS_FILL_NOP)");
+    }
+    if (fill_nop) {
+       uint32_t *map = (uint32_t *) new_bo->map;
+@@ -376,10 +376,10 @@ tu_ib2_split_dwords(void)
+    if (v < 0) {
+       /* On by default: with 256 the long-IB2 fault site on the G2 went away (8 sessions, one
+        * fault burst elsewhere, the same FPS; 2026-10-20). TU_IB2_SPLIT=0 turns it off. */
+-      const char *env = getenv("TU_IB2_SPLIT");
++      const char *env = os_get_option("TU_IB2_SPLIT");
+       v = env ? (int) strtoul(env, NULL, 0) : 256;
+       if (env && v)
+-         fprintf(stderr, "tu: draw IBs split every %d dwords (TU_IB2_SPLIT)\n", v);
++         tu_note("tu: draw IBs split every %d dwords (TU_IB2_SPLIT)", v);
+    }
+    return v;
+ }
+@@ -389,10 +389,10 @@ tu_page1_skip(void)
+ {
+    static int on = -1;
+    if (on < 0) {
+-      const char *env = getenv("TU_PAGE1_SKIP");
++      const char *env = os_get_option("TU_PAGE1_SKIP");
+       on = !env || env[0] != '0';
+       if (!on)
+-         fprintf(stderr, "tu: command streams may use the second page of their BOs (TU_PAGE1_SKIP=0)\n");
++         tu_note("tu: command streams may use the second page of their BOs (TU_PAGE1_SKIP=0)");
+    }
+    return on;
+ }
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 852403ddc71..dec02f2248d 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -60,9 +60,9 @@ kgsl_submitqueue_new(struct tu_device *dev, struct tu_queue *queue)
+     * preemption style (KGSL_CONTEXT_PREEMPT_STYLE_RINGBUFFER << 25 = 0x02000000: preempted
+     * only between submissions), the priority (<< 12) or the type (VK = 5 << 20).
+     */
+-   if (const char *extra = getenv("TU_KGSL_CTX_FLAGS")) {
++   if (const char *extra = os_get_option("TU_KGSL_CTX_FLAGS")) {
+       req.flags |= (uint32_t) strtoul(extra, NULL, 0);
+-      fprintf(stderr, "tu/kgsl: context flags 0x%08x\n", req.flags);
++      tu_note("tu/kgsl: context flags 0x%08x", req.flags);
+    }
+ 
+    int ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
+@@ -101,7 +101,7 @@ tu_bo_log_enabled(void)
+ {
+    static int enabled = -1;
+    if (enabled < 0) {
+-      const char *env = getenv("TU_BO_LOG");
++      const char *env = os_get_option("TU_BO_LOG");
+       enabled = env && env[0] == '1';
+    }
+    return enabled;
+@@ -733,7 +733,7 @@ kgsl_recover_enabled(void)
+ {
+    static int v = -1;
+    if (v < 0) {
+-      const char *env = getenv("TU_KGSL_RECOVER");
++      const char *env = os_get_option("TU_KGSL_RECOVER");
+       v = !(env && env[0] == '0');
+    }
+    return v;
+@@ -1542,8 +1542,8 @@ kgsl_queue_recover(struct tu_queue *queue, const char *why)
+    p_atomic_set(&queue->kgsl_retired_count, queue->kgsl_retired_count + 1);
+    queue->fence = -1;
+ 
+-   fprintf(stderr, "tu/kgsl: %s on context %u (KGSL gives up a context after more than 3 GPU "
+-           "faults in 2 s); the queue goes on in new context %u (recovery %u)\n",
++   tu_note("tu/kgsl: %s on context %u (KGSL gives up a context after more than 3 GPU "
++           "faults in 2 s); the queue goes on in new context %u (recovery %u)",
+            why, old_id, queue->msm_queue_id, queue->kgsl_retired_count);
+    return VK_SUCCESS;
+ }
+@@ -1564,10 +1564,10 @@ kgsl_fault_test(struct tu_queue *queue)
+    if (likely(at == 0))
+       return;
+    if (at < 0) {
+-      const char *env = getenv("TU_KGSL_FAULT_TEST");
++      const char *env = os_get_option("TU_KGSL_FAULT_TEST");
+       at = env ? os_time_get_nano() + (int64_t) strtoul(env, NULL, 0) * 1000000000ll : 0;
+       if (at)
+-         fprintf(stderr, "tu/kgsl: GPU fault test in %s s (TU_KGSL_FAULT_TEST)\n", env);
++         tu_note("tu/kgsl: GPU fault test in %s s (TU_KGSL_FAULT_TEST)", env);
+       return;
+    }
+    if (os_time_get_nano() < at)
+@@ -1588,7 +1588,7 @@ kgsl_fault_test(struct tu_queue *queue)
+       .flags = KGSL_CMDLIST_IB,
+       .id = bo->gem_handle,
+    };
+-   if (strchr(getenv("TU_KGSL_FAULT_TEST"), 'i')) {
++   if (strchr(os_get_option("TU_KGSL_FAULT_TEST"), 'i')) {
+       kgsl_fault_test_inline = 4;
+       return;
+    }
+diff --git a/src/freedreno/vulkan/tu_memcheck.cc b/src/freedreno/vulkan/tu_memcheck.cc
+index d46a5ec3e7e..d5a267c03a6 100644
+--- a/src/freedreno/vulkan/tu_memcheck.cc
++++ b/src/freedreno/vulkan/tu_memcheck.cc
+@@ -38,7 +38,7 @@ bool
+ enabled()
+ {
+    static const bool on = [] {
+-      const char *env = getenv("TU_MEMCHECK");
++      const char *env = os_get_option("TU_MEMCHECK");
+       return env && env[0] == '1';
+    }();
+    return on;
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index f73c1f99a8a..be9f671c15d 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -478,6 +478,14 @@ tu_dbg_log_gmem_load_store_skips(struct tu_device *device);
+       mesa_log(MESA_LOG_WARN, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__);    \
+ } while(0)
+ 
++/* uncharted-android: notes about our changes go to stderr (uncharted-android's log) and to the
++ * Android log (other apps that load this driver, such as the emulators).
++ */
++#define tu_note(fmt, ...) do {                                          \
++   fprintf(stderr, fmt "\n", ##__VA_ARGS__);                            \
++   mesa_log(MESA_LOG_WARN, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__);       \
++} while(0)
++
+ #define sizeof_field(s, field) sizeof(((s *) NULL)->field)
+ 
+ #define offsetof_arr(s, field, idx)                                          \
+-- 
+2.43.0
+

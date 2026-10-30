@@ -526,7 +526,34 @@ public class Launcher extends Activity {
 
     private void setFolder(String path) {
         while (path.length() > 1 && path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        // The update folder picked (CUSAxxxxx-UPDATE, issue #10): the game is the folder next to it.
+        File f = new File(path);
+        if (f.getName().toUpperCase(Locale.ROOT).endsWith("-UPDATE") && f.getParentFile() != null) {
+            File game = new File(f.getParentFile(), f.getName().substring(0, f.getName().length() - "-UPDATE".length()));
+            if (game.isDirectory()) path = game.getAbsolutePath();
+        }
         prefs.edit().putString("game_dir", path).apply();
+    }
+
+    /** The game's update as a folder of its own: <game folder>-UPDATE next to it (the layout PS4
+     *  emulators use; issue #10), or null. Its files take precedence over the game's. */
+    private static File updateFolder(String dir) {
+        if (dir.isEmpty()) return null;
+        File f = new File(dir + "-UPDATE");
+        return f.isDirectory() ? f : null;
+    }
+
+    /** The folders prepareGame and sfoValue read: the update folder first, when there is one. */
+    private static String gameDirs(String dir) {
+        File update = updateFolder(dir);
+        return update != null ? update.getAbsolutePath() + "\n" + dir : dir;
+    }
+
+    /** <dir>/<name>, from the update folder when it has the file (issue #10). */
+    private static File gameFile(String dir, String name) {
+        File update = updateFolder(dir);
+        if (update != null && new File(update, name).isFile()) return new File(update, name);
+        return new File(dir, name);
     }
 
     @Override
@@ -578,18 +605,21 @@ public class Launcher extends Activity {
         if (!new File(dir).isDirectory()) return "Not a folder the app can open: " + dir;
         List<String> missing = new ArrayList<>();
         for (String[] g : GAMES)
-            if (!new File(dir, g[1]).isFile()) missing.add(g[1]);
+            if (!gameFile(dir, g[1]).isFile()) missing.add(g[1]);
         for (String m : MODULES)
-            if (!new File(dir, m).isFile()) missing.add(m);
+            if (!gameFile(dir, m).isFile()) missing.add(m);
         if (!missing.isEmpty()) return "Missing in the folder: " + String.join(", ", missing);
         return null;
     }
 
-    /** The stamp of a preparation: the folder and its executables' sizes and times. */
+    /** The stamp of a preparation: the folder, the update folder next to it if any, and the
+     *  executables' sizes and times (adding or removing the update folder means preparing again). */
     private String stamp(String dir) {
         StringBuilder b = new StringBuilder(dir).append('\n');
+        File update = updateFolder(dir);
+        if (update != null) b.append("update ").append(update.getAbsolutePath()).append('\n');
         for (String[] g : GAMES) {
-            File f = new File(dir, g[1]);
+            File f = gameFile(dir, g[1]);
             b.append(g[1]).append(' ').append(f.length()).append(' ').append(f.lastModified()).append('\n');
         }
         return b.toString();
@@ -613,8 +643,10 @@ public class Launcher extends Activity {
         String problem = access ? problems(dir) : "Allow the app to read all files first (the game's folder is opened by path).";
         if (problem == null) {
             // (APP_VER is the base game's even when the folder has the patched executables.)
-            String title = sfoValue(dir, "TITLE"), id = sfoValue(dir, "TITLE_ID");
-            folderInfo.setText((title != null ? title : "?") + "  " + (id != null ? id : "?"));
+            String title = sfoValue(gameDirs(dir), "TITLE"), id = sfoValue(gameDirs(dir), "TITLE_ID");
+            File update = updateFolder(dir);
+            folderInfo.setText((title != null ? title : "?") + "  " + (id != null ? id : "?")
+                               + (update != null ? "  (with the update folder " + update.getName() + ")" : ""));
         } else {
             folderInfo.setText(problem);
         }
@@ -658,7 +690,7 @@ public class Launcher extends Activity {
                 File out = g[2].isEmpty() ? files : new File(files, g[2]);
                 out.mkdirs();
                 status("Preparing " + g[1] + " ...");
-                error = prepareGame(dir, g[1], out.getAbsolutePath());
+                error = prepareGame(gameDirs(dir), g[1], out.getAbsolutePath());
                 if (error != null) {
                     error = g[1] + ": " + error;
                     break;
@@ -869,6 +901,8 @@ public class Launcher extends Activity {
             args.append(out).append("/boot-linked.bin\n--content-profile\n").append(out).append("/content.bin\n")
                 .append("--app0\n").append(dir).append("\n--user\n").append(d).append("/user\n")
                 .append("--timeout\n0\n--log\n").append(d).append("/bb-probe.log\n");
+            File update = updateFolder(dir);
+            if (update != null) args.append("--app0-update\n").append(update.getAbsolutePath()).append('\n');
             if (preset != null) args.append("--patches\n").append(preset).append('\n');
             writeText(new File(files, "args-" + g[0] + ".txt"), args.toString());
             if (g[0].equals("u1")) writeText(new File(files, "args.txt"), args.toString());

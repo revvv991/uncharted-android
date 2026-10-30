@@ -10,7 +10,8 @@
     <uses-permission android:name="android.permission.INTERNET" /> <!-- driver packages and updates from GitHub (the launcher) -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" /> <!-- updates (Updater.java) -->
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
-    <application android:label="uncharted-android" android:hasCode="true" android:extractNativeLibs="true"
+    <application android:label="uncharted-android" android:icon="@mipmap/ic_launcher"
+        android:hasCode="true" android:extractNativeLibs="true"
         android:hardwareAccelerated="true" android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <!-- Updates (Updater.java): the releases of this repository, offered only to an app signed

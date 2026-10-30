@@ -8,7 +8,8 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" /> <!-- driver packages from GitHub (the launcher) -->
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
-    <application android:label="Uncharted G2" android:hasCode="true" android:extractNativeLibs="true"
+    <application android:label="Uncharted G2" android:icon="@mipmap/ic_launcher"
+        android:hasCode="true" android:extractNativeLibs="true"
         android:hardwareAccelerated="true" android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
         <!-- simpleperf from adb shell (profiling hot threads), without debuggable's costs. -->

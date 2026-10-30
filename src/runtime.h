@@ -73,6 +73,9 @@ uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
+/* g2-arm64 (issue #10): the game's update folder (CUSAxxxxx-UPDATE next to the game's folder):
+ * its files take precedence under /app0; NULL or "" for none. Before runtime_file_configure. */
+void runtime_file_configure_update(const char *update);
 int runtime_file_mount(const char *guest, const char *host);
 void runtime_file_unmount(const char *guest);
 int runtime_file_translate(const char *guest, char *out, size_t size);
