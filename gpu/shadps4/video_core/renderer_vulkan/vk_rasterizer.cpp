@@ -824,6 +824,19 @@ bool StreamDedupeEnabled() {
     return enabled;
 }
 
+// g2-arm64: BB_STREAM_DEDUPE_MAX=<bytes>: copies above it are neither hashed nor deduplicated.
+// The hash of every source cost the command processor's thread 16% of its time in U3's
+// museum (simpleperf, 2026-10-31), where the frame is that thread's latency: the dedupe off
+// ran at 34.5 FPS against 32.4-33.7. The small copies (constants) keep the dedupe, which
+// spared U2's palace 1.1 GB/s of traffic. 0: no cap.
+u64 StreamDedupeMax() {
+    static const u64 max = [] {
+        const char* env = std::getenv("BB_STREAM_DEDUPE_MAX");
+        return env ? std::strtoull(env, nullptr, 10) : u64{0};
+    }();
+    return max;
+}
+
 // BB_STREAM_STATS=1: stream-path copies that repeat an address already copied in the same frame
 // (BbStats::gpu_frames), with the same bytes or not, and those equal to the address's previous
 // copy whatever its frame (stage A only).
@@ -968,7 +981,9 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
                           bool dedupe = true) {
         StreamDedupe::Entry* entry = nullptr;
         u64 hash = 0;
-        if (!source && dedupe && StreamDedupeEnabled() && memory->IsHostMapped(address, size)) {
+        if (!source && dedupe && StreamDedupeEnabled() &&
+            (StreamDedupeMax() == 0 || size <= StreamDedupeMax()) &&
+            memory->IsHostMapped(address, size)) {
             hash = XXH3_64bits(reinterpret_cast<const void*>(address), size);
             entry = &g_stream_dedupe.Slot(address, size);
             if (entry->address == address && entry->size == size && entry->hash == hash &&
@@ -2290,8 +2305,26 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
+    // bbport (Mevlock): a draw of up to 6 indices is usually a full-screen quad (not jittered), but
+    // a quad that writes depth or tests it for equality is scene geometry: U3's chateau wall panels
+    // are single quads. Left unjittered, they sat a fraction of a pixel off their jittered
+    // neighbours and the seams opened into pinholes showing the scene colour's clear (0, 0, 1, 0):
+    // rows of bright blue dots, only with an upscaler on. BB_JITTER_SMALL=0: off.
+    static const bool jitter_small = [] {
+        const char* env = std::getenv("BB_JITTER_SMALL");
+        return !(env && env[0] == '0');
+    }();
+    const auto small_scene_geometry = [&] {
+        if (!jitter_small || !regs.depth_control.depth_enable) {
+            return false;
+        }
+        // Full-screen depth copies and resolves write depth with an always-passing test: not these.
+        const auto func = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
+        return func != vk::CompareOp::eAlways &&
+               (bool(regs.depth_control.depth_write_enable) || func == vk::CompareOp::eEqual);
+    };
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
-        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
+        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1 || small_scene_geometry())) {
         draw_jitter = upscaler->Jitter();
     } else if (const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
                ps && upscaler->Enabled() && JitterFullScreenPass(ps->pgm_hash)) {
@@ -2680,8 +2713,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
     static const bool enabled = [] {
         // Off by default: in U3's Cartagena square it halved the frame rate (94 -> 46 FPS)
-        // with each copy waiting for the GPU. g2-arm64: 1 copies without the wait, sync with it
-        // (ReadBackSmallWrittenBuffers).
+        // with each copy waiting for the GPU; since 0.3.11 the bytes land on the landing
+        // thread (ReadBackSmallWrittenBuffers). g2-arm64: "sync" counts as on as well.
         const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
         return env && (env[0] == '1' || std::string_view{env} == "sync");
     }();
@@ -2707,26 +2740,40 @@ void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
 }
 
 void Rasterizer::ReadBackSmallWrittenBuffers() {
-    // g2-arm64 (from uncharted_Linux c443a3b): copied without waiting for the GPU
-    // (BufferCache::ReadMemoryAsync): the game gets the value once the GPU is past the event
-    // instead of right at it. Waiting for the GPU at every end-of-pipe event (ReadMemory) cost
-    // Uncharted 1 on the Steam Deck 40% of its frame rate. BB_READBACK_SMALL_BUFFERS=sync: the
-    // waiting copy.
-    static const bool sync = [] {
-        const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
-        return env && std::string_view{env} == "sync";
-    }();
+    // g2-arm64: the uncharted_Linux way (c443a3b, ReadMemoryAsync) gave way to upstream's landing
+    // (0.3.11): BB_READBACK_SMALL_BUFFERS=sync means BB_READBACK_SMALL_DEFER=0 now.
     std::vector<std::pair<VAddr, u32>> ranges;
     {
         std::scoped_lock lk{small_written_mutex};
         ranges.swap(small_written_buffers);
     }
+    // The read back waits for the whole GPU queue (U3 pub: 27 instead of 46 FPS with the other
+    // run of the pair at the same time). The bytes land on the landing thread instead, once the
+    // work that wrote them is done, and the end-of-pipe label waits for them (landing_gate.h):
+    // the guest sees the same data in the same order without a thread waiting for the GPU.
+    // BB_READBACK_SMALL_DEFER=0: wait here as before.
+    static const bool defer = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_DEFER");
+        return !(env && env[0] == '0');
+    }();
+    // Gated: the end-of-pipe label waits for the landing, i.e. for the GPU to finish that work
+    // (the guest then never reads it early, but loses the overlap with the GPU: U3 pub 46 of 60
+    // FPS). Default: the bytes land when the GPU is done and the label does not wait.
+    // BB_READBACK_SMALL_GATE=1: gated.
+    static const bool gated = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_GATE");
+        return env && env[0] == '1';
+    }();
     for (const auto& [address, size] : ranges) {
-        if (sync) {
-            buffer_cache.ReadMemory(address, size, false, true);
-        } else {
-            buffer_cache.ReadMemoryAsync(address, size);
+        if (defer) {
+            if (!buffer_cache.IsRangeGpuWritten(address, size)) {
+                continue; // none of these bytes is GPU data, the guest copy is current
+            }
+            if (buffer_cache.DeferGuestCopy(address, address, size, false, gated)) {
+                continue;
+            }
         }
+        buffer_cache.ReadMemory(address, size, false, true);
     }
 }
 
@@ -2999,10 +3046,16 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
-    const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
-    // g2-arm64: BB_CS_SPLIT: the pipeline was compiled for workgroups split this many times.
-    const u32 host_dim_x =
-        dim_x * (cs.cs_split_safe ? PipelineCache::CsSplitRequest(cs.pgm_hash, cs_program) : 1);
+    // bbport: workgroups compiled as smaller ones (Shader::WorkgroupSplit): that many times the
+    // workgroups in X.
+    const Shader::HwComputeRuntimeInfo hw_cs = {
+        .workgroup_size = {cs_program.num_thread_x.full, cs_program.num_thread_y.full,
+                           cs_program.num_thread_z.full},
+        .indirect = false,
+    };
+    const u32 workgroup_split = Shader::WorkgroupSplit(cs.cs_split_eligible, hw_cs);
+    const u32 dim_x = cs_program.dim_x * workgroup_split, dim_y = cs_program.dim_y,
+              dim_z = cs_program.dim_z;
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
@@ -3032,7 +3085,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
-        cmdbuf.dispatch(host_dim_x, dim_y, dim_z);
+        cmdbuf.dispatch(dim_x, dim_y, dim_z);
         if (full_barrier >= 1) {
             cmdbuf.pipelineBarrier2(dependency);
         }

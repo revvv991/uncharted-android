@@ -294,38 +294,13 @@ void EmitContext::DefineAmdPerVertexAttribs() {
     }
 }
 
-void EmitContext::DefineSplitIds() {
-    // Host workgroup w, invocation l of a dispatch split k times: guest workgroup w / k,
-    // guest invocation (w % k) * (size / k) + l. Workgroups are one-dimensional (size, 1, 1).
-    const u32 split = CsSplit();
-    const u32 host_size = runtime_info.hw.cs.workgroup_size[0] / split;
-    const Id host_group{OpLoad(U32[3], workgroup_id)};
-    const Id host_x{OpCompositeExtract(U32[1], host_group, 0)};
-    const Id split_const{ConstU32(split)};
-    split_workgroup_id =
-        OpCompositeInsert(U32[3], OpUDiv(U32[1], host_x, split_const), host_group, 0);
-    Name(split_workgroup_id, "guest_workgroup_id");
-    const Id host_local_x{
-        OpCompositeExtract(U32[1], OpLoad(U32[3], local_invocation_id), 0)};
-    const Id guest_local_x{OpIAdd(U32[1],
-                                  OpIMul(U32[1], OpUMod(U32[1], host_x, split_const),
-                                         ConstU32(host_size)),
-                                  host_local_x)};
-    split_local_id = OpCompositeConstruct(U32[3], guest_local_x, u32_zero_value, u32_zero_value);
-    Name(split_local_id, "guest_local_id");
-}
-
 void EmitContext::DefineWorkgroupIndex() {
-    const Id workgroup_id_val{split_workgroup_id.value ? split_workgroup_id
-                                                       : OpLoad(U32[3], workgroup_id)};
+    const Id workgroup_id_val{OpLoad(U32[3], workgroup_id)};
     const Id workgroup_x{OpCompositeExtract(U32[1], workgroup_id_val, 0)};
     const Id workgroup_y{OpCompositeExtract(U32[1], workgroup_id_val, 1)};
     const Id workgroup_z{OpCompositeExtract(U32[1], workgroup_id_val, 2)};
     const Id num_workgroups{OpLoad(U32[3], num_workgroups_id)};
-    Id num_workgroups_x{OpCompositeExtract(U32[1], num_workgroups, 0)};
-    if (split_workgroup_id.value) {
-        num_workgroups_x = OpUDiv(U32[1], num_workgroups_x, ConstU32(CsSplit()));
-    }
+    const Id num_workgroups_x{OpCompositeExtract(U32[1], num_workgroups, 0)};
     const Id num_workgroups_y{OpCompositeExtract(U32[1], num_workgroups, 1)};
     workgroup_index_id =
         OpIAdd(U32[1], OpIAdd(U32[1], workgroup_x, OpIMul(U32[1], workgroup_y, num_workgroups_x)),
@@ -509,15 +484,12 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case SwStage::Compute: {
-        // g2-arm64: a split shader rebuilds every guest id from both host ids.
-        const bool split = CsSplit() > 1;
-        const bool uses_ids = info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
-                              info.loads.GetAny(IR::Attribute::WorkgroupId) ||
-                              info.loads.GetAny(IR::Attribute::LocalInvocationId) ||
-                              info.loads.Get(IR::Attribute::LocalInvocationIndex);
+    case SwStage::Compute:
+        workgroup_split = WorkgroupSplit(info.cs_split_eligible, runtime_info.hw.cs);
         if (info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
-            info.loads.GetAny(IR::Attribute::WorkgroupId) || (split && uses_ids)) {
+            info.loads.GetAny(IR::Attribute::WorkgroupId) ||
+            (workgroup_split > 1 && (info.loads.GetAny(IR::Attribute::LocalInvocationId) ||
+                                     info.loads.Get(IR::Attribute::LocalInvocationIndex)))) {
             workgroup_id =
                 DefineVariable(U32[3], spv::BuiltIn::WorkgroupId, spv::StorageClass::Input);
         }
@@ -525,16 +497,15 @@ void EmitContext::DefineInputs() {
             num_workgroups_id =
                 DefineVariable(U32[3], spv::BuiltIn::NumWorkgroups, spv::StorageClass::Input);
         }
-        if (info.loads.GetAny(IR::Attribute::LocalInvocationId) || (split && uses_ids)) {
+        if (info.loads.GetAny(IR::Attribute::LocalInvocationId)) {
             local_invocation_id =
                 DefineVariable(U32[3], spv::BuiltIn::LocalInvocationId, spv::StorageClass::Input);
         }
-        if (!split && info.loads.Get(IR::Attribute::LocalInvocationIndex)) {
+        if (info.loads.Get(IR::Attribute::LocalInvocationIndex)) {
             local_invocation_index = DefineVariable(U32[1], spv::BuiltIn::LocalInvocationIndex,
                                                     spv::StorageClass::Input);
         }
         break;
-    }
     case SwStage::Geometry: {
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
         const auto gl_per_vertex =

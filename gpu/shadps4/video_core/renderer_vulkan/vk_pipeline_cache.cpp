@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "bbport_focus_fix.h"
 
 namespace Vulkan {
 
@@ -252,7 +253,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.cs.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
                                   cs_pgm.IsTgidEnabled(2)};
         info.hw.cs.shared_memory_size = cs_pgm.SharedMemSize();
-        info.hw.cs.split_factor = compute_split;
+        info.hw.cs.indirect = sel.indirect_dispatch;
         break;
     }
     default:
@@ -354,6 +355,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             return !instance.IsFragmentShaderBarycentricSupported() &&
                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
         }(),
+        // g2-arm64: also with BB_CS_SPLIT (anything but 0; the launcher sets it): U1's GPU
+        // skinning, cs 8f067540, is ~300 dispatches a frame of one 1024-invocation workgroup,
+        // one shader core of the Adreno (port 0019: +1.3 FPS at 720p).
+        .split_large_workgroups = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+                                  [] {
+                                      const char* env = std::getenv("BB_CS_SPLIT");
+                                      return env && env[0] && env[0] != '0';
+                                  }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
@@ -757,46 +766,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return result;
 }
 
-u32 PipelineCache::CsSplitRequest(u64 hash, const AmdGpu::ComputeProgram& cs_pgm) {
-    struct Setting {
-        u32 size = 0;
-        std::vector<u32> hashes;
-    };
-    static const Setting setting = [] {
-        Setting s;
-        if (const char* env = std::getenv("BB_CS_SPLIT")) {
-            char* end;
-            s.size = static_cast<u32>(std::strtoul(env, &end, 10));
-            if (s.size < 64 || s.size % 64 != 0) {
-                s.size = 0;
-            }
-            for (const char* p = *end == ':' ? end + 1 : end; *p;) {
-                const u32 value = static_cast<u32>(std::strtoull(p, &end, 16));
-                if (end == p) {
-                    break;
-                }
-                s.hashes.push_back(value);
-                p = *end == ',' ? end + 1 : end;
-            }
-            std::printf("CS split: workgroups larger than %u invocations into %u (%s)\n", s.size,
-                        s.size, s.hashes.empty() ? "all shaders" : env);
-        }
-        return s;
-    }();
-    const u32 x = cs_pgm.num_thread_x.full;
-    if (setting.size == 0 || x <= setting.size || x % setting.size != 0 ||
-        cs_pgm.num_thread_y.full != 1 || cs_pgm.num_thread_z.full != 1 ||
-        (!setting.hashes.empty() &&
-         std::find(setting.hashes.begin(), setting.hashes.end(), u32(hash)) ==
-             setting.hashes.end())) {
-        return 1;
-    }
-    return x / setting.size;
-}
-
-const ComputePipeline* PipelineCache::GetComputePipeline(bool direct) {
-    compute_direct = direct;
+const ComputePipeline* PipelineCache::GetComputePipeline(bool indirect) {
     EnsureWarm();
+    sel.indirect_dispatch = indirect;
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -1265,7 +1237,6 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    compute_split = compute_direct ? CsSplitRequest(cs_params.hash, cs_pgm) : 1;
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -1299,7 +1270,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(spv, instance.GetDevice());
     }
 
-    if (!Shader::Backend::SPIRV::IsForcedShader(info.pgm_hash)) {
+    // bbport: the autofocus fix is translated each run (BB_FOCUS_FIX=0 turns it off).
+    if (!Shader::Backend::SPIRV::IsForcedShader(info.pgm_hash) &&
+        !BbFocusFix::FocusCentreShader(info.pgm_hash)) {
         RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
     }
 

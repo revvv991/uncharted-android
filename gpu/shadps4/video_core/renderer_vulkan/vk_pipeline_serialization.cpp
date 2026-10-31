@@ -22,19 +22,23 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "bbport_focus_fix.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // g2-arm64: 10 BB_CS_SPLIT; 11 constant windows per shader and sharps read through them (0047,
 // 0048: cached shaders with windowed reads kept the old clamp and a null cookie); 12 merged with
 // upstream 0.3.9's 10 (motion shaders hold address stand-ins) and 11 (scalar instructions split
-// EXEC scopes); 13 T# tables of 128 entries; 14 the output clamp's NaN -> 0 in fragment shaders
-static constexpr u32 ShaderBinaryVersion = 14u;
+// EXEC scopes); 13 T# tables of 128 entries; 14 the output clamp's NaN -> 0 in fragment shaders;
+// 15 merged with upstream 0.3.11 (WorkgroupSplit in place of BB_CS_SPLIT, the aiming focus fix in
+// 9f801363, the custom border colour)
+static constexpr u32 ShaderBinaryVersion = 15u;
 // g2-arm64: 8 Info::cs_split_safe, 9 T# tables, 10 merged with upstream 0.3.9, 11 T# tables of
-// 128 entries
-static constexpr u32 ShaderMetaVersion = 11u;
-// g2-arm64: 6 HwComputeRuntimeInfo::split_factor, 7 merged with upstream 0.3.9
-static constexpr u32 PipelineKeyVersion = 7u;
+// 128 entries, 12 upstream 0.3.11's cs_split_eligible in place of cs_split_safe
+static constexpr u32 ShaderMetaVersion = 12u;
+// g2-arm64: 6 HwComputeRuntimeInfo::split_factor, 7 merged with upstream 0.3.9, 8 upstream
+// 0.3.11's indirect in place of split_factor
+static constexpr u32 PipelineKeyVersion = 8u;
 /// bbport (BilalReloaded): the cache name of a shader's SPIR-V. Shaders that gained multi-wave
 /// LDS barriers get a new name, so their binaries cached before the fix are not found and only
 /// those shaders recompile.
@@ -414,7 +418,8 @@ void PipelineCache::WarmUpThread() {
         stage.spec.info = &stage.program->info;
         std::optional<Shader::Gcn::FetchShaderData> unused;
         if (!LoadShaderMeta(meta_ar, stage.program->info, unused, stage.spec, stage.perm_idx) ||
-            Shader::Backend::SPIRV::IsForcedShader(stage.program->info.pgm_hash)) {
+            Shader::Backend::SPIRV::IsForcedShader(stage.program->info.pgm_hash) ||
+            BbFocusFix::FocusCentreShader(stage.program->info.pgm_hash)) {
             stage.program.reset();
             return;
         }

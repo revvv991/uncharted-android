@@ -432,7 +432,7 @@ struct BufferCache::Landing {
     std::chrono::steady_clock::time_point registered;
 };
 
-bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
+bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part, bool gated) {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_SCALAR_COPY64_DEFER");
         return env && env[0] == '1'; // run.py: on for Uncharted 2
@@ -444,8 +444,12 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
         return !(env && env[0] == '0');
     }();
     const bool use_ring = !side_queue && ring_enabled;
-    if (!enabled || !(side_queue || use_ring) || land_stopping.load(std::memory_order_acquire) ||
-        size == 0 || size > SideQueue::StagingSize / 2 || !memory->IsValidGpuMapping(src, size) ||
+    // The raycaster copies (guest_part) are opt-in; the small GPU results the guest reads in place
+    // (ReadBackSmallWrittenBuffers, guest_part false) always land on the landing thread:
+    // waiting for them stopped the GPU thread (U3 Cartagena square 60 -> 36 FPS).
+    if ((guest_part && !enabled) || !(side_queue || use_ring) ||
+        land_stopping.load(std::memory_order_acquire) || size == 0 ||
+        size > SideQueue::StagingSize / 2 || !memory->IsValidGpuMapping(src, size) ||
         !memory->IsValidGpuMapping(dst, size)) {
         return false;
     }
@@ -534,9 +538,18 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
             });
         }
         // The copy is in the open command buffer: submitted here, so it completes without
-        // anybody waiting for something else to submit it.
+        // anybody waiting for something else to submit it. g2-arm64: only when somebody
+        // waits (gated: the raycaster copies, 0123); the small compute results (PR #449,
+        // gated false, ~600 a second in U3's museum) ride the next submit instead - each of
+        // their submits cost the GPU an idle gap. BB_LANDING_SUBMIT=1: every landing submits.
+        static const bool submit_all = [] {
+            const char* env = std::getenv("BB_LANDING_SUBMIT");
+            return env && env[0] == '1';
+        }();
         tick = scheduler.CurrentTick();
-        scheduler.Flush();
+        if (gated || submit_all) {
+            scheduler.Flush();
+        }
     } else {
         // The tick of the work that wrote the source. Everything is recorded by now (the
         // dispatch follows a drain of the draw pipe), so a write marked for the next tick is in
@@ -549,9 +562,11 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
     }
     landing->tick = tick;
     landing->registered = std::chrono::steady_clock::now();
-    if (use_ring) {
-        // The guest part now: only the bytes the GPU did not write. The ones it wrote keep the
-        // destination's records until theirs land, as before a GPU copy has run.
+    // The guest part of the copy now; the GPU-written bytes follow when they have landed
+    // (guest_part false: nothing now, only the GPU-written bytes land).
+    if (guest_part && use_ring) {
+        // Only the bytes the GPU did not write. The ones it wrote keep the destination's
+        // records until theirs land, as before a GPU copy has run.
         VAddr at = src;
         for (const auto& copy : landing->copies) {
             const VAddr start = arena->cpu_addr + copy.srcOffset;
@@ -565,8 +580,7 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
             memory->TryWriteBacking(reinterpret_cast<void*>(dst + (at - src)),
                                     reinterpret_cast<const void*>(at), src + size - at);
         }
-    } else {
-        // The guest part of the copy now; the GPU-written bytes follow when they have landed.
+    } else if (guest_part) {
         memory->TryWriteBacking(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src),
                                 size);
     }
@@ -575,8 +589,12 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size) {
         if (landing_stop) {
             return false;
         }
-        landing->seq = ++landing_registered_seq;
-        landing_registered.store(landing->seq, std::memory_order_release);
+        if (gated) {
+            landing->seq = ++landing_registered_seq;
+            landing_registered.store(landing->seq, std::memory_order_release);
+        } else {
+            landing->seq = landing_registered_seq; // no label waits for it
+        }
         landing_queue.push_back(std::move(landing));
         if (!landing_thread.joinable()) {
             landing_thread = std::thread([this] { LandingWorker(); });

@@ -449,6 +449,19 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (pipeline_result != vk::Result::eSuccess) {
+        // bbport (Mevlock, drakolordx7): some drivers refuse a pipeline only because of the
+        // pipeline cache (ErrorInitializationFailed on a Radeon RX 9070 XT at start): try once
+        // more without it.
+        auto [retry_result, retry_pipe] = device.createGraphicsPipelineUnique(nullptr, pipeline_info);
+        if (retry_result == vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan,
+                        "Graphics pipeline {} was refused with the pipeline cache ({}); created without it",
+                        debug_str, vk::to_string(pipeline_result));
+            pipeline_result = retry_result;
+            pipe = std::move(retry_pipe);
+        }
+    }
     // g2-arm64 (from uncharted_Linux 45963a2): a driver that cannot build one pipeline
     // (ErrorUnknown on some AMD drivers) stopped the game here; the pipeline stays empty
     // instead and the draws that use it are skipped.

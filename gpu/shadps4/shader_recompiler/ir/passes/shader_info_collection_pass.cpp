@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -168,6 +173,26 @@ void Visit(Info& info, const IR::Inst& inst) {
     }
 }
 
+// g2-arm64: the hash list of BB_CS_SPLIT ("<size>[:<hash>,...]"); empty: every eligible shader.
+static bool CsSplitListed(u64 hash) {
+    static const std::vector<u32> hashes = [] {
+        std::vector<u32> list;
+        const char* env = std::getenv("BB_CS_SPLIT");
+        const char* p = env ? std::strchr(env, ':') : nullptr;
+        while (p && *p) {
+            char* end;
+            const u32 value = static_cast<u32>(std::strtoull(p + 1, &end, 16));
+            if (end == p + 1) {
+                break;
+            }
+            list.push_back(value);
+            p = *end == ',' ? end : nullptr;
+        }
+        return list;
+    }();
+    return hashes.empty() || std::find(hashes.begin(), hashes.end(), u32(hash)) != hashes.end();
+}
+
 void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     Info& info = program.info;
     bool workgroup_sync = false;
@@ -179,18 +204,23 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
                               opcode == IR::Opcode::WorkgroupMemoryBarrier;
         }
     }
-    // g2-arm64: invocations that never see each other's work (no LDS, also not lowered to a
-    // per-workgroup buffer; no barrier; no cross-lane operation) give the same results in
-    // smaller workgroups. The subgroup composition is kept by splitting at a multiple of the
-    // host subgroup size (BB_CS_SPLIT).
-    info.cs_split_safe =
-        info.sw_stage == SwStage::Compute && !workgroup_sync && info.shared_types == IR::Type::Void &&
-        info.shared_memory_scratch_size == 0 && !info.uses_lane_id && !info.uses_group_quad &&
-        !info.uses_group_shuffle && !info.uses_group_ballot &&
-        std::none_of(info.buffers.begin(), info.buffers.end(), [](const BufferResource& buffer) {
-            return buffer.buffer_type == BufferType::SharedMemory ||
-                   buffer.buffer_type == BufferType::GdsBuffer;
-        });
+    // bbport: workgroups that share nothing between their threads may run as smaller ones.
+    if (info.sw_stage == SwStage::Compute && profile.split_large_workgroups) {
+        bool shares = info.shared_types != IR::Type::Void || info.shared_memory_scratch_size != 0 ||
+                      info.loads.GetAny(IR::Attribute::WorkgroupIndex);
+        for (const auto& buffer : info.buffers) {
+            shares |= buffer.buffer_type == BufferType::SharedMemory;
+        }
+        for (IR::Block* const block : program.post_order_blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                shares |= inst.GetOpcode() == IR::Opcode::Barrier;
+            }
+        }
+        // g2-arm64: BB_CS_SPLIT=<size>[:<hash>,...] (port 0019's form): with a hash list only
+        // those shaders split (U1's GPU skinning, cs 8f067540). Splitting every eligible shader
+        // gave U1 36 CP faults in 2 minutes on the Adreno 735 and no frame rate.
+        info.cs_split_eligible = !shares && CsSplitListed(info.pgm_hash);
+    }
 
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         info.uses_dma = false;

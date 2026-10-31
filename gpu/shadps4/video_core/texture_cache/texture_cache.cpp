@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -109,6 +111,16 @@ void TextureCache::ProcessDownloadImages() {
 // fence), so the CPU read a stale value: the focus sat at ~2 m and everything behind Drake was
 // blurred while aiming. Images of at most 4x4 pixels (1x1 of any tiling, else linear) the GPU
 // writes are now copied back after each use without waiting. BB_TINY_READBACK=1: on.
+// g2-arm64: BB_TINY_READBACK_LOG=1: once a second, the latest tiny read-back with its image and
+// the value the game gets (U2's autofocus: the depth under the crosshair), and the count so far.
+static bool TinyReadbackLog() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_TINY_READBACK_LOG");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 bool TextureCache::TinyReadback(const Image& image) {
     static const bool enabled = [] {
         // On for Uncharted 2 (upstream fd15af1; g2-arm64: the launcher's env-u2.txt): its aim
@@ -154,11 +166,34 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
+        const bool log = TinyReadbackLog() && TinyReadback(image);
         scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
+            [this, device_addr = image.info.guest_address, download, download_size, log,
+             width = image.info.size.width, height = image.info.size.height,
+             format = static_cast<int>(image.info.pixel_format),
+             tiled = image.info.props.is_tiled, bits = image.info.num_bits] {
                 download.Invalidate();
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
+                if (log) {
+                    static u32 count = 0;
+                    static s64 last_ms = 0;
+                    count++;
+                    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count();
+                    if (now_ms - last_ms >= 1000) {
+                        last_ms = now_ms;
+                        u32 word = 0;
+                        float value = 0;
+                        std::memcpy(&word, download.mapped, sizeof(word));
+                        std::memcpy(&value, &word, sizeof(value));
+                        std::printf("Tiny readback #%u: %ux%u format %d, %u bits%s at 0x%llx = %g "
+                                    "(0x%08x)\n",
+                                    count, width, height, format, bits, tiled ? ", tiled" : "",
+                                    static_cast<unsigned long long>(device_addr), value, word);
+                    }
+                }
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
@@ -670,7 +705,20 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     int view_mip{-1};
     int view_slice{-1};
     if (!image_id) {
+        // bbport (after zorde23's port, UC_OVERLAP_KEEP_VIEW, 28e1280c): a later image in the
+        // region that only overlaps by chance (it gives back the image already found, or none)
+        // no longer drops the mip/slice found for that image. A target at the address of a mip
+        // (U3 bloom mips 1 and 2) resolved to mip 0 of its image whenever an unrelated image (a
+        // 512x512 table) shared the region after it: the mip was drawn into the corner of mip 0
+        // and the real mip kept an old frame (bloom blotches, depending on the render size).
+        // BB_OVERLAP_KEEP_VIEW=0: off.
+        static const bool keep_view = [] {
+            const char* env = std::getenv("BB_OVERLAP_KEEP_VIEW");
+            return !(env && env[0] == '0');
+        }();
         for (const auto& cache_id : image_ids) {
+            const ImageId found_id = image_id;
+            const int found_mip = view_mip, found_slice = view_slice;
             view_mip = -1;
             view_slice = -1;
 
@@ -681,6 +729,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 image_id = overlap_image_id;
                 view_mip = overlap_view_mip;
                 view_slice = overlap_view_slice;
+            }
+            if (keep_view && found_id && image_id == found_id && view_mip < 0 && view_slice < 0) {
+                view_mip = found_mip;
+                view_slice = found_slice;
             }
         }
     }

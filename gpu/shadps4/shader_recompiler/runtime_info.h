@@ -253,20 +253,30 @@ struct HwComputeRuntimeInfo {
     u32 shared_memory_size;
     std::array<u32, 3> workgroup_size;
     std::array<bool, 3> tgid_enable;
-    /// g2-arm64: workgroups of workgroup_size[0] / split_factor invocations, split_factor times
-    /// as many of them (direct dispatches of BB_CS_SPLIT shaders; 1 = as the guest).
-    u32 split_factor;
+    bool indirect; ///< bbport: dispatched indirectly (workgroup count in GPU memory)
 
     bool operator==(const HwComputeRuntimeInfo& other) const noexcept {
         return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable &&
-               split_factor == other.split_factor;
-    }
-
-    /// The split the shader is compiled with: requested and safe for it.
-    [[nodiscard]] u32 AppliedSplit(bool split_safe) const noexcept {
-        return split_safe && split_factor > 1 ? split_factor : 1;
+               indirect == other.indirect;
     }
 };
+
+/// bbport: how many workgroups of 256 threads one guest workgroup runs as (1 = unchanged).
+/// On NVIDIA a 1024-thread workgroup compiled to 64 registers per thread needs the whole register
+/// file of an SM (65536); the scheduler then intermittently rejects it under load
+/// (SKEDCHECK19_CTA_REGISTER_CONSUMPTION, device lost; the U1/U2 skinning shader above 55 FPS).
+/// 256 threads x 255 registers always fit. Only one-dimensional workgroups of shaders that do not
+/// share anything within the workgroup (`eligible`), dispatched directly (the workgroup count is
+/// multiplied when recording).
+inline u32 WorkgroupSplit(bool eligible, const HwComputeRuntimeInfo& cs) {
+    constexpr u32 SplitSize = 256;
+    const u32 x = cs.workgroup_size[0];
+    if (!eligible || cs.indirect || cs.workgroup_size[1] != 1 || cs.workgroup_size[2] != 1 ||
+        x <= SplitSize || x % SplitSize != 0) {
+        return 1;
+    }
+    return x / SplitSize;
+}
 
 /**
  * Stores information relevant to shader compilation sourced from liverpool registers.

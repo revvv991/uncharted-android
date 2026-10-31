@@ -14,6 +14,8 @@
         android:hasCode="true" android:extractNativeLibs="true"
         android:hardwareAccelerated="true" android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <!-- simpleperf from adb shell (profiling hot threads), without debuggable's costs. -->
+        <profileable android:shell="true" />
         <!-- Updates (Updater.java): the releases of this repository, offered only to an app signed
              with the release key (this certificate's SHA-256; Android installs an update only over
              an app signed with the same key, so a build of your own is not offered them). -->

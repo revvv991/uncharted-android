@@ -864,6 +864,18 @@ public class Launcher extends Activity {
         writeText(f, out.toString());
     }
 
+    /** Whether More environment has a line for this variable: NAME=value, or -NAME (unset). A name
+     *  that merely begins with it (BB_TINY_READBACK_LOG for BB_TINY_READBACK) does not count. */
+    private boolean envNames(String name) {
+        for (String line : extraEnv.getText().toString().split("\n")) {
+            line = line.trim();
+            if (line.startsWith("-")) line = line.substring(1);
+            int eq = line.indexOf('=');
+            if ((eq < 0 ? line : line.substring(0, eq)).trim().equals(name)) return true;
+        }
+        return false;
+    }
+
     private void play() {
         if (!prepared()) {
             status("Prepare the game's files first.");
@@ -908,20 +920,33 @@ public class Launcher extends Activity {
             if (g[0].equals("u1")) writeText(new File(files, "args.txt"), args.toString());
             // The movie decoder's picture size goes with a size below 1080p (port 0015).
             env[i] = preset != null && below1080 ? "BB_VDEC_CONTENT=" + width + "x" + height + "\n" : "-BB_VDEC_CONTENT\n";
-            // U2's aiming autofocus reads a 1x1 render result on the CPU: copied back for U2
-            // only, as upstream does (issue #7; it costs elsewhere). More environment overrides.
-            if (g[0].equals("u2") && !extraEnv.getText().toString().contains("BB_TINY_READBACK"))
+            // U2's and U3's aiming autofocus (and U3's turrets) read a 1x1 render result on the
+            // CPU: copied back for them, as upstream 0.3.11's run.py does (issue #7; U1 unchanged).
+            // More environment overrides.
+            final boolean u2 = g[0].equals("u2"), u3 = g[0].equals("u3");
+            if ((u2 || u3) && !envNames("BB_TINY_READBACK"))
                 env[i] += "BB_TINY_READBACK=1\n";
+            // Weapon textures depend on small buffers a compute shader writes and the game reads
+            // back (upstream 3dbd071): without the copy U2's pistol is black (the owner, 2026-10-31),
+            // U3's weapons too. Since 0.3.11 the bytes land on the landing thread, nothing waits:
+            // no measurable cost in U2 on the G2, ~2% in U3 before that change. More environment
+            // overrides.
+            if ((u2 || u3) && !envNames("BB_READBACK_SMALL_BUFFERS"))
+                env[i] += "BB_READBACK_SMALL_BUFFERS=1\n";
             // U2 reads GPU results back from memory it also writes (grenades, vehicle damage,
             // chapter 21's convoy), which merging leaves on the GPU: accurate GPU memory, as
             // upstream runs U2. More environment overrides.
-            if (g[0].equals("u2") && accurateGpu.isChecked() && !extraEnv.getText().toString().contains("BB_GPU_MERGE"))
+            if (u2 && accurateGpu.isChecked() && !envNames("BB_GPU_MERGE"))
                 env[i] += "BB_GPU_MERGE=0\n";
             // U2's mesh raycasters: their GPU results reach the record arrays the game reads,
             // once the GPU has made them (without it the game asserts "iSubMesh <
-            // m_numSubMeshInstances" when firing, issue #21; port 0108). More environment
-            // overrides.
-            if (g[0].equals("u2") && !extraEnv.getText().toString().contains("BB_SCALAR_COPY64"))
+            // m_numSubMeshInstances" when firing, issue #21, port 0108). Off in U3 (it cost
+            // upstream 94 -> 54 FPS in Cartagena square) and, unlike upstream 0.3.11, in U1: each
+            // raycast lands through a queue submit of its own, ~30 a second there, 36.6 against
+            // 39.0 FPS on the G2 without the limit (findings 2026-10-31); the two lines in More
+            // environment turn them on for whoever meets U1's Customs House crash (0daa5c4).
+            // More environment overrides.
+            if (u2 && !envNames("BB_SCALAR_COPY64_SYNC") && !envNames("BB_SCALAR_COPY64_DEFER"))
                 env[i] += "BB_SCALAR_COPY64_SYNC=2\nBB_SCALAR_COPY64_DEFER=1\n";
         }
         StringBuilder e = new StringBuilder();

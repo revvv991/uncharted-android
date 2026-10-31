@@ -104,6 +104,7 @@ struct PipelineSelection {
     /// Compute program state of a worker's dispatch (the GPU thread reads its queue's own).
     const AmdGpu::ComputeProgram* cs{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
+    bool indirect_dispatch{}; ///< bbport: compute: workgroup count in GPU memory (WorkgroupSplit)
 };
 
 /// bbport: a draw-preparation worker's own program state (see vk_draw_prep.h).
@@ -167,15 +168,8 @@ public:
         return used_prepared;
     }
 
-    /// g2-arm64: direct = a direct dispatch (it may run split, BB_CS_SPLIT).
-    const ComputePipeline* GetComputePipeline(bool direct = false);
-
-    /// g2-arm64: BB_CS_SPLIT=<size>[:<hash>,...]: direct dispatches of one-dimensional compute
-    /// workgroups larger than <size> (of these shaders, or all) run as workgroups of <size>
-    /// invocations when the shader allows it (Info::cs_split_safe). U1: GPU skinning (cs
-    /// 8f067540) is ~300 dispatches a frame of one 1024-invocation workgroup, one shader core.
-    /// Returns the requested factor (1 = none).
-    static u32 CsSplitRequest(u64 hash, const AmdGpu::ComputeProgram& cs_pgm);
+    /// bbport: `indirect`: the workgroup count is in GPU memory (no WorkgroupSplit).
+    const ComputePipeline* GetComputePipeline(bool indirect = false);
 
     /// bbport: worker side of a dispatch: translates the compute program and builds its pipeline
     /// when they do not exist yet, so the GPU thread finds them (sel.cs is the program state).
@@ -242,8 +236,6 @@ private:
     void ReleaseClaim(u64 id);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
-    bool compute_direct = false; // g2-arm64: BB_CS_SPLIT
-    u32 compute_split = 1;
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;

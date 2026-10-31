@@ -12,9 +12,6 @@ void EmitPrologue(EmitContext& ctx) {
     if (ctx.hw_stage == HwStage::Fragment) {
         ctx.DefineAmdPerVertexAttribs();
     }
-    if (ctx.CsSplit() > 1 && ctx.workgroup_id.value && ctx.local_invocation_id.value) {
-        ctx.DefineSplitIds();
-    }
     if (ctx.info.loads.Get(IR::Attribute::WorkgroupIndex)) {
         ctx.DefineWorkgroupIndex();
     }

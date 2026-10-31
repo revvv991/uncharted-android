@@ -47,16 +47,6 @@ public:
     void DefineBufferProperties();
     void DefineAmdPerVertexAttribs();
     void DefineWorkgroupIndex();
-    /// g2-arm64: guest workgroup and local invocation ids of a split compute shader.
-    void DefineSplitIds();
-
-    /// g2-arm64: host workgroups per guest workgroup (BB_CS_SPLIT); 1 when not split.
-    [[nodiscard]] u32 CsSplit() const noexcept {
-        return info.sw_stage == SwStage::Compute
-                   ? runtime_info.hw.cs.AppliedSplit(info.cs_split_safe)
-                   : 1;
-    }
-
     [[nodiscard]] Id DefineInput(Id type, std::optional<u32> location = std::nullopt,
                                  std::optional<spv::BuiltIn> builtin = std::nullopt) {
         const Id input_id{DefineVariable(type, builtin, spv::StorageClass::Input)};
@@ -293,13 +283,13 @@ public:
     Id tess_coord;
     std::array<Id, 30> patches{};
 
+    /// bbport: guest workgroups run as this many host workgroups (WorkgroupSplit).
+    u32 workgroup_split{1};
     Id workgroup_id{};
     Id num_workgroups_id{};
     Id workgroup_index_id{};
     Id local_invocation_id{};
     Id local_invocation_index{};
-    Id split_workgroup_id{}; // g2-arm64: guest ids (u32x3 values) when split
-    Id split_local_id{};
     Id invocation_id{};
     Id subgroup_local_invocation_id{};
     Id subgroup_lt_mask{};
