@@ -636,10 +636,16 @@ _Static_assert(sizeof(u3_focus_reset_100)==51 && sizeof(u3_focus_reset_102)==53,
  * worker at Begin (+0xe810) and asserts the same one at End ("m_workerThreadIndex ==
  * GetCurrentWorkerThreadIndex()"). One site each in all three games. */
 extern _Thread_local int runtime_ndgi_open; /* runtime_fiber.c */
+#ifndef _WIN32
+extern volatile uint32_t probe_ndgi_begins; /* g2-arm64: probe.c's job wait report */
+#endif
 static void __attribute__((ms_abi)) ndgi_begin(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
                                                const RuntimeGuestRegs *regs) {
     (void)rdi; (void)rsi; (void)image; (void)r14; (void)regs;
     runtime_ndgi_open=1;
+#ifndef _WIN32
+    __atomic_add_fetch(&probe_ndgi_begins,1,__ATOMIC_RELAXED);
+#endif
 }
 static void __attribute__((ms_abi)) ndgi_end(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
                                              const RuntimeGuestRegs *regs) {

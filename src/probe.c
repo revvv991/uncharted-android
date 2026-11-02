@@ -673,6 +673,13 @@ static void *stall_watch(void *arg) {
  * (address u64, length u32, status u32: 0 or an errno) and, when read, the bytes. The request
  * is removed; write it elsewhere and move it to <file> so that it is read whole. */
 static volatile uint32_t u1_set_job_skips, u1_set_maker_null; /* install_u1_set_job_guard below */
+/* g2-arm64: patch_job_lock_wait's waits in place that got their counter (count, time, the longest,
+ * in us), those that suspended after the full wait, the counter waits that reached it on workers
+ * (with a render context open or not), and the render contexts opened (the Begin callback in
+ * runtime_pad.c): the peek thread reports them every 10 s. */
+static volatile uint32_t job_lock_waits, job_lock_wait_max_us, job_lock_suspends, job_lock_tries, job_lock_tries_open;
+static volatile uint64_t job_lock_wait_total_us;
+volatile uint32_t probe_ndgi_begins;
 /* install_u1_dt_smooth below: nominal (s, 0 = off), debt, k, correction low/high, debt low/high,
  * the last raw dt - read and written by the guest stub. */
 static float u1_dt_state[8];
@@ -694,6 +701,8 @@ static void *peek_on_request(void *arg) {
     snprintf(part,sizeof(part),"%s.part",path);
     static unsigned char data[1<<20];
     uint32_t skips_told=0;
+    unsigned ticks=0;
+    int contexts_told=0;
     for (;;) {
         usleep(200000);
         /* g2-arm64: and the U1 set job guard's counts, when they grow. */
@@ -704,6 +713,25 @@ static void *peek_on_request(void *arg) {
                    "it null %u times\n",skips,nulls);
             fflush(stdout);
             skips_told=skips+nulls;
+        }
+        /* g2-arm64: and the job wait's waits every 10 s when there were any (the render contexts
+         * once, to show that its callbacks run). */
+        if (++ticks%50==0) {
+            const uint32_t waits=__atomic_exchange_n(&job_lock_waits,0,__ATOMIC_RELAXED);
+            const uint32_t suspended=__atomic_exchange_n(&job_lock_suspends,0,__ATOMIC_RELAXED);
+            const uint64_t total=__atomic_exchange_n(&job_lock_wait_total_us,0,__ATOMIC_RELAXED);
+            const uint32_t longest=__atomic_exchange_n(&job_lock_wait_max_us,0,__ATOMIC_RELAXED);
+            const uint32_t contexts=__atomic_exchange_n(&probe_ndgi_begins,0,__ATOMIC_RELAXED);
+            const uint32_t tries=__atomic_exchange_n(&job_lock_tries,0,__ATOMIC_RELAXED);
+            const uint32_t tries_open=__atomic_exchange_n(&job_lock_tries_open,0,__ATOMIC_RELAXED);
+            if (waits || suspended || tries_open || (contexts && !contexts_told)) {
+                printf("Job wait: %u waits in place in 10 s (%.1f ms in all, the longest %.1f ms), %u "
+                       "suspended after the full wait; %u counter waits on workers, %u with a render "
+                       "context open; %u render contexts opened\n",waits,total/1000.0,longest/1000.0,
+                       suspended,tries,tries_open,contexts);
+                fflush(stdout);
+                contexts_told=1;
+            }
         }
         FILE *request=fopen(path,"r");
         if (!request) continue;
@@ -1393,7 +1421,20 @@ static unsigned char *near_image_memory(size_t size) {
                                 size,MEM_RESERVE|MEM_COMMIT,PAGE_EXECUTE_READWRITE);
     }
 #else
-    (void)size;
+    /* g2-arm64: the same on Linux hosts (FEXCore runs the guest at its own addresses, the image at
+     * 0x400000): a free range within rel32 reach after the image. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    uint64_t end_of_image=round_page(guest_image_size ? guest_image_size : 1);
+    uint64_t base=((uint64_t)(uintptr_t)image+end_of_image+(32u<<20)+0xffff)&~(uint64_t)0xffff;
+    for (uint64_t step=0;!memory && step<(1900ull<<20);step+=1u<<16) {
+        void *want=(void *)(uintptr_t)(base+step);
+        void *got=mmap(want,size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+        if (got==MAP_FAILED) continue;
+        if (got!=want) { munmap(got,size); continue; } /* a kernel without the flag took it as a hint */
+        memory=got;
+    }
 #endif
     return memory;
 }
@@ -1431,8 +1472,9 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     const RuntimeGuestCallback *callbacks=runtime_guest_callbacks(&count);
     unsigned char *thunks=NULL;
     size_t used=0;
-    uint8_t installed[32]={0};
+    uint8_t installed[32]={0}, skipped[32]={0}; /* g2-arm64: skipped - left out on purpose, not reported */
     uint64_t hook_offsets[32]; size_t hooks_done=0;
+    int no_thunks=0;
     guest_image_size=image_size;
     if (count>sizeof(installed)) count=sizeof(installed);
     /* A/B tests: BB_CALLBACKS=0 installs none, BB_CALLBACKS_SKIP=<text> none whose name contains the text */
@@ -1441,6 +1483,10 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     for (size_t i=0;i<count;++i) {
         const RuntimeGuestCallback *c=&callbacks[i];
         if (skip && *skip && strstr(c->name,skip)) continue;
+#if !defined(__x86_64__)
+        /* g2-arm64: no mouse camera on the device (its touch pad has its own path) */
+        if (c->callback && strstr(c->name,"(mouse)")) { skipped[i]=1; continue; }
+#endif
         uint64_t found=0;
         size_t length=0, matches=find_pattern(segments,ns,c->pattern,&found,&length);
         if (matches>1) { printf("Callbacks: %s: %zu matches, not installed\n",c->name,matches); continue; }
@@ -1456,7 +1502,10 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
             printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,offset);
             continue;
         }
-        if (!thunks && !(thunks=near_image_memory(8192))) { printf("Callbacks: no thunk memory\n"); return; }
+        /* g2-arm64: without thunk memory only the callbacks stay out (a return here also left out the
+         * code patches further down the table: on Android the move action pool and the NaN resets) */
+        if (!thunks && !no_thunks && !(thunks=near_image_memory(8192))) { no_thunks=1; printf("Callbacks: no thunk memory\n"); }
+        if (!thunks) continue;
         if (used+320>8192) break;
         unsigned char *t=thunks+used, *f=image+offset;
         size_t k=0;
@@ -1474,7 +1523,8 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         }
         t[k++]=0x48; t[k++]=0x89; t[k++]=0xf9;                      /* mov rcx, rdi */
         t[k++]=0x48; t[k++]=0x89; t[k++]=0xf2;                      /* mov rdx, rsi */
-        const uintptr_t base=(uintptr_t)image, host=(uintptr_t)c->callback;
+        /* g2-arm64: through FEX's veneer on ARM64 (the function itself on x86-64) */
+        const uintptr_t base=(uintptr_t)image, host=guest_host_function((const void *)c->callback,c->name,GUEST_ABI_MS);
         t[k++]=0x49; t[k++]=0xb8; memcpy(t+k,&base,8); k+=8;        /* movabs r8, image */
         t[k++]=0x4d; t[k++]=0x89; t[k++]=0xf1;                      /* mov r9, r14 */
         t[k++]=0x48; t[k++]=0x89; t[k++]=0x5c; t[k++]=0x24; t[k++]=0x20; /* mov [rsp+0x20], rbx (regs) */
@@ -1509,7 +1559,7 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
             if (installed[j] && !strncmp(callbacks[j].name,callbacks[i].name,game+1)) group=1;
         }
         any|=ok;
-        if (!seen && !ok && group) printf("Callbacks: %s not found\n",callbacks[i].name);
+        if (!seen && !ok && group && !skipped[i]) printf("Callbacks: %s not found\n",callbacks[i].name);
     }
     if (!any) printf("Callbacks: none of the known camera and pad code was found (unknown build?)\n");
 }
@@ -1897,11 +1947,41 @@ extern _Thread_local int runtime_ndgi_open; /* runtime_fiber.c */
 static uint64_t job_lock_try;
 static unsigned job_lock_wait_ms=250;
 static volatile long job_lock_fallbacks;
+#if !defined(__x86_64__)
+/* g2-arm64: the game's try function is x86 code, so its two tests run here: mode 1 is a signed
+ * value <= target (setle), mode 0 value == target (sete, setle with the recipes' robust counter
+ * waits, 5fe325c), any other mode fails; job_lock_tests reads which from the function's bytes. */
+static uint8_t job_lock_le[2];
+static int job_lock_ready(uint64_t value, uint64_t target, uint32_t mode) {
+    if (mode>1) return 0;
+    return job_lock_le[mode] ? (int64_t)value<=(int64_t)target : value==target;
+}
+/* cmp edx,1; jne; cmp rdi,rsi; setcc al; ret; test edx,edx; jne; cmp rdi,rsi; setcc al; ret;
+ * xor eax,eax; ret - 0 when the function has another shape. */
+static int job_lock_tests(const unsigned char *f) {
+    static const unsigned char shape[]={0x83,0xfa,0x01,0x75,0x07,0x48,0x39,0xf7,0x0f,0x00,0xc0,0xc3,0x85,
+                                        0xd2,0x75,0x07,0x48,0x39,0xf7,0x0f,0x00,0xc0,0xc3,0x31,0xc0,0xc3};
+    for (size_t i=0;i<sizeof(shape);++i)
+        if (i!=9 && i!=20 && f[i]!=shape[i]) return 0;
+    if ((f[9]!=0x9e && f[9]!=0x94) || (f[20]!=0x9e && f[20]!=0x94)) return 0;
+    job_lock_le[1]=f[9]==0x9e;
+    job_lock_le[0]=f[20]==0x9e;
+    return 1;
+}
+#endif
 static ABI int job_lock_wait(uint64_t counter, uint64_t a, uint32_t b) {
+    const volatile uint64_t *value=(const volatile uint64_t *)(uintptr_t)(counter+0x20);
+#if defined(__x86_64__)
     typedef int (ABI *Try)(uint64_t, uint64_t, uint32_t);
     const Try try_value=(Try)(uintptr_t)job_lock_try;
-    const volatile uint64_t *value=(const volatile uint64_t *)(uintptr_t)(counter+0x20);
 #define try_lock(x,y) try_value(*value,(x),(y))
+#else
+#define try_lock(x,y) job_lock_ready(*value,(x),(y))
+#endif
+#ifndef _WIN32
+    __atomic_add_fetch(&job_lock_tries,1,__ATOMIC_RELAXED); /* g2-arm64: the report's counts */
+    if (runtime_ndgi_open) __atomic_add_fetch(&job_lock_tries_open,1,__ATOMIC_RELAXED);
+#endif
     /* Without a render context open the job may move: suspend at once, as the game does (waiting
      * in place for every counter starved the job system: 3.6 fps loading with 4 cores). */
     if (!runtime_ndgi_open) return 0;
@@ -1915,12 +1995,26 @@ static ABI int job_lock_wait(uint64_t counter, uint64_t a, uint32_t b) {
         Sleep(1);
     }
 #else
+    struct timespec t0, t1; /* g2-arm64: the wait's time, for the peek thread's report */
+    clock_gettime(CLOCK_MONOTONIC,&t0);
     for (unsigned i=0;i<job_lock_wait_ms*10;++i) {
-        if (try_lock(a,b)&0xff) return 1;
+        if (try_lock(a,b)&0xff) {
+            clock_gettime(CLOCK_MONOTONIC,&t1);
+            const uint32_t us=(uint32_t)((t1.tv_sec-t0.tv_sec)*1000000+(t1.tv_nsec-t0.tv_nsec)/1000);
+            __atomic_add_fetch(&job_lock_waits,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&job_lock_wait_total_us,us,__ATOMIC_RELAXED);
+            uint32_t longest=__atomic_load_n(&job_lock_wait_max_us,__ATOMIC_RELAXED);
+            while (us>longest && !__atomic_compare_exchange_n(&job_lock_wait_max_us,&longest,us,1,
+                                                              __ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+            return 1;
+        }
         usleep(100);
     }
 #endif
     if (try_lock(a,b)&0xff) return 1;
+#ifndef _WIN32
+    __atomic_add_fetch(&job_lock_suspends,1,__ATOMIC_RELAXED);
+#endif
     const long n=__atomic_add_fetch(&job_lock_fallbacks,1,__ATOMIC_RELAXED);
     if (n<=20) printf("Job wait: a worker with a render context open waited %u ms in vain, its job suspends (%ld)\n",
                       job_lock_wait_ms,n);
@@ -1939,19 +2033,26 @@ static size_t jump_abs(unsigned char *t, uint64_t target) {
  *   mov rsi,r14; mov edx,ebx; call SuspendJob
  * The game keeps an uncalled copy of the try function, which job_lock_wait calls. */
 static void patch_job_lock_wait_us(uint64_t image_size) {
-    const int64_t at=find_unique_pattern(image_size, "498b4f20 83fb01 75?? 4c39f1 0f9ec1 eb?? 85db 75?? 4c39f1 0f94c1 84c9 75?? 84c0 74?? "
-                                                     "662e0f1f840000000000 4c89ff 4c89f6 89da e8????????");
-    const int64_t try_at=find_unique_pattern(image_size, "83fa01 7507 4839f7 0f9ec0 c3 85d2 7507 4839f7 0f94c0 c3");
+    /* g2-arm64: or with mode 0's sete made setle by the recipes' robust counter waits (5fe325c) */
+    int64_t at=find_unique_pattern(image_size, "498b4f20 83fb01 75?? 4c39f1 0f9ec1 eb?? 85db 75?? 4c39f1 0f94c1 84c9 75?? 84c0 74?? "
+                                               "662e0f1f840000000000 4c89ff 4c89f6 89da e8????????");
+    if (at<0) at=find_unique_pattern(image_size, "498b4f20 83fb01 75?? 4c39f1 0f9ec1 eb?? 85db 75?? 4c39f1 0f9ec1 84c9 75?? 84c0 74?? "
+                                                 "662e0f1f840000000000 4c89ff 4c89f6 89da e8????????");
+    int64_t try_at=find_unique_pattern(image_size, "83fa01 7507 4839f7 0f9ec0 c3 85d2 7507 4839f7 0f94c0 c3");
+    if (try_at<0) try_at=find_unique_pattern(image_size, "83fa01 7507 4839f7 0f9ec0 c3 85d2 7507 4839f7 0f9ec0 c3");
     if (at<0 || try_at<0) { printf("Job wait: pattern not found, not patched\n"); return; }
     unsigned char *p=image+at;
     job_lock_try=(uint64_t)(uintptr_t)(image+try_at);
+#if !defined(__x86_64__)
+    if (!job_lock_tests(image+try_at)) { printf("Job wait: the try function has another shape, not patched\n"); return; }
+#endif
     const uint64_t done=(uint64_t)(uintptr_t)(p+31+(int8_t)p[30]);
     const uint64_t not_worker=(uint64_t)(uintptr_t)(p+35+(int8_t)p[34]);
     const uint64_t suspend_loop=(uint64_t)(uintptr_t)(p+45);
     unsigned char *t=near_image_memory(4096);
     if (!t) { printf("Job wait: no thunk memory, not patched\n"); return; }
     size_t k=0;
-    const uintptr_t host=(uintptr_t)job_lock_wait;
+    const uintptr_t host=guest_host_function((const void *)job_lock_wait,"job_lock_wait",GUEST_ABI_SYSV); /* g2-arm64 */
     t[k++]=0x84; t[k++]=0xc0; t[k++]=0x75; t[k++]=0x0e;                 /* test al,al; jnz worker */
     k+=jump_abs(t+k,not_worker);                                         /* not a worker */
     static const unsigned char args[]={0x4c,0x89,0xff,0x4c,0x89,0xf6,0x89,0xda}; /* rdi=r15 (the counter), rsi=r14, edx=ebx */
@@ -1991,13 +2092,16 @@ static void patch_job_lock_wait(uint64_t image_size) {
     unsigned char *p=image+at;
     int32_t rel; memcpy(&rel,p+11,4);
     job_lock_try=(uint64_t)(uintptr_t)(p+15+rel);
+#if !defined(__x86_64__)
+    if (!job_lock_tests(p+15+rel)) { printf("Job wait: the try function has another shape, not patched\n"); return; }
+#endif
     const uint64_t done=(uint64_t)(uintptr_t)(p+19+(int8_t)p[18]);
     const uint64_t not_worker=(uint64_t)(uintptr_t)(p+24+(int8_t)p[23]);
     const uint64_t suspend_loop=(uint64_t)(uintptr_t)(p+29);
     unsigned char *t=near_image_memory(4096);
     if (!t) { printf("Job wait: no thunk memory, not patched\n"); return; }
     size_t k=0;
-    const uintptr_t host=(uintptr_t)job_lock_wait;
+    const uintptr_t host=guest_host_function((const void *)job_lock_wait,"job_lock_wait",GUEST_ABI_SYSV); /* g2-arm64 */
     static const unsigned char test_r12b[]={0x45,0x84,0xe4,0x75,0x0e};   /* test r12b,r12b; jnz worker */
     memcpy(t+k,test_r12b,sizeof(test_r12b)); k+=sizeof(test_r12b);
     k+=jump_abs(t+k,not_worker);                                         /* not a worker */
