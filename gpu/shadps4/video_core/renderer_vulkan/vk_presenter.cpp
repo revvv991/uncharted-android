@@ -13,6 +13,8 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
+#include "bbport_present_unlock.h"
+#include "bbport_submit_stats.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -711,6 +713,37 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         free_frame();
         return;
     }
+    // g2-arm64 diagnosis: BB_SKIP_PRESENT=1: no acquire, blit or present at all (the screen keeps
+    // its last picture, the game goes on): the frame rate a free present would allow
+    // (findings 2026-11-01: vkQueuePresentKHR holds the queue lock for up to half a frame).
+    static const bool skip_present = [] {
+        const char* env = std::getenv("BB_SKIP_PRESENT");
+        return env && env[0] == '1';
+    }();
+    if (skip_present && is_game_frame) {
+        free_frame();
+        if (!is_reusing_frame) {
+            DebugState.IncFlipFrameNum();
+            // The overlay prints the frame rate when it draws; here nothing is drawn.
+            static auto window_start = std::chrono::steady_clock::now();
+            static auto last = window_start;
+            static int frames = 0;
+            static double worst = 0.0;
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+            ++frames;
+            worst = std::max(worst, ms < 1000.0 ? ms : 0.0);
+            const double elapsed = std::chrono::duration<double>(now - window_start).count();
+            if (elapsed >= 5.0) {
+                std::printf("Frame rate: %.1f FPS, slowest frame %.1f ms\n", frames / elapsed, worst);
+                window_start = now;
+                frames = 0;
+                worst = 0.0;
+            }
+        }
+        return;
+    }
     // g2-arm64: the app in the background (the screen off) or between Android windows: skip
     // presenting until there is a surface again (the game goes on).
     if (!swapchain.SurfaceReady()) {
@@ -783,8 +816,26 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 }
 
+namespace {
+/// g2-arm64: BB_PRESENT_WAIT=1: the presenter waits for its blit to finish on the GPU before it
+/// takes the queue lock (Scheduler::submit_mutex) for vkQueuePresentKHR. On Turnip/KGSL the
+/// present took ~6 ms on average and 8-11 ms half the time - the blit queued behind the ~5 draw
+/// submissions in flight - all of it with the lock held, and the recording thread's mid-frame
+/// submissions waited ~8 ms behind it 13-16 times a second in U3's museum (BB_SUBMIT_STATS,
+/// findings 2026-11-01). Waiting first leaves the lock to the submissions meanwhile.
+bool PresentWaitWanted() {
+    static const bool wanted = [] {
+        const char* env = std::getenv("BB_PRESENT_WAIT");
+        return env && env[0] == '1';
+    }();
+    return wanted;
+}
+} // namespace
+
 bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
+    BbSubmitStats::Steps steps{"present"}; // g2-arm64 diagnosis: BB_SUBMIT_STATS
     if (!swapchain.AcquireNextImage()) {
+        steps.Cancel();
         if (swapchain.AcquireTimedOut() || !swapchain.SurfaceReady()) {
             return false; // g2-arm64: no buffer or no surface now: skip this frame
         }
@@ -796,6 +847,7 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
         }
     }
 
+    steps.Step("acquire");
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
@@ -1030,13 +1082,46 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
         // Also covers the generated frames' submissions before it on this queue.
         info.AddSignal(frame->present_done);
     }
+    steps.Step("record");
     scheduler.Flush(info);
+    steps.Step("flush");
+    if (PresentWaitWanted()) {
+        scheduler.Wait(scheduler.CurrentTick() - 1); // the blit just submitted
+    }
+    steps.Step("gpu wait");
 
     // Present to swapchain.
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present() && window.GetWidth() != 0 && window.GetHeight() != 0) {
+        BbSubmitStats::TimedLock submit_lock{Scheduler::submit_mutex, "present"};
+        steps.Step("lock");
+        u64 run0 = 0, queue0 = 0, run1 = 0, queue1 = 0;
+        const bool sched = BbSubmitStats::On() && BbSubmitStats::SchedStat(run0, queue0);
+        if (BbPresentUnlock::Wanted() && BbPresentUnlock::hooked) {
+            BbPresentUnlock::queue_lock = &Scheduler::submit_mutex;
+        }
+        // g2-arm64: BB_PRESENT_PACING: the game frame's desired present time, once (a frame
+        // shown again goes out at once).
+        const s64 desired = last ? frame->desired_present_ns : 0;
+        std::array<s64, 5> trace{};
+        const s64 trace_arg = frame->trace_arg;
+        if (last) {
+            frame->desired_present_ns = 0;
+            trace = frame->trace_ns;
+            frame->trace_ns = {};
+        }
+        const bool presented =
+            swapchain.Present(desired, trace[3] ? trace.data() : nullptr, trace_arg);
+        BbPresentUnlock::queue_lock = nullptr;
+        if (!presented && window.GetWidth() != 0 && window.GetHeight() != 0) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        }
+        steps.Step("vkQueuePresentKHR");
+        if (sched && BbSubmitStats::SchedStat(run1, queue1)) {
+            steps.Value("(of it on a CPU)", run1 - run0);
+            steps.Value("(of it runnable)", queue1 - queue0);
+        } else {
+            steps.Value("(of it on a CPU)", 0);
+            steps.Value("(of it runnable)", 0);
         }
     }
     return true;

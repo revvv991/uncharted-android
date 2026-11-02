@@ -26,6 +26,13 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#ifdef __ANDROID__
+#include <cstddef>
+#include <poll.h>
+#include <unistd.h>
+#include "bbport_present_unlock.h"
+#include "bbport_submit_stats.h"
+#endif
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_xess.h"
 
@@ -109,6 +116,86 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
     return VK_FALSE;
 }
 
+#ifdef __ANDROID__
+namespace {
+/// g2-arm64 diagnosis (BB_SUBMIT_STATS): vkQueuePresentKHR split at the window's queueBuffer
+/// (libvulkan calls the driver's QueueSignalReleaseImageANDROID first, then queueBuffer), and
+/// whether the fence of the previous queueBuffer - the one BufferQueueProducer waits for when the
+/// producer is connected as EGL, as libvulkan connects it - was still pending at the call. The
+/// window's function table is ABI-stable (system/window.h): queueBuffer at 176 of 192 bytes.
+struct WindowTable {
+    int magic;
+    int version;
+    void* reserved[4];
+    void (*inc_ref)(void*);
+    void (*dec_ref)(void*);
+    uint32_t flags;
+    int min_swap_interval;
+    int max_swap_interval;
+    float xdpi;
+    float ydpi;
+    intptr_t oem[4];
+    void* functions[8]; // setSwapInterval ... dequeueBuffer
+    int (*queue_buffer)(void* window, void* buffer, int fence);
+    void* cancel_buffer;
+};
+static_assert(sizeof(WindowTable) == 192);
+static_assert(offsetof(WindowTable, queue_buffer) == 176);
+constexpr int WindowMagic = ('_' << 24) | ('w' << 16) | ('n' << 8) | 'd';
+
+int (*original_queue_buffer)(void*, void*, int) = nullptr;
+int previous_fence = -1; // the presenter thread only
+
+int TimedQueueBuffer(void* window, void* buffer, int fence) {
+    bool pending = false;
+    if (previous_fence >= 0) {
+        pollfd p{.fd = previous_fence, .events = POLLIN, .revents = 0};
+        pending = poll(&p, 1, 0) == 0;
+        close(previous_fence);
+    }
+    previous_fence = fence >= 0 ? dup(fence) : -1;
+    BbSubmitStats::StepHere("signal release image");
+    // BB_PRESENT_UNLOCK: the queue is not used in here; the submissions go on meanwhile.
+    std::mutex* const lock = BbPresentUnlock::queue_lock;
+    const char* const holder = BbSubmitStats::holder.load(std::memory_order_relaxed);
+    if (lock) {
+        BbSubmitStats::holder.store(nullptr, std::memory_order_relaxed);
+        lock->unlock();
+    }
+    const int result = original_queue_buffer(window, buffer, fence);
+    if (lock) {
+        lock->lock();
+        BbSubmitStats::holder.store(holder, std::memory_order_relaxed);
+    }
+    BbSubmitStats::StepHere("queueBuffer");
+    if (auto* steps = BbSubmitStats::current) {
+        steps->Value("(previous fence pending: 1000 = always)", pending ? 1000000 : 0);
+    }
+    return result;
+}
+
+void HookQueueBuffer(void* native_window) {
+    if ((!BbSubmitStats::On() && !BbPresentUnlock::Wanted()) || !native_window) {
+        return;
+    }
+    auto* table = static_cast<WindowTable*>(native_window);
+    if (table->magic != WindowMagic || table->version != int(sizeof(WindowTable))) {
+        std::printf("Submit stats: unexpected window table (magic %x, version %d), no queueBuffer "
+                    "probe\n", table->magic, table->version);
+        return;
+    }
+    if (table->queue_buffer == &TimedQueueBuffer) {
+        return;
+    }
+    original_queue_buffer = table->queue_buffer;
+    table->queue_buffer = &TimedQueueBuffer;
+    BbPresentUnlock::hooked = true;
+    std::printf("Window: queueBuffer wrapped (%s)\n",
+                BbPresentUnlock::Wanted() ? "the queue lock let go during it" : "statistics");
+}
+} // namespace
+#endif
+
 vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& emu_window) {
     // g2-arm64: the current native window (Android replaces it after the app was paused).
     const auto window_info = emu_window.CurrentWindowInfo();
@@ -159,6 +246,7 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
         const vk::AndroidSurfaceCreateInfoKHR android_ci = {
             .window = static_cast<ANativeWindow*>(window_info.render_surface),
         };
+        HookQueueBuffer(window_info.render_surface); // g2-arm64: BB_SUBMIT_STATS, BB_PRESENT_UNLOCK
         if (instance.createAndroidSurfaceKHR(&android_ci, nullptr, &surface) != vk::Result::eSuccess) {
             LOG_CRITICAL(Render_Vulkan, "Failed to initialize Android surface");
             UNREACHABLE();

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -132,6 +133,21 @@ public:
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
+    /// g2-arm64: guest memory the recording thread will read for work handed to it (buffers it
+    /// binds from guest memory, images, index and indirect buffers): a guest memory copy the
+    /// command thread makes at once (ScalarCopyAheadHLE) must not overwrite what a packet handed
+    /// over still has to read.
+    void NotePendingGuestRead(VAddr address, u64 size);
+    void NoteGuestReads(const Shader::Info& stage, const PreparedDraw* prepared);
+    /// Stage A: a packet handed over still reads / writes the range.
+    bool PendingGuestRead(VAddr address, u64 size);
+    bool PendingGuestWrite(VAddr address, u64 size) {
+        return PendingWriteOverlaps(address, size);
+    }
+    /// Stage B: the dispatch packet's scalar copy was already made in guest memory on stage A.
+    bool ScalarCopyGuestDone() const {
+        return scalar_copy_guest_done;
+    }
     /// bbport: small buffers (up to 64 bytes) a compute shader writes are read by the game's CPU
     /// code (the auto-exposure multiplier of Uncharted, among others). The dispatch notes them and
     /// the next end-of-pipe event copies them to guest memory (BB_READBACK_SMALL_BUFFERS=0: off).
@@ -548,6 +564,15 @@ private:
     };
     std::vector<PendingWrite> pending_writes;
     VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
+    /// g2-arm64: stage A, the guest ranges the packets handed over read, in pipe order.
+    struct PendingRead {
+        VAddr begin, end;
+        u64 position; ///< the packet's start; Reached(position + 1): the packet has run
+    };
+    std::deque<PendingRead> pending_reads;
+    u32 pending_read_notes = 0;
+    bool scalar_copy_ahead = false;      ///< stage A: the packet being made has its guest copy done
+    bool scalar_copy_guest_done = false; ///< stage B: that flag of the packet being recorded
     u32 pending_checks = 0;
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers

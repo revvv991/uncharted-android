@@ -18,6 +18,7 @@
 
 #include "bbport_copy.h"
 #include "bbport_owner_wait.h"
+#include "bbport_submit_stats.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/landing_gate.h"
 #include "bbport_toggles.h"
@@ -663,13 +664,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     // pending while this thread holds it and waits for that thread. Direct recording (or
     // deferral off) means the recording thread has nothing queued.
     FrontCheck check{this, "SubmitExecution"};
+    // g2-arm64 diagnosis: BB_SUBMIT_STATS (bbport_submit_stats.h), the steps of a submission.
+    BbSubmitStats::Steps steps{on_submit ? "draw submit, deferred" : "submit, deferred"};
     const bool defer = DeferredSubmitWanted() && IsRecordingDeferred();
     if (defer && DeferredSubmitsPending() && queue_work_pending && queue_work_pending()) {
         // The submit callback's sparse binds go to the queue now: earlier deferred
         // submissions reach it first, as before.
         SyncRecording();
     }
-    std::scoped_lock lk{submit_mutex};
+    steps.Step("presync");
+    BbSubmitStats::TimedLock lk{submit_mutex, on_submit ? "draw submit" : "submit"};
+    steps.Step("lock");
     // bbport: BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
     static const bool submit_threads = std::getenv("BB_SUBMIT_THREADS") != nullptr;
 #ifdef _WIN32
@@ -722,7 +727,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     if (on_submit) {
-        on_submit(info);
+        on_submit(info); // its parts are steps of their own (vk_rasterizer.cpp)
+    } else {
+        steps.Step("callback");
     }
 
     EndRendering();
@@ -731,6 +738,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         profiler->Mark(GpuProfiler::IdleKey,
                        [] { return std::string{"(between submissions: GPU idle)"}; });
     }
+    steps.Step("end rendering");
     if (defer && IsRecordingDeferred()) {
         ++deferred_submits_issued;
         Record([this, info, signal_value](vk::CommandBuffer cmdbuf) mutable {
@@ -740,35 +748,49 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         // starts unset.
         dynamic_state.Invalidate();
         KickRecording(true);
+        steps.Step("record+kick");
         PopPendingOperations();
+        steps.Step("pending ops");
         return;
     }
+    steps.SetSite(on_submit ? "draw submit, direct" : "submit, direct");
     SyncRecording();
+    steps.Step("sync");
     // Guest memory copies into staging read by this submission (copy threads).
     WaitHostCopies();
+    steps.Step("host copies");
     EndForSubmission(current_cmdbuf);
-    QueueSubmit(current_cmdbuf, info, signal_value);
+    steps.Step("end cmdbuf");
+    QueueSubmit(current_cmdbuf, info, signal_value); // steps "submit prep", "vkQueueSubmit"
     work_semaphore.Refresh();
     AllocateWorkerCommandBuffers();
+    steps.Step("next cmdbuf");
 
     // Apply pending operations
     PopPendingOperations();
+    steps.Step("pending ops");
 }
 
 void Scheduler::SubmitRecorded(vk::CommandBuffer cmdbuf, SubmitInfo& info, u64 signal_value) {
     // Guest memory copies into staging read by this submission: this thread ran its own
     // (RecordHostCopy) before; the copy threads' may still run.
+    BbSubmitStats::Steps steps{"recorded submit"}; // g2-arm64 diagnosis: BB_SUBMIT_STATS
     BbCopy::WaitAsync();
+    steps.Step("host copies");
     EndForSubmission(cmdbuf);
+    steps.Step("end cmdbuf");
     {
-        std::scoped_lock lk{submit_mutex};
-        QueueSubmit(cmdbuf, info, signal_value);
+        BbSubmitStats::TimedLock lk{submit_mutex, "recorded submit"};
+        steps.Step("lock");
+        QueueSubmit(cmdbuf, info, signal_value); // steps "submit prep", "vkQueueSubmit"
     }
     work_semaphore.Refresh();
     current_cmdbuf = command_pool.Commit();
+    steps.Step("next cmdbuf");
     Check(current_cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     }));
+    steps.Step("begin");
     deferred_submits_done.fetch_add(1, std::memory_order_release);
 }
 
@@ -810,10 +832,18 @@ void Scheduler::QueueSubmit(vk::CommandBuffer cmdbuf, SubmitInfo& info, u64 sign
         }
     }
     ImGui::Core::TextureManager::Submit();
+    if (BbSubmitStats::On() && on_submit) {
+        // g2-arm64 diagnosis: the draw submissions the GPU has not finished yet.
+        work_semaphore.Refresh();
+        const u64 done = work_semaphore.KnownGpuTick();
+        BbSubmitStats::NoteInflight(signal_value > done + 1 ? signal_value - 1 - done : 0);
+    }
+    BbSubmitStats::StepHere("submit prep");
     static const bool submit_stats = std::getenv("BB_SYNC_STATS") != nullptr; // g2-arm64
     const auto t0 = submit_stats ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    BbSubmitStats::StepHere("vkQueueSubmit");
     if (submit_result == vk::Result::eErrorDeviceLost) {
         std::printf("Device lost during submit\n");
         DeviceLost(instance.GetDevice());

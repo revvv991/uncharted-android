@@ -24,6 +24,7 @@
 #include "bbport_touchpad.h"          // g2-arm64: the on-screen gamepad
 #endif
 #include "bbport_settings.h"
+#include "bbport_submit_stats.h"
 #include "bbport_toggles.h"
 #include <miniz.h>
 #include "imgui.h"
@@ -1184,7 +1185,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     });
     {
         // Font atlas uploads submit to the graphics queue themselves.
-        std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
+        BbSubmitStats::TimedLock submit_lock{Vulkan::Scheduler::submit_mutex, "overlay"};
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmdbuf);
     }
     cmdbuf.endRendering();

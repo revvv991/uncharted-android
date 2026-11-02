@@ -504,6 +504,12 @@ public:
         return supports_memory_budget;
     }
 
+    /// g2-arm64: VK_GOOGLE_display_timing (Android's libvulkan): desired present times and the
+    /// vsyncs the frames went out on (BB_PRESENT_PACING).
+    bool IsDisplayTimingSupported() const {
+        return display_timing;
+    }
+
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
@@ -609,6 +615,7 @@ private:
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};
+    bool display_timing{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

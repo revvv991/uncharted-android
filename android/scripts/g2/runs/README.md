@@ -47,3 +47,23 @@ playing) alone.
 The owner's env by default: `../env-g2.txt` (another one: `OWNER_ENV=<file>`). The screen is woken
 up automatically (otherwise the game hangs before the GPU starts). Screenshots and logs stay
 local, not in git.
+
+## The 2026-10-31 generation (the public app, adb over Wi-Fi, the owner's Continue saves)
+
+Sourced by all of them: `g2.sh` - the device (`G2=<ip:port>` or `../device.txt`, git-ignored),
+the package `dev.unchartedandroid`, `OUT` (`<repo>/out/g2`, git-ignored), the backup/restore of
+the owner's launcher files and saves around every run, `press` through `BB_PAD_FILE`. The rules
+and the pitfalls: `.claude/skills/g2-runs/SKILL.md`.
+
+- `continue_run.sh <tag> <u1|u2|u3> <secs> [KEY=VALUE ...]`: one run from the owner's Continue
+  save, the camera turning, FPS and GPU faults, screenshots, the log; the owner's state back.
+  `START` = the game the owner played last (the restored saves put the menu there).
+- `ab_pairs.sh <tag> <game> <pairs> <secs> '<A>' '<B>'`: interleaved A/B with cool-downs (`COOL`),
+  medians and per-pair signs; 4 pairs.
+- `owner_session.sh start|status|stop`: the owner plays, the GPU faults and frame rate watched.
+- `focus_hold.sh start|step|value|stop`: hold an input, screenshot, the autofocus distance.
+- `restore_owner.sh [stamp]`: the owner's files and settings back after a run that died.
+- `queue_after.sh <marker file> <regex> <log> -- <command>`: chain series without attention.
+- `symbolize.sh <addr...>`: names for `libbbgpu.so+0x...` offsets (the last test build).
+- `../gprof_idle.py <log>`: the GPU idle share from `BB_GPU_PROFILE` blocks; `../cap_diff.py <a> <b>`:
+  two frame-analyzer captures side by side (passes and dispatches that differ).

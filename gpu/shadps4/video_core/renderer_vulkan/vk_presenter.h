@@ -43,6 +43,13 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    /// g2-arm64: BB_PRESENT_PACING: when the present thread wants it on the screen (CLOCK_MONOTONIC
+    /// ns, 0 = at once); used by its first present only.
+    s64 desired_present_ns{};
+    /// g2-arm64: BB_PRESENT_TRACE: the guest's flip argument and the frame's times so far (the
+    /// guest's flip, its wait, queued, taken, due; BbPresentPacing::TraceTime).
+    s64 trace_arg{};
+    std::array<s64, 5> trace_ns{};
 
     /// bbport: frame generation: frames between the previous game frame and this one,
     /// presented before it (FrameGenerator), the first `generated_count` of them.

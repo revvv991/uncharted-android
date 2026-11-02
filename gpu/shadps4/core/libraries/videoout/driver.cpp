@@ -14,6 +14,11 @@
 #include <sys/resource.h>
 #endif
 #include "common/assert.h"
+#include "bbport_present_pacing.h"
+
+// g2-arm64: the paced frame's time on the screen for the runtime (U1's frame dt smoothing, probe.c).
+extern "C" void runtime_frame_time_hint(float seconds);
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -610,6 +615,11 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     }
 
     if (!is_eop) {
+        // g2-arm64: BB_PRESENT_TRACE: a flip of the guest's own (sceVideoOutSubmitFlip) is its
+        // call; an end-of-pipe flip's call was noted by gnmdriver.
+        if (index != -1 && BbPresentPacing::Trace()) {
+            BbPresentPacing::NoteGuestFlip(flip_arg, BbPresentPacing::NowNs(), 0);
+        }
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
     } else {
@@ -663,6 +673,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .queued_ns = BbPresentPacing::Trace() ? BbPresentPacing::NowNs() : 0,
         });
     }
     request_cv.notify_one();
@@ -738,6 +749,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // until its slot; slots advance by one period (no drift).
     // g2-arm64: the limit is a live setting (the in-game panel), read on every tick below.
     auto next_flip = std::chrono::steady_clock::now();
+    // g2-arm64: BB_PRESENT_PACING (bbport_present_pacing.h): under a limit of a whole number of
+    // refreshes a frame the slots are the display's vsyncs, not CPU clock periods.
+    BbPresentPacing::Pacer pacer;
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
                 EmulatorSettings.GetVblankFrequency(), EmulatorSettings.GetFrameLimit());
 
@@ -780,6 +794,43 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             return std::min(std::max(slot + frame_period, now + frame_period - frame_period / 16),
                             now + frame_period);
         };
+        // g2-arm64: a request taken now: the next slot and, paced, its desired present time.
+        // Movies (60 Hz past the limit) and frame generation (frames of its own) are not paced.
+        const auto schedule = [&](const Request& request, bool movie_flip) {
+            const s64 refreshes =
+                movie_flip || BbSettings::Get().frame_gen.load(std::memory_order_relaxed) !=
+                                  BbSettings::FrameGenOff
+                    ? 0
+                    : pacer.Refreshes(frame_limit);
+            // g2-arm64: the game's frame clock moves by the paced frame's time on the screen (0: not paced).
+            const int64_t refresh = BbPresentPacing::refresh_ns.load(std::memory_order_relaxed);
+            const float hint = refreshes && request.frame ? float(double(refreshes * refresh) / 1e9) : 0.0f;
+            static float last_hint = -1.0f;
+            if (hint != last_hint) {
+                last_hint = hint;
+                runtime_frame_time_hint(hint);
+            }
+            if (!refreshes || !request.frame) {
+                pacer.Reset();
+                next_flip = next_slot(next_flip);
+                return;
+            }
+            int64_t slot = 0;
+            const int64_t taken = BbPresentPacing::NowNs();
+            const int64_t due = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    next_flip.time_since_epoch())
+                                    .count();
+            request.frame->desired_present_ns = pacer.Take(taken, refreshes, slot);
+            if (BbPresentPacing::Trace()) {
+                const auto guest = BbPresentPacing::FindGuestFlip(request.flip_arg);
+                request.frame->trace_arg = request.flip_arg;
+                request.frame->trace_ns = {guest.guest_ns, guest.waited_ns, request.queued_ns,
+                                           taken, due};
+            }
+            next_flip = std::chrono::steady_clock::time_point(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::nanoseconds(slot)));
+        };
         // bbport: with a frame limit (uncapped presets) a queued flip is presented as soon as it
         // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
         const bool immediate_flips = frame_limit != 0;
@@ -805,7 +856,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
-                next_flip = next_slot(next_flip);
+                schedule(request, movie);
+            } else if (request) {
+                runtime_frame_time_hint(0.0f); // no limit: the game's own frame times
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -865,7 +918,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             const auto request = receive_request();
             if (request) {
-                next_flip = next_slot(next_flip);
+                schedule(request, false);
                 Flip(request);
                 FRAME_END;
             }

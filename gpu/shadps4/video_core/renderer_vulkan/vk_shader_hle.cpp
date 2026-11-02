@@ -358,7 +358,8 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
                 // completed their ticks, so this waits only for the landing thread's copies.
                 buffer_cache.WaitLanding(buffer_cache.PendingLanding());
             }
-            if (!deferred && (!src_written || sync) && memory->IsValidGpuMapping(src.base_address, size) &&
+            if (!deferred && (!src_written || sync) && !rasterizer.ScalarCopyGuestDone() &&
+                memory->IsValidGpuMapping(src.base_address, size) &&
                 memory->IsValidGpuMapping(dst.base_address, size)) {
                 memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
                                         reinterpret_cast<const void*>(src.base_address), size);
@@ -397,8 +398,9 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
     }
     if (!memory->IsValidGpuMapping(src.base_address, size) ||
         !memory->IsValidGpuMapping(dst.base_address, size) ||
-        !memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
-                                 reinterpret_cast<const void*>(src.base_address), size)) {
+        (!rasterizer.ScalarCopyGuestDone() && // g2-arm64: made on stage A (ScalarCopyAheadHLE)
+         !memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
+                                  reinterpret_cast<const void*>(src.base_address), size))) {
         return false;
     }
     // The GPU's copy of the destination is refreshed from guest memory when next used; so are
@@ -451,6 +453,66 @@ bool PipelineGuestMemoryShaderHLE(const Shader::Info& info,
         std::printf("Scalar copy: %u of %u down the draw pipe\n", p, n);
     }
     return pipe;
+}
+
+// g2-arm64: the copies PipelineGuestMemoryShaderHLE leaves to the GPU thread (the source not
+// GPU data: a copy in guest memory, which the SRT walks of the draws after it read) made it
+// drain the draw pipe each time (U3's museum: 92-150 a second, 7-24% of the thread, the pipe
+// emptied). The guest copy itself needs no drain when nothing handed over still reads or
+// writes the destination and nothing writes the source (stage A's own notes of the pending
+// reads and GPU writes; the page bits for writes already recorded): it is made here, and the
+// rest of the HLE (the cache invalidation, the GPU copy beside GPU data) runs on the recording
+// thread in order, told to skip the guest copy. Off by default (0131, see
+// Liverpool's OrderedCommandsEnabled): BB_SCALAR_COPY_AHEAD=1 turns it on.
+bool ScalarCopyAheadHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
+                        Rasterizer& rasterizer) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_SCALAR_COPY_AHEAD");
+        return env && env[0] == '1';
+    }();
+    static const bool small_sync = [] { // that mode reads the destination back: not ahead
+        const char* env = std::getenv("BB_SCALAR_COPY_SMALL_SYNC");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || small_sync || info.buffers.size() != 2 ||
+        BbToggle::Disabled(BbToggle::MultiCopyShader)) {
+        return false;
+    }
+    const u64 group_size = info.pgm_hash == SCALAR_COPY64_SHADER_HASH ? 64 : 1;
+    const auto ud = info.UserData();
+    if (ud.size() <= 6) {
+        return false;
+    }
+    const auto src = info.buffers[0].GetSharp(info);
+    const auto dst = info.buffers[1].GetSharp(info);
+    if (src.GetStride() != 4 || dst.GetStride() != 4 || !src.base_address || !dst.base_address) {
+        return false;
+    }
+    const u64 count =
+        std::min<u64>({u64(cs_program.dim_x) * group_size, ud[6], src.num_records, dst.num_records});
+    const u64 size = count * 4;
+    if (count == 0 || size >= 1_MB) {
+        return false;
+    }
+    auto* memory = Core::Memory::Instance();
+    if (!memory->IsValidGpuMapping(src.base_address, size) ||
+        !memory->IsValidGpuMapping(dst.base_address, size)) {
+        return false;
+    }
+    static std::atomic<u32> total{0}, ahead{0};
+    const u32 n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool made =
+        !rasterizer.GetBufferCache().IsRegionGpuModified(src.base_address, size) &&
+        !rasterizer.PendingGuestWrite(src.base_address, size) &&
+        !rasterizer.PendingGuestWrite(dst.base_address, size) &&
+        !rasterizer.PendingGuestRead(dst.base_address, size) &&
+        memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
+                                reinterpret_cast<const void*>(src.base_address), size);
+    const u32 a = ahead.fetch_add(made, std::memory_order_relaxed) + made;
+    if ((n & 4095) == 0) {
+        std::printf("Scalar copy: %u of %u made ahead of the draw pipe\n", a, n);
+    }
+    return made;
 }
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,

@@ -40,6 +40,8 @@ int runtime_fiber_describe(char* out, size_t size, uint64_t rsp);
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cinttypes>
+#include <pthread.h>
 #include <ctime>
 #include <limits>
 #include <mutex>
@@ -210,6 +212,26 @@ uint64_t MonotonicNs() {
   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
 }
 
+// g2-arm64 diagnosis: BB_HLE_SLOW_MS=<ms> - host function calls that took at least that long are
+// printed with the time, the thread, the call site and three arguments (sleeps, and U1's idle wait
+// on its job manager's condition variable 0x13a9ce0, left out), and gaps of over 70 ms between the
+// guest's flip submissions on the same clock (U1's game-side stalls, findings 2026-11-01 evening).
+double HleSlowMs() {
+  static const double ms = [] {
+    const char* e = std::getenv("BB_HLE_SLOW_MS");
+    return e ? std::atof(e) : 0.0;
+  }();
+  return ms;
+}
+bool HleSleepName(const char* n) {
+  return n && (!std::strcmp(n, "sceKernelUsleep") || !std::strcmp(n, "usleep") || !std::strcmp(n, "sleep") ||
+               !std::strcmp(n, "nanosleep") || !std::strcmp(n, "sceKernelNanosleep") || !std::strcmp(n, "sceKernelSleep"));
+}
+bool HleFlipName(const char* n) {
+  return n && (!std::strncmp(n, "sceGnmSubmitAndFlipCommandBuffers", 33) || !std::strcmp(n, "sceVideoOutSubmitFlip"));
+}
+std::atomic<uint64_t> g_hle_last_flip_ns {0};
+
 FEXCore::Context::Context* g_context = nullptr;
 FEXCore::HostFeatures g_features {};
 uintptr_t g_exit_hlt = 0;        // hlt: the outermost guest_call returns here
@@ -254,7 +276,29 @@ public:
       std::memcpy(&caller, reinterpret_cast<const void*>(rsp), sizeof(caller));
       enter = MonotonicNs();
     }
+    const double slow_ms = HleSlowMs();
+    const uint64_t slow_enter = slow_ms > 0.0 ? MonotonicNs() : 0;
     bb_call_host(f.fn, x, d, out, stack);
+    if (slow_ms > 0.0) {
+      static const uint64_t t0 = slow_enter;
+      const uint64_t leave = MonotonicNs();
+      const double ms = (leave - slow_enter) / 1e6;
+      if (HleFlipName(f.name)) {
+        const uint64_t prev = g_hle_last_flip_ns.exchange(leave, std::memory_order_relaxed);
+        if (prev && leave - prev > 70000000)
+          std::printf("Guest flip gap: %.3f s, %.0f ms since the last flip\n", (leave - t0) / 1e9, (leave - prev) / 1e6);
+      }
+      const bool idle_wait = f.name && !std::strcmp(f.name, "scePthreadCondTimedwait") && x[0] == 0x13a9ce0;
+      if (ms >= slow_ms && !HleSleepName(f.name) && !idle_wait) {
+        char thread[16] = "";
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        uint64_t site = 0;
+        std::memcpy(&site, reinterpret_cast<const void*>(rsp), sizeof(site));
+        std::printf("Slow host call: %.3f s %s %s %.1f ms, caller %#" PRIx64 ", args %#" PRIx64 " %#" PRIx64 " %#" PRIx64
+                    " -> %#" PRIx64 "\n", (slow_enter - t0) / 1e9, thread, f.name ? f.name : "?", ms, site, x[0], x[1],
+                    x[2], out[0]);
+      }
+    }
     if (trace) {
       const size_t i = g_hle_n.fetch_add(1, std::memory_order_relaxed);
       if (i < kHleMaxRecords || g_hle_ring.load(std::memory_order_relaxed))
@@ -915,6 +959,81 @@ int guest_cpu_describe_stack(char* out, size_t size) {
     shown++;
   }
   n += (size_t)std::snprintf(out + n, size - n, "\n");
+  return (int)n;
+}
+
+int guest_cpu_describe_fault(char* out, size_t size, const void* context) {
+  HostThread& t = t_host;
+  if (!t.fex || !context || size < 2048) return 0;
+  const auto* uc = static_cast<const ucontext_t*>(context);
+  const auto pc = static_cast<uint64_t>(uc->uc_mcontext.pc);
+  if (!g_context->IsAddressInCodeBuffer(t.fex, pc)) return 0;
+  // While translated code runs FEX keeps rax..r15 in fixed host registers (x64::SRA in
+  // Arm64Emitter.cpp); the frame state is only the last sync.
+  static constexpr int kHost[16] = {4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29};
+  static const char* const names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+  uint64_t g[16];
+  for (int r = 0; r < 16; ++r) g[r] = uc->uc_mcontext.regs[kHost[r]];
+  const uint64_t rip = g_context->RestoreRIPFromHostPC(t.fex, pc);
+  size_t n = (size_t)std::snprintf(out, size, "  translated code: guest rip %#llx, its registers:\n",
+                                   (unsigned long long)rip);
+  for (int r = 0; r < 16 && n + 100 < size; r += 4) {
+    n += (size_t)std::snprintf(out + n, size - n, "  ");
+    for (int k = r; k < r + 4; ++k)
+      n += (size_t)std::snprintf(out + n, size - n, " %-3s=%016llx", names[k], (unsigned long long)g[k]);
+    n += (size_t)std::snprintf(out + n, size - n, "\n");
+  }
+  uint8_t code[16];
+  if (ProfRead(code, rip, sizeof(code))) {
+    n += (size_t)std::snprintf(out + n, size - n, "  code at that rip:");
+    for (uint8_t b : code) n += (size_t)std::snprintf(out + n, size - n, " %02x", b);
+    n += (size_t)std::snprintf(out + n, size - n, "\n");
+  }
+  // The return addresses up the rbp chain (frame pointers are kept in the games' code).
+  n += (size_t)std::snprintf(out + n, size - n, "  rbp chain:");
+  for (uint64_t rbp = g[5], i = 0; i < 24 && n + 40 < size; ++i) {
+    uint64_t frame[2];
+    if ((rbp & 7) || !ProfRead(frame, rbp, sizeof(frame))) break;
+    n += (size_t)std::snprintf(out + n, size - n, " %#llx", (unsigned long long)frame[1]);
+    if (frame[0] <= rbp || frame[0] - rbp > (1u << 20)) break;
+    rbp = frame[0];
+  }
+  n += (size_t)std::snprintf(out + n, size - n, "\n");
+  // The live stack: the frame from rsp to rbp+0x10 in full, then the image addresses above it.
+  uint64_t words[384];
+  struct iovec local = {words, sizeof(words)};
+  struct iovec remote = {reinterpret_cast<void*>(g[4]), sizeof(words)};
+  const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+  const size_t nw = got > 0 ? (size_t)got / 8 : 0;
+  size_t fw = 0;
+  if (g[5] > g[4] && g[5] - g[4] <= 0x300) fw = std::min(nw, (size_t)((g[5] - g[4]) / 8 + 2));
+  for (size_t i = 0; i < fw && n + 100 < size; i += 4) {
+    n += (size_t)std::snprintf(out + n, size - n, "  [rsp+0x%03zx]", i * 8);
+    for (size_t k = i; k < i + 4 && k < fw; ++k)
+      n += (size_t)std::snprintf(out + n, size - n, " %016llx", (unsigned long long)words[k]);
+    n += (size_t)std::snprintf(out + n, size - n, "\n");
+  }
+  n += (size_t)std::snprintf(out + n, size - n, "  live stack image addresses:");
+  for (size_t i = fw, shown = 0; i < nw && shown < 48 && n + 32 < size; ++i) {
+    if (words[i] < 0x400000 || words[i] >= 0x80000000ull) continue;
+    n += (size_t)std::snprintf(out + n, size - n, " +%#zx=%#llx", i * 8, (unsigned long long)words[i]);
+    shown++;
+  }
+  n += (size_t)std::snprintf(out + n, size - n, "\n");
+  // 64 bytes at every register that points into guest memory (heap, stacks), once per value.
+  for (int r = 0; r < 16; ++r) {
+    const uint64_t v = g[r];
+    if (r == 4 || r == 5 || v < 0x1000000000ull || v >= 0x4000000000ull) continue;
+    bool seen = false;
+    for (int k = 0; k < r; ++k) seen |= g[k] == v && k != 4 && k != 5;
+    uint64_t m[8];
+    if (seen || !ProfRead(m, v, sizeof(m))) continue;
+    for (int i = 0; i < 8 && n + 100 < size; i += 4)
+      n += (size_t)std::snprintf(out + n, size - n, "  [%s+%#04x] %016llx %016llx %016llx %016llx\n", names[r], i * 8,
+                                 (unsigned long long)m[i], (unsigned long long)m[i + 1], (unsigned long long)m[i + 2],
+                                 (unsigned long long)m[i + 3]);
+  }
   return (int)n;
 }
 

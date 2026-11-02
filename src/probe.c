@@ -450,6 +450,9 @@ static void fault(int sig, siginfo_t *info, void *context) {
      * the PC and the faulting address (JIT code has no module). */
     { char name[40]="  thread "; prctl(PR_GET_NAME,(unsigned long)(name+9),0,0,0); size_t l=strlen(name); name[l]=10;
       ssize_t w_=write(2,name,l+1); (void)w_; }
+    /* g2-arm64: a fault in translated code: the guest instruction and its registers, the frames. */
+    { static char live[8192]; int f=guest_cpu_describe_fault(live,sizeof(live),context);
+      if (f>0) { ssize_t w_=write(2,live,(size_t)f); (void)w_; } }
     { char guest[256]; int n=guest_cpu_describe_thread(guest,sizeof(guest));
       if (n>0) { ssize_t w_=write(2,guest,(size_t)n); (void)w_; }
       /* g2-arm64: every guest register, memory at rbx, the guest stack and the current fiber. */
@@ -669,14 +672,39 @@ static void *stall_watch(void *arg) {
  * up to 1 MiB); the reply is <file>.out, renamed into place when complete: per line a header
  * (address u64, length u32, status u32: 0 or an errno) and, when read, the bytes. The request
  * is removed; write it elsewhere and move it to <file> so that it is read whole. */
+static volatile uint32_t u1_set_job_skips, u1_set_maker_null; /* install_u1_set_job_guard below */
+/* install_u1_dt_smooth below: nominal (s, 0 = off), debt, k, correction low/high, debt low/high,
+ * the last raw dt - read and written by the guest stub. */
+static float u1_dt_state[8];
+static int u1_dt_installed, u1_dt_fixed; /* the stub is in; BB_U1_DT_SMOOTH=<ms> fixed the nominal */
+/* g2-arm64: the present thread's frame time on the screen (s; 0: frames not paced, movies), the
+ * nominal of U1's frame dt smoothing (install_u1_dt_smooth); the debt starts over when it turns on. */
+void runtime_frame_time_hint(float seconds) {
+    if (!u1_dt_installed || u1_dt_fixed || u1_dt_state[0] == seconds) return;
+    if (u1_dt_state[0] == 0.0f) u1_dt_state[1] = 0.0f;
+    u1_dt_state[3] = -seconds / 4;
+    u1_dt_state[4] = seconds;
+    u1_dt_state[0] = seconds;
+    printf("Frame dt smoothing: %.3f ms a frame%s\n", seconds * 1e3, seconds > 0.0f ? "" : " (off: frames not paced)");
+}
 static void *peek_on_request(void *arg) {
     const char *path=(const char *)arg;
     char out[512], part[512];
     snprintf(out,sizeof(out),"%s.out",path);
     snprintf(part,sizeof(part),"%s.part",path);
     static unsigned char data[1<<20];
+    uint32_t skips_told=0;
     for (;;) {
         usleep(200000);
+        /* g2-arm64: and the U1 set job guard's counts, when they grow. */
+        const uint32_t skips=__atomic_load_n(&u1_set_job_skips,__ATOMIC_RELAXED);
+        const uint32_t nulls=__atomic_load_n(&u1_set_maker_null,__ATOMIC_RELAXED);
+        if (skips+nulls!=skips_told) {
+            printf("Set job guard: %u of U1's node set jobs skipped with no set; the set maker left "
+                   "it null %u times\n",skips,nulls);
+            fflush(stdout);
+            skips_told=skips+nulls;
+        }
         FILE *request=fopen(path,"r");
         if (!request) continue;
         FILE *reply=fopen(part,"wb");
@@ -695,6 +723,412 @@ static void *peek_on_request(void *arg) {
         fclose(request);
         unlink(path);
         if (reply) { fclose(reply); rename(part,out); }
+    }
+    return NULL;
+}
+/* g2-arm64 (U1's job fiber crash, findings 2026-11-01): U1's game frame (0x49c5b0) reads the main
+ * view's region table in 0x739b90 (per tracked entity the bitset of its region; the crash is its
+ * movbe at 0x739ed2). The table and its bitsets live in the render frame arena (allocator 0x36):
+ * the render frame job (0x4f0cb0) resets that arena at 0x4f0dfb and rebuilds the table only later,
+ * in its view update (0x97dab0 -> 0x9a4260 -> 0x9bba20: the old table freed, the pointer zeroed, a
+ * new table allocated, published at once and then filled). In between the published table is
+ * memory the job's other allocations reuse; nothing orders the game frame's read against that, and
+ * on the PS4 the read evidently never lands there, here it does (the watch of 2026-11-01: job
+ * entries, counter pointers or floats in the published table for 1-30 ms every 10-40 s; 4 crashes
+ * in ~140 U1 runs). Now the arena reset sets a stale flag in host memory and the end of the view
+ * update clears it; while it is set the reader takes no bitset (as for a null one: the entity
+ * counts as in view), nor for a pointer outside the guest heap (0x739e66); and a spin lock covers
+ * the reader's loop (no calls but a math function, no fiber switch) and the whole of 0x9bba20
+ * (allocations and asserts only, entered from four places) for its zeroed pointer.
+ * BB_U1_VIEW_LOCK=0: off. */
+static struct { volatile uint32_t lock, reader_held, stale; } u1_view_lock;
+static int u1_view_lock_on;
+static void install_u1_view_lock(uint64_t image_size) {
+    const char *env = getenv("BB_U1_VIEW_LOCK");
+    if (env && env[0] == '0') return;
+    const uint64_t base = 0x400000, cave = 0xd1fe00, acquire_at = 0x739d3b, release_at = 0x73a0ac,
+                   bits_at = 0x739e66, producer = 0x9bba20, reset_at = 0x4f0df5, views_at = 0x4f0e81,
+                   views = 0x97dab0;
+    static const unsigned char acquire_old[] = {0x4d, 0x8d, 0xb5, 0x60, 0x03, 0x00, 0x00};
+    static const unsigned char release_old[] = {0x48, 0x8b, 0x45, 0x90, 0xa8, 0x01};
+    static const unsigned char bits_old[] = {0x48, 0x8b, 0x44, 0x10, 0x20, 0x48, 0x89, 0x45, 0x88};
+    static const unsigned char producer_old[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    static const unsigned char reset_old[] = {0x48, 0x8b, 0x08, 0x48, 0x89, 0xc7, 0xff, 0x51, 0x18};
+    static const unsigned char views_old[] = {0xe8, 0x2a, 0xcc, 0x48, 0x00};
+    if (cave - base + 512 > image_size) return;
+    if (memcmp(image + acquire_at - base, acquire_old, sizeof(acquire_old)) ||
+        memcmp(image + release_at - base, release_old, sizeof(release_old)) ||
+        memcmp(image + bits_at - base, bits_old, sizeof(bits_old)) ||
+        memcmp(image + producer - base, producer_old, sizeof(producer_old)) ||
+        memcmp(image + reset_at - base, reset_old, sizeof(reset_old)) ||
+        memcmp(image + views_at - base, views_old, sizeof(views_old)))
+        return; /* not U1 */
+    for (size_t i = 0; i < 512; ++i)
+        if (image[cave - base + i]) { printf("View table lock: the code cave is not empty, off\n"); return; }
+    unsigned char *t = image + cave - base;
+    size_t k = 0;
+    const uint64_t state = (uint64_t)(uintptr_t)&u1_view_lock;
+    const uint32_t tries = 20000; /* pause is wfe here (~100 us): a guard of ~2 s, never met */
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+#define STATE_R11() do { B(0x49, 0xbb); memcpy(t + k, &state, 8); k += 8; } while (0) /* movabs r11, state */
+    /* A, before the reader's loop: the moved lea, then the lock (reader_held when taken) */
+    const uint64_t a = cave + k;
+    B(0x4d, 0x8d, 0xb5, 0x60, 0x03, 0x00, 0x00);            /* lea r14, [r13+0x360] */
+    STATE_R11();
+    B(0xb9); memcpy(t + k, &tries, 4); k += 4;              /* mov ecx, tries */
+    const size_t a_spin = k;
+    B(0xb8, 0x01, 0x00, 0x00, 0x00);                        /* mov eax, 1 */
+    B(0x41, 0x87, 0x03);                                    /* xchg [r11], eax */
+    B(0x85, 0xc0);                                          /* test eax, eax */
+    B(0x74); const size_t a_got = k; B(0x00);               /* je got */
+    B(0xf3, 0x90);                                          /* pause */
+    B(0xff, 0xc9);                                          /* dec ecx */
+    B(0x75, (unsigned char)(a_spin - (k + 2)));             /* jne spin */
+    B(0x41, 0xc7, 0x43, 0x04, 0x00, 0x00, 0x00, 0x00);      /* mov dword [r11+4], 0 */
+    B(0xc3);                                                /* ret */
+    t[a_got] = (unsigned char)(k - (a_got + 1));
+    B(0x41, 0xc7, 0x43, 0x04, 0x01, 0x00, 0x00, 0x00);      /* got: mov dword [r11+4], 1 */
+    B(0xc3);
+    /* R, after the loop: the lock released when held, then the moved mov and test */
+    const uint64_t r = cave + k;
+    STATE_R11();
+    B(0x41, 0x83, 0x7b, 0x04, 0x00);                        /* cmp dword [r11+4], 0 */
+    B(0x74); const size_t r_skip = k; B(0x00);              /* je skip */
+    B(0x41, 0xc7, 0x43, 0x04, 0x00, 0x00, 0x00, 0x00);      /* mov dword [r11+4], 0 */
+    B(0x41, 0xc7, 0x03, 0x00, 0x00, 0x00, 0x00);            /* mov dword [r11], 0 */
+    t[r_skip] = (unsigned char)(k - (r_skip + 1));
+    B(0x48, 0x8b, 0x45, 0x90);                              /* skip: mov rax, [rbp-0x70] */
+    B(0xa8, 0x01);                                          /* test al, 1 */
+    B(0xc3);
+    /* G, the bitset pointer: none while the table is stale or outside [0x10_0000_0000,
+     * 0x40_0000_0000) (r11 holds the loop's mask: rdx is the scratch here) */
+    const uint64_t g = cave + k;
+    B(0x48, 0x8b, 0x44, 0x10, 0x20);                        /* mov rax, [rax+rdx+0x20] */
+    B(0x48, 0xba); memcpy(t + k, &state, 8); k += 8;        /* movabs rdx, state */
+    B(0x83, 0x7a, 0x08, 0x00);                              /* cmp dword [rdx+8], 0 */
+    B(0x75); const size_t g_none = k; B(0x00);              /* jne none */
+    B(0x48, 0x89, 0xc2);                                    /* mov rdx, rax */
+    B(0x48, 0xc1, 0xea, 0x24);                              /* shr rdx, 36 */
+    B(0x48, 0xff, 0xca);                                    /* dec rdx */
+    B(0x48, 0x83, 0xfa, 0x02);                              /* cmp rdx, 2 */
+    B(0x76, 0x02);                                          /* jbe ok */
+    t[g_none] = (unsigned char)(k - (g_none + 1));
+    B(0x31, 0xc0);                                          /* none: xor eax, eax */
+    B(0x48, 0x89, 0x45, 0x88);                              /* ok: mov [rbp-0x78], rax */
+    B(0xc3);
+    /* P, the rebuild's entry: the lock, the function through T, the lock released when taken */
+    const uint64_t p = cave + k;
+    B(0x48, 0x83, 0xec, 0x08);                              /* sub rsp, 8 */
+    STATE_R11();
+    B(0x41, 0xba); memcpy(t + k, &tries, 4); k += 4;        /* mov r10d, tries */
+    const size_t p_spin = k;
+    B(0xb8, 0x01, 0x00, 0x00, 0x00);                        /* mov eax, 1 */
+    B(0x41, 0x87, 0x03);                                    /* xchg [r11], eax */
+    B(0x85, 0xc0);                                          /* test eax, eax */
+    B(0x74); const size_t p_got = k; B(0x00);               /* je got */
+    B(0xf3, 0x90);                                          /* pause */
+    B(0x41, 0xff, 0xca);                                    /* dec r10d */
+    B(0x75, (unsigned char)(p_spin - (k + 2)));             /* jne spin */
+    B(0xc7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00);            /* mov dword [rsp], 0 */
+    B(0xeb); const size_t p_go = k; B(0x00);                /* jmp call */
+    t[p_got] = (unsigned char)(k - (p_got + 1));
+    B(0xc7, 0x04, 0x24, 0x01, 0x00, 0x00, 0x00);            /* got: mov dword [rsp], 1 */
+    t[p_go] = (unsigned char)(k - (p_go + 1));
+    B(0xe8); const size_t p_call = k; k += 4;               /* call T */
+    B(0x83, 0x3c, 0x24, 0x00);                              /* cmp dword [rsp], 0 */
+    B(0x74); const size_t p_out = k; B(0x00);               /* je out */
+    STATE_R11();
+    B(0x41, 0xc7, 0x03, 0x00, 0x00, 0x00, 0x00);            /* mov dword [r11], 0 */
+    t[p_out] = (unsigned char)(k - (p_out + 1));
+    B(0x48, 0x83, 0xc4, 0x08);                              /* out: add rsp, 8 */
+    B(0xc3);                                                /* ret (rax: the function's result) */
+    /* T: the moved prologue, then the rest of 0x9bba20 */
+    const uint64_t tr = cave + k;
+    { const int32_t rel = (int32_t)((int64_t)tr - (int64_t)(cave + p_call + 4)); memcpy(t + p_call, &rel, 4); }
+    B(0x55, 0x48, 0x89, 0xe5, 0x41, 0x57);                  /* push rbp; mov rbp, rsp; push r15 */
+    B(0xe9);
+    { const int32_t rel = (int32_t)((int64_t)(producer + 6) - (int64_t)(cave + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
+    /* S, the render job's arena reset: stale, then the moved virtual call */
+    const uint64_t sr = cave + k;
+    STATE_R11();
+    B(0x41, 0xc7, 0x43, 0x08, 0x01, 0x00, 0x00, 0x00);      /* mov dword [r11+8], 1 */
+    B(0x48, 0x8b, 0x08);                                    /* mov rcx, [rax] */
+    B(0x48, 0x89, 0xc7);                                    /* mov rdi, rax */
+    B(0x48, 0x83, 0xec, 0x08);                              /* sub rsp, 8 */
+    B(0xff, 0x51, 0x18);                                    /* call [rcx+0x18] */
+    B(0x48, 0x83, 0xc4, 0x08);                              /* add rsp, 8 */
+    B(0xc3);                                                /* ret */
+    /* V, the render job's view update: the call, then no longer stale */
+    const uint64_t vu = cave + k;
+    B(0x48, 0x83, 0xec, 0x08);                              /* sub rsp, 8 */
+    B(0xe8);
+    { const int32_t rel = (int32_t)((int64_t)views - (int64_t)(cave + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
+    B(0x48, 0x83, 0xc4, 0x08);                              /* add rsp, 8 */
+    STATE_R11();
+    B(0x41, 0xc7, 0x43, 0x08, 0x00, 0x00, 0x00, 0x00);      /* mov dword [r11+8], 0 */
+    B(0xc3);                                                /* ret */
+#undef STATE_R11
+#undef B
+    /* the six sites: call A; call R; call G; jmp P; call S; call V */
+    struct { uint64_t at, to; size_t size; unsigned char op; } sites[] = {
+        {acquire_at, a, sizeof(acquire_old), 0xe8}, {release_at, r, sizeof(release_old), 0xe8},
+        {bits_at, g, sizeof(bits_old), 0xe8}, {producer, p, sizeof(producer_old), 0xe9},
+        {reset_at, sr, sizeof(reset_old), 0xe8}, {views_at, vu, sizeof(views_old), 0xe8}};
+    for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); ++i) {
+        unsigned char *s = image + sites[i].at - base;
+        const int32_t rel = (int32_t)((int64_t)sites[i].to - (int64_t)(sites[i].at + 5));
+        s[0] = sites[i].op;
+        memcpy(s + 1, &rel, 4);
+        memset(s + 5, 0x90, sites[i].size - 5);
+    }
+    u1_view_lock_on = 1;
+    printf("View table lock: U1's view region table read only while valid (%zu bytes of stubs at %#" PRIx64 ")\n",
+           k, cave);
+}
+
+/* g2-arm64 (U1's second job crash, findings 2026-11-01): U1's job 0xa16aa0 takes 0x50 bytes of
+ * data from its two submitters (0x9fb520, 0x9fbe4b: a scene object, checked by its tag 0x610ba10,
+ * and that object's +0x78, a set of up to 1024 nodes - two 16-word bitmasks and the nodes - which
+ * the job copies and walks, marking the nodes and visiting their children). It faulted at 0xa16b04
+ * reading +0x20 of a null set (viewfix-u1-B4, one of ~40 U1 runs that day): the object's +0x78 was
+ * empty when the job was submitted, and the submitters do not check it. The job now returns at its
+ * entry when its set is null, as for an empty set (the job runner then completes it as usual); the
+ * peek thread reports the skips. The set is made by the job 0xa1f000 (submitted at 0x9fa8da with the
+ * object as its data): after pushing a scoped allocator of its own (0x8585a0), 128 KiB for +0x70 and
+ * 32 KiB for +0x78 from the thread's top allocator - null for both when that stack is empty; its
+ * null stores of the set (0xa1f12e) are counted too. BB_U1_SET_GUARD=0: off. */
+static void install_u1_set_job_guard(uint64_t image_size) {
+    const char *env = getenv("BB_U1_SET_GUARD");
+    if (env && env[0] == '0') return;
+    const uint64_t base = 0x400000, cave = 0xd20000, job = 0xa16aa0, load_at = 0xa16b00,
+                   store_at = 0xa1f12e;
+    static const unsigned char job_old[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                            0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x18, 0x01, 0x00, 0x00};
+    static const unsigned char load_old[] = {0x49, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0x48, 0x20};
+    static const unsigned char store_old[] = {0x49, 0x89, 0x5c, 0x24, 0x78, 0x49, 0xc7, 0x84, 0x24,
+                                              0x88, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00};
+    if (cave - base + 128 > image_size) return;
+    if (memcmp(image + job - base, job_old, sizeof(job_old)) ||
+        memcmp(image + load_at - base, load_old, sizeof(load_old)) ||
+        memcmp(image + store_at - base, store_old, sizeof(store_old)))
+        return; /* not U1 */
+    for (size_t i = 0; i < 128; ++i)
+        if (image[cave - base + i]) { printf("Set job guard: the code cave is not empty, off\n"); return; }
+    unsigned char *t = image + cave - base;
+    size_t k = 0;
+    const uint64_t skips = (uint64_t)(uintptr_t)&u1_set_job_skips;
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+    B(0x48, 0x83, 0x7f, 0x08, 0x00);                        /* cmp qword [rdi+8], 0: the set */
+    B(0x74); const size_t skip = k; B(0x00);                /* je skip */
+    B(0x55);                                                /* push rbp (the moved prologue) */
+    B(0x48, 0x89, 0xe5);                                    /* mov rbp, rsp */
+    B(0x41, 0x57);                                          /* push r15 */
+    B(0xe9);                                                /* jmp job + 6 */
+    { const int32_t rel = (int32_t)((int64_t)(job + 6) - (int64_t)(cave + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
+    t[skip] = (unsigned char)(k - (skip + 1));
+    B(0x48, 0xb8); memcpy(t + k, &skips, 8); k += 8;        /* skip: movabs rax, &skips */
+    B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
+    B(0xc3);                                                /* ret */
+    /* The maker's store of the set, at +64 (rax is dead there: the next load overwrites it). */
+    const size_t m = 64;
+    k = m;
+    const uint64_t nulls = (uint64_t)(uintptr_t)&u1_set_maker_null;
+    B(0x49, 0x89, 0x5c, 0x24, 0x78);                        /* mov [r12+0x78], rbx: the set */
+    B(0x48, 0x85, 0xdb);                                    /* test rbx, rbx */
+    B(0x75); const size_t made = k; B(0x00);                /* jne made */
+    B(0x48, 0xb8); memcpy(t + k, &nulls, 8); k += 8;        /* movabs rax, &nulls */
+    B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
+    t[made] = (unsigned char)(k - (made + 1));
+    B(0xc3);                                                /* made: ret */
+#undef B
+    unsigned char *site = image + job - base;               /* jmp the job's stub */
+    int32_t rel = (int32_t)((int64_t)cave - (int64_t)(job + 5));
+    site[0] = 0xe9;
+    memcpy(site + 1, &rel, 4);
+    site[5] = 0x90;
+    site = image + store_at - base;                         /* call the store's stub */
+    rel = (int32_t)((int64_t)(cave + m) - (int64_t)(store_at + 5));
+    site[0] = 0xe8;
+    memcpy(site + 1, &rel, 4);
+    printf("Set job guard: U1's node set job skips a null set (%zu bytes of stubs at %#" PRIx64 ")\n", k, cave);
+}
+
+/* g2-arm64 (U1's jumps, findings 2026-11-02): U1 moves its world each frame by the time since the
+ * last frame began (the frame clock at 0xe66f10: 0x4fac70 clamps the raw time and stores it at
+ * +0x8, every game clock is advanced by it). On PS4 its frames begin evenly, held by the GPU's
+ * vsync-locked frame ends; here they follow the port's frame ends three frames back, 12-70 ms apart
+ * while the screen shows every frame 33.3 ms: the picture moved by the game's steps, not by the
+ * screen's (a recording's frame-to-frame shift correlated 0.91 with the game's frame intervals).
+ * A stub replaces that store:
+ *   out = nominal + clamp(0.15 * (debt + raw - nominal), -nominal/4, +nominal),
+ *   debt = clamp(debt + raw - out, -100 ms, +250 ms)
+ * so the game time follows real time with a bounded debt and moves by the screen's steps. The
+ * nominal is the paced frame's time on the screen from the present thread (runtime_frame_time_hint;
+ * 0, the raw dt, when frames are not paced and during movies). BB_U1_DT_SMOOTH=0: off; =<ms>: that
+ * nominal always. A 60 s screen recording while the camera turned (2026-11-02): steps of a
+ * refresh's worth or more off the screen's time 418 a minute -> 56, the game's dt p5-p95 15-59 ms
+ * -> 31-37 ms, the debt within -23..+44 ms (p1, p99), 30.0 FPS either way. */
+static void install_u1_dt_smooth(uint64_t image_size) {
+    const char *env = getenv("BB_U1_DT_SMOOTH");
+    if (env && env[0] == '0' && !env[1]) return;
+    const double nominal_ms = env ? atof(env) : 0.0;
+    const uint64_t base = 0x400000, cave = 0xd20080, site = 0x4fad20;
+    static const unsigned char site_old[] = {0xc5, 0xea, 0x5d, 0xc0,         /* vminss %xmm0,%xmm2,%xmm0 */
+                                             0xc5, 0xfa, 0x11, 0x43, 0x08,   /* vmovss %xmm0,0x8(%rbx) */
+                                             0x48, 0x8d, 0x05, 0xdc, 0xd4, 0x85, 0x00};
+    static const unsigned char stub[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,        /* movabs $state,%rax */
+        0xc5, 0xfa, 0x10, 0x10,                    /* vmovss (%rax),%xmm2: nominal */
+        0xc5, 0xe0, 0x57, 0xdb,                    /* vxorps %xmm3,%xmm3,%xmm3 */
+        0xc5, 0xf8, 0x2e, 0xd3,                    /* vucomiss %xmm3,%xmm2 */
+        0x76, 0x3d,                                /* jbe store: off */
+        0xc5, 0xfa, 0x11, 0x40, 0x1c,              /* vmovss %xmm0,0x1c(%rax): the raw dt */
+        0xc5, 0xfa, 0x58, 0x58, 0x04,              /* vaddss 0x4(%rax),%xmm0,%xmm3: raw + debt */
+        0xc5, 0xe2, 0x5c, 0xda,                    /* vsubss %xmm2,%xmm3,%xmm3: - nominal */
+        0xc5, 0xe2, 0x59, 0x58, 0x08,              /* vmulss 0x8(%rax),%xmm3,%xmm3: * k */
+        0xc5, 0xe2, 0x5f, 0x58, 0x0c,              /* vmaxss 0xc(%rax),%xmm3,%xmm3 */
+        0xc5, 0xe2, 0x5d, 0x58, 0x10,              /* vminss 0x10(%rax),%xmm3,%xmm3 */
+        0xc5, 0xe2, 0x58, 0xda,                    /* vaddss %xmm2,%xmm3,%xmm3: out */
+        0xc5, 0xfa, 0x58, 0x50, 0x04,              /* vaddss 0x4(%rax),%xmm0,%xmm2: raw + debt */
+        0xc5, 0xea, 0x5c, 0xd3,                    /* vsubss %xmm3,%xmm2,%xmm2: - out */
+        0xc5, 0xea, 0x5f, 0x50, 0x14,              /* vmaxss 0x14(%rax),%xmm2,%xmm2 */
+        0xc5, 0xea, 0x5d, 0x50, 0x18,              /* vminss 0x18(%rax),%xmm2,%xmm2 */
+        0xc5, 0xfa, 0x11, 0x50, 0x04,              /* vmovss %xmm2,0x4(%rax): debt */
+        0xc5, 0xf8, 0x28, 0xc3,                    /* vmovaps %xmm3,%xmm0 */
+        0xc5, 0xfa, 0x11, 0x43, 0x08,              /* store: vmovss %xmm0,0x8(%rbx) */
+        0xe9, 0, 0, 0, 0};                         /* jmp site + 5 */
+    if (cave - base + 128 > image_size || site - base + sizeof(site_old) > image_size) return;
+    if (memcmp(image + site - 4 - base, site_old, sizeof(site_old))) return; /* not U1 */
+    for (size_t i = 0; i < 128; ++i)
+        if (image[cave - base + i]) { printf("Frame dt smoothing: the code cave is not empty, off\n"); return; }
+    const float nominal = (float)(nominal_ms > 0.0 ? nominal_ms / 1000.0 : 0.0);
+    u1_dt_fixed = nominal > 0.0f;
+    u1_dt_state[0] = nominal;
+    u1_dt_state[1] = 0.0f;
+    u1_dt_state[2] = 0.15f;
+    u1_dt_state[3] = -nominal / 4;
+    u1_dt_state[4] = nominal;
+    u1_dt_state[5] = -0.1f;
+    u1_dt_state[6] = 0.25f;
+    unsigned char *t = image + cave - base;
+    memcpy(t, stub, sizeof(stub));
+    const uint64_t state = (uint64_t)(uintptr_t)u1_dt_state;
+    memcpy(t + 2, &state, 8);
+    int32_t rel = (int32_t)((int64_t)(site + 5) - (int64_t)(cave + sizeof(stub)));
+    memcpy(t + sizeof(stub) - 4, &rel, 4);
+    unsigned char *p = image + site - base;
+    rel = (int32_t)((int64_t)cave - (int64_t)(site + 5));
+    p[0] = 0xe9;
+    memcpy(p + 1, &rel, 4);
+    u1_dt_installed = 1;
+    printf("Frame dt smoothing: U1's frame clock moves by the screen's frame time with a debt to real "
+           "time (%s; %zu bytes of stub at %#" PRIx64 ")\n", u1_dt_fixed ? "fixed by BB_U1_DT_SMOOTH" : "from the present thread",
+           sizeof(stub), cave);
+}
+
+/* g2-arm64 diagnosis (U1's job fiber crash, 2026-11-01): BB_U1_VIEW_WATCH=1 watches the table
+ * U1's 0x739b90 takes its bitsets from (the faulting movbe at 0x739ed2): the view manager at
+ * 0x140b4c0, its level data ([+0x10]: the region count at +0x350, read under the rwlock at +0x360)
+ * and its view ([+0x40]: the table of 48-byte region entries at +0x10; bit 1 of an entry's +0xc
+ * says it has a bitset, its pointer at +0x20). Every millisecond: changes of those four values, and
+ * entries below the count with bitset words (+0xc >> 2) whose pointer is not a guest heap address,
+ * the table read under the view table lock above, and not while it is stale, when that is
+ * installed (as the game's reader). */
+static int peek_guest(void *out, uint64_t address, size_t size) {
+    struct iovec local={out,size}, remote={(void *)(uintptr_t)address,size};
+    return process_vm_readv(getpid(),&local,1,&remote,1,0)==(ssize_t)size;
+}
+/* g2-arm64 diagnosis (U1's jumps, findings 2026-11-02): BB_U1_FRAME_WATCH=1 polls U1's render
+ * frame number every 0.5 ms - FrameBegin's (ndlib/render/fg-draw-mgr.cpp, 0x8d2741: [[0x14e25a8]],
+ * or [[0x14e25a0]] by a flag of the caller) - and prints each new frame: the time (CLOCK_MONOTONIC
+ * ms), which pointer, the frame, and the GPU end-of-pipe ticks (m_gfxEopTick, +0xa08 of the frame
+ * params: 32 slots of 0xa50 bytes at 0x14cdb40) of the frame three back - the one FrameBegin
+ * recycles, waiting for its tick (patch_eop_tick_wait) - and of the frame before. The game's own
+ * frame times: the screen showed its picture moving unevenly while the frames went out evenly. */
+static void *u1_frame_watch(void *arg) {
+    (void)arg;
+    static const uint64_t pointers[2] = {0x14e25a8, 0x14e25a0};
+    uint64_t last[2] = {0, 0};
+    for (;;) {
+        usleep(500);
+        for (int which = 0; which < 2; ++which) {
+            uint64_t ptr = 0, frame = 0, tick3 = 0, tick1 = 0;
+            if (!peek_guest(&ptr, pointers[which], 8) || !ptr || !peek_guest(&frame, ptr, 8)) continue;
+            if (frame == last[which]) continue;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            peek_guest(&tick3, 0x14cdb40 + ((frame - 3) & 31) * 0xa50 + 0xa08, 8);
+            peek_guest(&tick1, 0x14cdb40 + ((frame - 1) & 31) * 0xa50 + 0xa08, 8);
+            float dt = 0;
+            peek_guest(&dt, 0xe66f18, 4); /* the frame clock's dt (install_u1_dt_smooth) */
+            printf("Frame watch: %.3f %c frame %" PRIu64 " (+%" PRId64 "), eop tick of frame-3 %#" PRIx64
+                   ", frame-1 %#" PRIx64 "; dt %.2f raw %.2f debt %.2f\n", now.tv_sec * 1e3 + now.tv_nsec / 1e6,
+                   which ? 'b' : 'a', frame, (int64_t)(frame - last[which]), tick3, tick1, dt * 1e3,
+                   u1_dt_state[7] * 1e3, u1_dt_state[1] * 1e3);
+            last[which] = frame;
+        }
+    }
+    return NULL;
+}
+static void *u1_view_watch(void *arg) {
+    (void)arg;
+    static unsigned char table[4096*48];
+    static const char *const names[4]={"level data","view","region count","region table"};
+    uint64_t last[4]={0}, changes[4]={0}, shown[4]={0}, bad=0, unreadable=0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC,&start);
+    double summary=0;
+    for (;;) {
+        usleep(1000);
+        uint64_t head[0x60/8];
+        if (!peek_guest(head,0x140b4c0,sizeof(head))) continue;
+        const uint64_t level=head[0x10/8], view=head[0x40/8];
+        uint32_t count=0; uint64_t tablep=0;
+        if (!level || !view || !peek_guest(&count,level+0x350,4) || !peek_guest(&tablep,view+0x10,8)) continue;
+        clock_gettime(CLOCK_MONOTONIC,&now);
+        const double t=(double)(now.tv_sec-start.tv_sec)+(double)(now.tv_nsec-start.tv_nsec)/1e9;
+        const uint64_t values[4]={level,view,count,tablep};
+        for (int k=0;k<4;++k) {
+            if (values[k]==last[k]) continue;
+            changes[k]++;
+            if (shown[k]++<40)
+                printf("View watch: %.3f s %s %#" PRIx64 " -> %#" PRIx64 " (regions %u, table %#" PRIx64 ")\n",
+                       t,names[k],last[k],values[k],count,tablep);
+            last[k]=values[k];
+        }
+        if (t-summary>=5.0) {
+            if (summary>0)
+                printf("View watch: %.0f s: changes level %" PRIu64 ", view %" PRIu64 ", count %" PRIu64 ", table %" PRIu64
+                       "; regions %u, table %#" PRIx64 ", bad entries seen %" PRIu64 "\n",
+                       t,changes[0],changes[1],changes[2],changes[3],count,tablep,bad);
+            summary=t;
+        }
+        const uint32_t n=count<4096 ? count : 4096;
+        if (!n) continue;
+        /* as the game's reader: under the view table lock (when installed), the table read afresh */
+        if (u1_view_lock_on) while (__atomic_exchange_n(&u1_view_lock.lock,1u,__ATOMIC_ACQUIRE)) usleep(50);
+        const int stale=u1_view_lock_on && __atomic_load_n(&u1_view_lock.stale,__ATOMIC_ACQUIRE);
+        int got=!stale && peek_guest(&tablep,view+0x10,8) && tablep && peek_guest(table,tablep,(size_t)n*48);
+        if (u1_view_lock_on) __atomic_store_n(&u1_view_lock.lock,0u,__ATOMIC_RELEASE);
+        if (stale) continue;
+        if (!tablep) continue;
+        if (!got) {
+            if (unreadable++<10) printf("View watch: %.3f s table %#" PRIx64 " (%u entries) unreadable\n",t,tablep,n);
+            continue;
+        }
+        for (uint32_t i=0;i<n;++i) {
+            const unsigned char *e=table+(size_t)i*48;
+            uint32_t flags; uint64_t bits;
+            memcpy(&flags,e+0xc,4); memcpy(&bits,e+0x20,8);
+            if (!(flags&2) || !(flags>>2) || (bits>=0x1000000000ull && bits<0x4000000000ull)) continue;
+            ++bad;
+            if (bad<=30 || !(bad&(bad-1))) {
+                char hex[48*3+1]; int p=0;
+                for (int b=0;b<48;++b) p+=snprintf(hex+p,sizeof(hex)-p,"%02x",e[b]);
+                printf("View watch: %.3f s bad entry %u of %u (#%" PRIu64 "): flags %#x bitset %#" PRIx64
+                       " table %#" PRIx64 ": %s\n",t,i,count,bad,flags,bits,tablep,hex);
+            }
+        }
     }
     return NULL;
 }
@@ -728,6 +1162,27 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
 }
+/* g2-arm64 diagnosis: BB_PATCH_SKIP=<offset>|<start>-<end>,...: the preset's writes at those
+ * image offsets (end exclusive) are left out - an A/B of one group of writes without another
+ * preset (issue #18: U1's job counter waits, 0x44a000-0x460000). */
+static int patch_skipped(uint64_t offset) {
+    const char *p=getenv("BB_PATCH_SKIP");
+    while (p && *p) {
+        char *end;
+        uint64_t start=strtoull(p,&end,0), stop;
+        if (end==p) break;
+        stop=start+1;
+        if (*end=='-') {
+            const char *q=end+1;
+            stop=strtoull(q,&end,0);
+            if (end==q) break;
+        }
+        if (offset>=start && offset<stop) return 1;
+        if (*end!=',') break;
+        p=end+1;
+    }
+    return 0;
+}
 /* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
  * function pointers): the patch holds the address at the patches' base, rebased here. */
@@ -735,12 +1190,13 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     FILE *f=fopen(path,"rb");
     char magic[8];
     if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"BBPATCH2",8)) fail("invalid patch file");
-    uint64_t base=read64(f), count=read64(f), bytes=0, rebased=0;
+    uint64_t base=read64(f), count=read64(f), bytes=0, rebased=0, skipped=0;
     unsigned char data[4096];
     for (uint64_t i=0;i<count;++i) {
         uint64_t offset=read64(f), length=read64(f);
         if (!length || length>sizeof(data) || !mapped(segments,ns,offset,length) || fread(data,1,length,f)!=length)
             fail("bad patch entry");
+        if (patch_skipped(offset)) { ++skipped; continue; }
         uint64_t slots[sizeof(data)/8]; size_t nslots=0;
         for (uint64_t r=0;r<nr;++r) {
             if (!(relocs[r].target<offset+length && offset<relocs[r].target+8)) continue;
@@ -764,6 +1220,7 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     const char *name=strrchr(path,'/'); /* g2-arm64: the file names the size (u1-960x540.bin) */
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased from %s\n",count,bytes,rebased,name ? name+1 : path);
+    if (skipped) printf("Patches: %" PRIu64 " writes left out (BB_PATCH_SKIP)\n",skipped);
 }
 /* BB_GUEST_HOOKS="offset:bytes,...,START-END": diagnostic call counters on guest functions.
  * The first `bytes` (>= 5, whole position-independent instructions) at each image offset move
@@ -1569,14 +2026,27 @@ static void patch_job_lock_wait(uint64_t image_size) {
  * its worker loop is identical, but its re-check loads the manager through r13 (not r15) and its
  * submit path tests rdi and jumps with a short je. A build that matches no set keeps spinning.
  * BB_JOB_SLEEP=0 keeps the spinning workers. */
+#ifdef __ANDROID__
+/* g2-arm64: U1's eboot (the entry of its node set job 0xa16aa0, as port 0143 checks it). */
+static int u1_image(uint64_t image_size) {
+    static const unsigned char entry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                          0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x18, 0x01, 0x00, 0x00};
+    return 0xa16aa0 - 0x400000 + sizeof(entry) <= image_size &&
+           !memcmp(image + 0xa16aa0 - 0x400000, entry, sizeof(entry));
+}
+#endif
 static void patch_job_sleep(uint64_t image_size) {
     const char *env=getenv("BB_JOB_SLEEP");
     if (env && env[0]=='0') { printf("Job workers: spin while idle (BB_JOB_SLEEP=0)\n"); return; }
 #ifdef __ANDROID__
     /* g2-arm64: off unless BB_JOB_SLEEP=1. On a phone's CPU the sleeping workers start jobs late
      * enough to outlive the frame memory they use: U3's particle jobs crashed within minutes,
-     * U2's navmesh queries and U1's loading end failed too (android/notes/findings.md, 2026-10-21). */
-    if (!env) { printf("Job workers: spin while idle (BB_JOB_SLEEP=1 lets them sleep)\n"); return; }
+     * U2's navmesh queries and U1's loading end failed too (android/notes/findings.md, 2026-10-21).
+     * U1 sleeps by default since 2026-11-02: its six spinning workers held six of the G2's eight
+     * cores, and the worker with the frame's job lost its core for tens of ms - hitches of 70-700 ms
+     * about every 15 s at the 30 FPS limit; asleep, 3 frames over 70 ms in 8 runs (none over 100),
+     * its loading end fine (the counter waits are robust since 5fe325c; findings 2026-11-02 night). */
+    if (!env && !u1_image(image_size)) { printf("Job workers: spin while idle (BB_JOB_SLEEP=1 lets them sleep)\n"); return; }
 #endif
 #ifdef _WIN32
     /* Sleeping workers free the cores of small CPUs, but cost ~8% in busy scenes on a 16-thread
@@ -1798,6 +2268,14 @@ int main(int argc, char **argv) {
         if (pthread_create(&peek_thread,NULL,peek_on_request,(void *)getenv("BB_PEEK_FILE"))==0)
             pthread_detach(peek_thread);
     }
+    if (getenv("BB_U1_VIEW_WATCH") && atoi(getenv("BB_U1_VIEW_WATCH"))>0) {
+        pthread_t watch_thread;
+        if (pthread_create(&watch_thread,NULL,u1_view_watch,NULL)==0) pthread_detach(watch_thread);
+    }
+    if (getenv("BB_U1_FRAME_WATCH") && atoi(getenv("BB_U1_FRAME_WATCH"))>0) {
+        pthread_t frame_thread;
+        if (pthread_create(&frame_thread,NULL,u1_frame_watch,NULL)==0) pthread_detach(frame_thread);
+    }
 #endif
     FILE *f = fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");
@@ -1975,6 +2453,11 @@ int main(int argc, char **argv) {
         patch_job_sleep(image_end);
         install_counter_log(image_end);
         install_counter_quarantine(image_end);
+#ifndef _WIN32
+        install_u1_view_lock(image_end);
+        install_u1_set_job_guard(image_end);
+        install_u1_dt_smooth(image_end);
+#endif
         patch_job_lock_wait(image_end);
         runtime_display_patch(image, image_end);
     }

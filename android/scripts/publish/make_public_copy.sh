@@ -11,8 +11,8 @@
 # - MERGED=<commit>: an upstream commit our main has merged (uncharted_pc 0.3.9: 754ed2a) becomes
 #   the release commit's second parent, so the public history carries upstream's commits up to it
 #   with their authors (the same hashes as on GitHub). Left out when the parent already has it.
-# - The tree: SRC's main (default: the WSL working copy) without CLAUDE.md, android/docs/ and
-#   android/notes/ (the development notes) and any extra PATHS (space separated). Dropped as well:
+# - The tree: SRC's main (default: the WSL working copy) without CLAUDE.md, .claude/ (the skills),
+#   android/docs/ and android/notes/ (the development notes) and any extra PATHS (space separated). Dropped as well:
 #   the "Date:" lines of our patch files (git format-patch; the time zone tells where the author
 #   lives) and the commit column of the port's change list (patches/README.md: those commits stay
 #   private).
@@ -44,7 +44,7 @@ if [ -n "${PREVIOUS:-}" ]; then
 fi
 git checkout -q --detach "$PARENT"
 git read-tree -u --reset "$TREE"
-git rm -r -q -f --ignore-unmatch -- CLAUDE.md android/docs android/notes ${PATHS:-}
+git rm -r -q -f --ignore-unmatch -- CLAUDE.md .claude android/docs android/notes ${PATHS:-}
 
 python3 -I - "${REPLACE:-}" <<'EOF'
 import os, subprocess, sys
@@ -128,7 +128,7 @@ git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objec
 echo "== Expected bytes in patch XML (should be none)"
 git grep -l 'Expected="' HEAD -- '*.xml' || echo none
 echo "== development notes (should be none)"
-git ls-tree -r --name-only HEAD | grep -E '^(CLAUDE\.md|android/(docs|notes)/)' || echo none
+git ls-tree -r --name-only HEAD | grep -E '^(CLAUDE\.md|\.claude/|android/(docs|notes)/)' || echo none
 echo "== personal-looking lines added by our commit (check each)"
 patterns=('/home/[a-z][a-z0-9_-]*/' '[A-Za-z]:\\Users\\' '/Users/[A-Za-z]' '192\.168\.[0-9]' '10\.[0-9]+\.[0-9]+\.[0-9]+:'
           '[A-Za-z0-9._%+-]+@(gmail|yandex|mail|outlook|hotmail|icloud|proton)[A-Za-z.]*')

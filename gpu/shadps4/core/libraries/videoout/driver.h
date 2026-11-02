@@ -127,6 +127,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        s64 queued_ns; ///< g2-arm64: BB_PRESENT_TRACE: when it was queued (CLOCK_MONOTONIC)
 
         operator bool() const noexcept {
             return frame != nullptr;

@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <unistd.h>
 typedef struct { int type; } GuestAttr;
 typedef struct { pthread_mutex_t native; } GuestMutex;
 static size_t created, locks, unlocks;
@@ -162,12 +163,37 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     ++waits;
     return orbis_error(pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
 }
+/* g2-arm64 diagnosis: BB_USLEEP_STATS=1 also reports the guest's timed condition variable waits
+ * that last over 30 ms: the thread, the variable, the timeout asked, whether it timed out, the guest
+ * stack (U1's game-side stalls, findings 2026-11-01 evening: a job worker asleep on a condition
+ * variable for 50-110 ms while the frame waited). */
+static int cond_stats_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("BB_USLEEP_STATS"); on = e && e[0] == '1'; }
+    return on;
+}
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
-    return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
+    if (!cond_stats_on()) return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
+    struct timespec a, b, real;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    clock_gettime(CLOCK_REALTIME, &real);
+    const int r = pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    const double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+    if (ms > 30.0) {
+        const double asked = (end->tv_sec - real.tv_sec) * 1e3 + (end->tv_nsec - real.tv_nsec) / 1e6;
+        char name[16] = "", stack[400] = "";
+        pthread_getname_np(pthread_self(), name, sizeof(name));
+        if (!guest_cpu_describe_stack(stack, sizeof(stack))) stack[0] = 0;
+        printf("Long cond wait: thread %d %s, cond %p, %.0f ms of %.0f ms asked, %s;%s\n", (int)gettid(), name,
+               (void *)cond, ms, asked, r == ETIMEDOUT ? "timed out" : "woken", stack);
+        fflush(stdout);
+    }
+    return timed_error(r);
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     struct timespec end;

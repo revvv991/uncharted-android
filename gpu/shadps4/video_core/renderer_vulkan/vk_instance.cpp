@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "bbport_present_pacing.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -378,6 +379,12 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+#ifdef __ANDROID__
+    // g2-arm64: BB_PRESENT_PACING (bbport_present_pacing.h): Android's libvulkan takes desired
+    // present times and reports the vsyncs the frames went out on.
+    display_timing =
+        BbPresentPacing::Mode() != 0 && add_extension(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+#endif
     // bbport: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     // bbport: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).

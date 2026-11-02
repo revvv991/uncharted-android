@@ -161,23 +161,32 @@ public:
         return on_processor_thread;
     }
 
-    template <bool wait_done = false>
+    /// g2-arm64: `in_order`: the command may run on the draw recording thread, in order with
+    /// the draws, instead of the command thread draining the draw pipe for it
+    /// (ProcessCommands). For work that needs the caches and the GPU writes recorded so far,
+    /// nothing of the command thread's own state.
+    struct Command {
+        Common::UniqueFunction<void> func;
+        bool in_order = false;
+    };
+    template <bool wait_done = false, bool in_order = false>
     void SendCommand(auto&& func) {
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
                 std::scoped_lock lk{submit_mutex};
-                command_queue.emplace([&sem, &func] {
-                    func();
-                    sem.release();
-                });
+                command_queue.push(Command{[&sem, &func] {
+                                               func();
+                                               sem.release();
+                                           },
+                                           in_order});
                 ++num_commands;
                 submit_cv.notify_one();
             }
             sem.acquire();
         } else {
             std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
+            command_queue.push(Command{std::forward<decltype(func)>(func), in_order});
             ++num_commands;
             submit_cv.notify_one();
         }
@@ -317,7 +326,7 @@ private:
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
-    std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::queue<Command> command_queue{};
     static inline thread_local bool on_processor_thread = false;
     std::thread::id gpu_id;
 #if defined(__linux__) || defined(_WIN32)

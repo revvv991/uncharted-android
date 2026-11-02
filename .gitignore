@@ -43,3 +43,6 @@ CUSA*/
 *.dmp
 # g2-arm64: the launcher icon (drawn by icon.py, issue #4) is not a screenshot
 !android/scripts/g2/game_app/res/**/*.png
+
+# The G2 over Wi-Fi: its address is personal (read by android/scripts/g2/runs/g2.sh)
+android/scripts/g2/device.txt

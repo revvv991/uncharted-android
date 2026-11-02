@@ -231,6 +231,33 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
+namespace {
+// g2-arm64: a guest write fault on a page holding GPU data is resolved (read back, merged or
+// dropped: BufferCache::InvalidateMemory) by a command on this thread, which drained the draw
+// pipe for each: U3's museum pays ~250 drains a second for them, 10.8% of this thread's time,
+// and the pipe loses its depth every time. The resolution needs the caches and the GPU writes
+// recorded so far - the draw recording thread's state while the pipe runs - and nothing of
+// this thread's: it goes down the pipe as an ordered task and runs there at the same point
+// of the stream (everything handed over before it recorded, nothing after), the faulting
+// thread waiting as before, this thread not. Off by default (0131): with the other two
+// barriers gone as well the frame got no shorter in U3's museum or U1's statue garden
+// (interleaved A/Bs, 2026-10-31) - the recording thread's tail bounds it; BB_ORDERED_FAULTS=1
+// turns it on for the day that tail is fixed.
+bool OrderedCommandsEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_ORDERED_FAULTS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void RunOrderedCommand(Vulkan::Rasterizer&, const u8* data) {
+    auto* command = *reinterpret_cast<Common::UniqueFunction<void>* const*>(data);
+    (*command)();
+    delete command;
+}
+} // namespace
+
 void Liverpool::ProcessCommands() {
     // bbport: commands touch the caches and record into the draw scheduler, so the draw
     // recording thread has to be idle first. A command queued after the check used to run
@@ -238,19 +265,30 @@ void Liverpool::ProcessCommands() {
     if (!num_commands) {
         return;
     }
-    if (rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
-    }
+    // g2-arm64: the ordered commands ride the draw pipe (RunOrderedCommand); a plain command
+    // after one drains again, so the order between them holds.
+    bool drained = false;
     // Process incoming commands with high priority
     while (num_commands) {
-        Common::UniqueFunction<void> callback{};
+        Command command{};
         {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
+            command = std::move(command_queue.front());
             command_queue.pop();
             --num_commands;
         }
-        callback();
+        if (command.in_order && rasterizer && OrderedCommandsEnabled()) {
+            auto* heap = new Common::UniqueFunction<void>(std::move(command.func));
+            if (rasterizer->RunInOrder(&RunOrderedCommand, &heap, sizeof(heap))) {
+                drained = false; // the pipe holds it now
+            }
+            continue;
+        }
+        if (rasterizer && !drained) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+            drained = true;
+        }
+        command.func();
     }
 }
 
@@ -488,6 +526,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
         // g2-arm64 diagnosis: BB_IDLE_STATS (a frame end: decoded, flushed, drained, signaled).
         const bool frame_end = submit_done && IdleStatsOn();
+        const bool frame_retired = submit_done; // g2-arm64: this round retires the frame below
         const u64 t_decoded = frame_end ? SteadyNs() : 0;
         u64 t_flushed = t_decoded, t_piped = t_decoded, t_submitted = t_decoded;
         const u64 pending = frame_end && rasterizer ? rasterizer->DrawPipePending() : 0;
@@ -514,6 +553,23 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
+        // g2-arm64: the queue runs dry a dozen times a frame while the guest still builds the
+        // frame (U3's museum: 382 of these drains a second waited, 7% of this thread, the pipe
+        // emptied each time). Nobody waits for GPU idle in the middle of a frame: the guest's
+        // lock (gnmdriver submission_lock) is taken at sceGnmSubmitDone, which wakes this
+        // loop (submit_done) and retires the frame here with the drains. So with the pipe
+        // still busy and no SubmitDone handled this round, the work stays unretired
+        // (work_retired false since the submission), nothing is signaled, and this thread goes
+        // back to waiting for the next submission while the recording thread works on.
+        // Off by default (0131, see OrderedCommandsEnabled): BB_LAZY_RETIRE=1 turns it on.
+        static const bool lazy_retire = [] {
+            const char* env = std::getenv("BB_LAZY_RETIRE");
+            return env && env[0] == '1';
+        }();
+        if (lazy_retire && !frame_retired && rasterizer && !rasterizer->DrawPipeIdle()) {
+            BbStats::lazy_retires.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         u64 t_drained = 0;
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);

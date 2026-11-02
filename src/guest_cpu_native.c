@@ -38,6 +38,7 @@ int guest_context_set(const GuestContext *in) { (void)in; return 0; }
 int guest_cpu_describe_thread(char *out, size_t size) { (void)out; (void)size; return 0; }
 int guest_cpu_describe_stack(char *out, size_t size) { (void)out; (void)size; return 0; }
 int guest_cpu_describe_registers(char *out, size_t size) { (void)out; (void)size; return 0; }
+int guest_cpu_describe_fault(char *out, size_t size, const void *context) { (void)out; (void)size; (void)context; return 0; }
 uint64_t guest_cpu_guest_rsp(void) { return 0; }
 void guest_cpu_hle_trace_save(void) {}
 #endif

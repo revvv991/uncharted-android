@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -121,8 +122,118 @@ static int sleep_ns(uint64_t ns) {
 #endif
     return 0;
 }
+/* g2-arm64 diagnosis: BB_USLEEP_STATS=1 - the guest's usleep calls by caller (the return address
+ * on the guest stack): calls, the time asked and the time slept, the longest sleep; a line per
+ * caller every 5 s. U1's game-side stalls (findings 2026-11-01 evening) showed the job worker the
+ * frame waited for asleep in nanosleep under kernel_usleep while the others spun idle. */
+#ifndef _WIN32
+#define USLEEP_CALLERS 16
+static struct { uint64_t caller, calls, asked_us, slept_ns, longest_ns; char thread[16]; } usleep_stats[USLEEP_CALLERS];
+static pthread_mutex_t usleep_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t usleep_stats_window;
+static int usleep_stats_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("BB_USLEEP_STATS"); on = e && e[0] == '1'; }
+    return on;
+}
+static void usleep_stats_note(uint64_t caller, uint32_t usec, uint64_t slept) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t now_ns = (uint64_t)now.tv_sec*1000000000+(uint64_t)now.tv_nsec;
+    pthread_mutex_lock(&usleep_stats_lock);
+    int slot = -1;
+    for (int i = 0; i < USLEEP_CALLERS; ++i)
+        if (usleep_stats[i].caller == caller || !usleep_stats[i].caller) { slot = i; break; }
+    if (slot >= 0) {
+        if (!usleep_stats[slot].caller) pthread_getname_np(pthread_self(), usleep_stats[slot].thread, sizeof(usleep_stats[slot].thread));
+        usleep_stats[slot].caller = caller;
+        usleep_stats[slot].calls++;
+        usleep_stats[slot].asked_us += usec;
+        usleep_stats[slot].slept_ns += slept;
+        if (slept > usleep_stats[slot].longest_ns) usleep_stats[slot].longest_ns = slept;
+    }
+    if (!usleep_stats_window) usleep_stats_window = now_ns;
+    if (now_ns - usleep_stats_window >= 5000000000ull) {
+        const double secs = (now_ns - usleep_stats_window) / 1e9;
+        for (int i = 0; i < USLEEP_CALLERS && usleep_stats[i].caller; ++i) {
+            if (!usleep_stats[i].calls) continue;
+            printf("Usleep over %.1f s: caller %#" PRIx64 " (%s): %" PRIu64 " calls, asked %.0f us, slept %.0f us each, "
+                   "the longest %.1f ms\n", secs, usleep_stats[i].caller, usleep_stats[i].thread, usleep_stats[i].calls,
+                   (double)usleep_stats[i].asked_us / usleep_stats[i].calls,
+                   usleep_stats[i].slept_ns / 1e3 / usleep_stats[i].calls, usleep_stats[i].longest_ns / 1e6);
+            usleep_stats[i].calls = usleep_stats[i].asked_us = usleep_stats[i].slept_ns = usleep_stats[i].longest_ns = 0;
+        }
+        fflush(stdout);
+        usleep_stats_window = now_ns;
+    }
+    pthread_mutex_unlock(&usleep_stats_lock);
+}
+/* U1's WaitForCounter polls with usleep(1000) off a fiber (the call returns to 0x84aa2a; the
+ * counter in r15, the target in r14, the mode in rbx: 1 "<=", 0 "=="). An episode of polls less
+ * than 5 ms apart that lasts past 30 ms is reported when it ends: its length, the counters polled
+ * (value and target at the first and the last poll of each) and the guest stack at its start. */
+#define WAIT_COUNTERS 4
+static __thread struct {
+    uint64_t start_ns, last_ns, polls;
+    struct { uint64_t counter; int64_t first, last, target; uint64_t mode; } c[WAIT_COUNTERS];
+    int n;
+    char stack[400];
+} wait_ep;
+static void wait_episode_end(void) {
+    const double ms = (wait_ep.last_ns - wait_ep.start_ns) / 1e6 + 1.0;
+    if (ms > 30.0 && wait_ep.polls) {
+        char text[512];
+        size_t at = 0;
+        for (int i = 0; i < wait_ep.n && at < sizeof(text) - 96; ++i)
+            at += (size_t)snprintf(text + at, sizeof(text) - at, " %#" PRIx64 " %" PRId64 "->%" PRId64 " (target %" PRId64 ", mode %" PRIu64 ")",
+                                   wait_ep.c[i].counter, wait_ep.c[i].first, wait_ep.c[i].last, wait_ep.c[i].target, wait_ep.c[i].mode);
+        text[at] = 0;
+        printf("Long counter wait: thread %d, %.0f ms, %" PRIu64 " polls; counters%s;%s\n", (int)gettid(), ms, wait_ep.polls,
+               text, wait_ep.stack);
+        fflush(stdout);
+    }
+    wait_ep.polls = 0;
+    wait_ep.n = 0;
+}
+static void counter_wait_note(uint64_t now_ns) {
+    GuestContext g;
+    if (!guest_context_get(&g)) return;
+    if (wait_ep.polls && now_ns - wait_ep.last_ns > 5000000) wait_episode_end();
+    if (!wait_ep.polls) {
+        wait_ep.start_ns = now_ns;
+        if (!guest_cpu_describe_stack(wait_ep.stack, sizeof(wait_ep.stack))) wait_ep.stack[0] = 0;
+    }
+    wait_ep.last_ns = now_ns;
+    wait_ep.polls++;
+    const uint64_t counter = g.gpr[GUEST_R15];
+    const int64_t value = ((const int64_t *)(uintptr_t)counter)[4];
+    int i = 0;
+    while (i < wait_ep.n && wait_ep.c[i].counter != counter) ++i;
+    if (i == wait_ep.n && wait_ep.n < WAIT_COUNTERS) {
+        wait_ep.c[i].counter = counter;
+        wait_ep.c[i].first = value;
+        wait_ep.c[i].target = (int64_t)g.gpr[GUEST_R14];
+        wait_ep.c[i].mode = g.gpr[GUEST_RBX];
+        wait_ep.n++;
+    }
+    if (i < wait_ep.n) wait_ep.c[i].last = value;
+}
+static int32_t usleep_noted(uint32_t usec) {
+    if (!usleep_stats_on()) { sleep_ns((uint64_t)usec*1000); return 0; }
+    const uint64_t rsp = guest_cpu_guest_rsp();
+    const uint64_t caller = rsp ? *(const uint64_t *)(uintptr_t)rsp : 0;
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    if (caller == 0x84aa2a) counter_wait_note((uint64_t)a.tv_sec*1000000000+(uint64_t)a.tv_nsec);
+    sleep_ns((uint64_t)usec*1000);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    usleep_stats_note(caller, usec, (uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec));
+    return 0;
+}
+static ABI int32_t kernel_usleep(uint32_t usec) { return usleep_noted(usec); }
+static ABI int32_t posix_usleep(uint32_t usec) { return usleep_noted(usec); }
+#else
 static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
 static ABI int32_t posix_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
+#endif
 static ABI uint32_t posix_sleep(uint32_t seconds) { sleep_ns((uint64_t)seconds*1000000000); return 0; }
 static ABI int32_t posix_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
     if (!rq || rq->nsec<0 || rq->nsec>=1000000000 || rq->sec<0) return fail_posix(EINVAL);

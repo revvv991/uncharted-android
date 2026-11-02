@@ -2,15 +2,19 @@ package dev.unchartedg2.game;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.Process;
 import android.system.Os;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import org.libsdl.app.SDLActivity;
@@ -153,6 +157,32 @@ public class GameActivity extends SDLActivity {
             throw new RuntimeException(e);
         }
         super.onCreate(savedInstanceState);
+        // The middle of the right edge, where the swipe that opens the panel starts, is kept from
+        // the system's back gesture (Android allows at most 200 dp of an edge).
+        getWindow().getDecorView().addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            float dp = getResources().getDisplayMetrics().density;
+            int width = r - l, height = b - t;
+            int edge = Math.max(Math.round(width * 0.04f), Math.round(24 * dp));
+            int half = Math.round(100 * dp);
+            v.setSystemGestureExclusionRects(Collections.singletonList(
+                    new Rect(width - edge, height / 2 - half, width, height / 2 + half)));
+        });
+    }
+
+    /** Issues #24 and #11: SDL hides the system bars once, when the port creates its window; a game
+     *  started again in a new process (U2 or U3 from the collection's menu: Restart below) kept the
+     *  status bar on some devices (Retroid Pocket 6, AYN Thor Max), and with the bars shown the
+     *  back gesture took the swipe in from the right edge that opens the panel. Hidden again here
+     *  whenever the window gets the focus. */
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (!hasFocus) return;
+        WindowInsetsController bars = getWindow().getDecorView().getWindowInsetsController();
+        if (bars != null) {
+            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            bars.hide(WindowInsets.Type.systemBars());
+        }
     }
 
     @Override

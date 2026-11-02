@@ -24,6 +24,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "bbport_present_pacing.h"
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -2316,8 +2317,14 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u64 frame = 0;
     s32 result;
     {
+        // g2-arm64: BB_PRESENT_TRACE: the guest's flip and its wait for the lock and the idle.
+        const s64 bb_guest_ns = BbPresentPacing::Trace() ? BbPresentPacing::NowNs() : 0;
         std::scoped_lock lk{m_submit_lock};
         WaitGpuIdle();
+        if (bb_guest_ns) {
+            BbPresentPacing::NoteGuestFlip(flip_arg, bb_guest_ns,
+                                           BbPresentPacing::NowNs() - bb_guest_ns);
+        }
 
         const s32 patch_result = PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode,
                                                   flip_arg, nullptr /*unk*/);

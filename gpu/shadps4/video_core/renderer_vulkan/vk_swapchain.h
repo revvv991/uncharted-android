@@ -42,8 +42,9 @@ public:
         return acquire_timed_out;
     }
 
-    /// Presents the current image and move to the next one
-    bool Present();
+    /// Presents the current image and move to the next one. g2-arm64: with display timing
+    /// (BB_PRESENT_PACING) a desired present time (CLOCK_MONOTONIC ns, 0 = at once).
+    bool Present(s64 desired_present_ns = 0, const s64* trace = nullptr, s64 trace_arg = 0);
 
     vk::SurfaceKHR GetSurface() const {
         return surface;
@@ -136,6 +137,10 @@ private:
     /// Creates the image acquired and present ready semaphores
     void RefreshSemaphores();
 
+    /// g2-arm64: BB_PRESENT_PACING: the vsyncs of the frames SurfaceFlinger has shown since the
+    /// last call (bbport_present_pacing.h).
+    void NotePresentTimes();
+
 private:
     const Instance& instance;
     const Frontend::WindowSDL& window;
@@ -161,6 +166,8 @@ private:
     void* surface_window = nullptr; ///< g2-arm64: the native window the surface was made from
     bool surface_lost = false;      ///< g2-arm64: no usable surface or swapchain until a new one
     bool acquire_timed_out = false;
+    bool present_timing = false; ///< g2-arm64: presents carry IDs and desired times
+    u32 present_id = 0;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
 };

@@ -11,6 +11,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_owner_wait.h"
+#include "bbport_submit_stats.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -321,8 +322,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     runtime.SetImageAccessHook(&JoinBindHelper, this);
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         FlushSkinBatchForSubmit(); // g2-arm64
+        BbSubmitStats::StepHere("skin batch"); // g2-arm64 diagnosis: BB_SUBMIT_STATS
         runtime.FlushBarriers();
+        BbSubmitStats::StepHere("barriers");
         buffer_cache.SubmitPendingArenaBinds(info);
+        BbSubmitStats::StepHere("arena binds");
     });
     scheduler.SetQueueWorkCheck([this] { return buffer_cache.HasPendingArenaBinds(); });
     static Rasterizer* busy_check;
@@ -637,6 +641,7 @@ struct DrawPacket {
     u16 num_blocks;
     u32 num_stages;
     u32 verify;
+    u32 flags; ///< g2-arm64: 1 - the dispatch's scalar copy was made in guest memory on stage A
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
     AmdGpu::CbDbExtent db_extent;
     u64 ring_end; ///< constant ring position after this packet's copies
@@ -757,6 +762,95 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
     pending_writes.push_back({address, end, position});
     pending_min = std::min(pending_min, address);
     pending_max = std::max(pending_max, end);
+}
+
+void Rasterizer::NotePendingGuestRead(VAddr address, u64 size) {
+    if (!draw_pipe || !size) {
+        return;
+    }
+    const VAddr end = address + size;
+    const u64 position = draw_pipe->Head();
+    // Now and then drop the entries of packets the recording thread has run (a scene without
+    // scalar copies never checks them, and the deque would grow with every packet).
+    if ((++pending_read_notes & 63) == 0) {
+        while (!pending_reads.empty() && draw_pipe->Reached(pending_reads.front().position + 1)) {
+            pending_reads.pop_front();
+        }
+    }
+    // The ranges of one packet overlap and abut (a pipeline's buffers): the last entry grows.
+    if (!pending_reads.empty()) {
+        auto& last = pending_reads.back();
+        if (last.position == position && address <= last.end && last.begin <= end) {
+            last.begin = std::min(last.begin, address);
+            last.end = std::max(last.end, end);
+            return;
+        }
+    }
+    pending_reads.push_back({address, end, position});
+}
+
+void Rasterizer::NoteGuestReads(const Shader::Info& stage, const PreparedDraw* prepared) {
+    if (!draw_pipe) {
+        return;
+    }
+    const PreparedStage* prepared_stage = nullptr;
+    if (prepared && !BbToggle::Disabled(BbToggle::PreparedResources)) {
+        for (u32 i = 0; i < prepared->num_stages; ++i) {
+            const auto& candidate = prepared->stages[i];
+            if (&candidate.program->info == &stage &&
+                candidate.num_buffers == stage.buffers.size()) {
+                prepared_stage = &candidate;
+                break;
+            }
+        }
+    }
+    // Every buffer read: the streamed ones (CollectRingBindings) are copied here and now and
+    // need no entry, but noting them too only costs a drain a copy would have taken anyway.
+    for (u32 index = 0; index < stage.buffers.size(); ++index) {
+        const auto& desc = stage.buffers[index];
+        if (desc.IsSpecial() || desc.is_written) {
+            continue;
+        }
+        const auto vsharp = prepared_stage ? prepared_stage->buffer_sharps[index]
+                                           : desc.GetSharp(stage);
+        const VAddr address = vsharp.base_address;
+        if (address == 0 || vsharp.GetSize() == 0) {
+            continue;
+        }
+        NotePendingGuestRead(address, memory->ClampRangeSize(address, vsharp.GetSize()));
+    }
+    // Images are uploaded from guest memory when first bound: an upper bound of their bytes
+    // (pitch x height x slices x 16 bytes, half again for the mips; the exact size needs the
+    // tiling). Too large only costs a drain.
+    for (u32 index = 0; index < stage.images.size(); ++index) {
+        const auto tsharp = prepared_stage ? prepared_stage->image_sharps[index]
+                                           : stage.images[index].GetSharp(stage);
+        const VAddr address = tsharp.Address();
+        if (address == 0 || !tsharp.Valid()) {
+            continue;
+        }
+        u64 bound = u64(tsharp.Pitch()) * (u64(tsharp.height) + 1) *
+                    std::max<u64>(tsharp.NumLayers(), u64(tsharp.depth) + 1) * 16;
+        bound += bound / 2;
+        NotePendingGuestRead(address, memory->ClampRangeSize(address, bound));
+    }
+}
+
+bool Rasterizer::PendingGuestRead(VAddr address, u64 size) {
+    if (!draw_pipe) {
+        return false;
+    }
+    // Entries of packets the recording thread has run (the position after them consumed).
+    while (!pending_reads.empty() && draw_pipe->Reached(pending_reads.front().position + 1)) {
+        pending_reads.pop_front();
+    }
+    const VAddr end = address + size;
+    for (const auto& read : pending_reads) {
+        if (address < read.end && read.begin < end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
@@ -1056,7 +1150,11 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         }
         const u64 size = memory->ClampRangeSize(address, vsharp.GetSize());
         if (desc.is_written) {
-            NotePendingGpuWrite(address, size);
+            // g2-arm64: the GPU copy of a scalar copy made ahead (ScalarCopyAheadHLE) writes
+            // the bytes guest memory holds already: the constants it fills stream as before.
+            if (!scalar_copy_ahead) {
+                NotePendingGpuWrite(address, size);
+            }
             continue;
         }
         // The stream path of BufferCache::ObtainBuffer, taken here: small, read-only, not
@@ -1140,6 +1238,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         if (stage) {
             auto& ring = rings[num_stages];
             ring.clear();
+            NoteGuestReads(*stage, used_prepared);
             if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing)) {
                 CollectRingBindings(*stage, used_prepared, ring);
             }
@@ -1155,6 +1254,17 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     if (indirect) {
         size += AlignPacket(sizeof(IndirectDraw));
+        NotePendingGuestRead(indirect->args,
+                             u64(indirect->stride) * std::max<u32>(indirect->max_count, 1));
+        if (indirect->count) {
+            NotePendingGuestRead(indirect->count, sizeof(u32));
+        }
+    }
+    if (is_indexed) {
+        // Bound from guest memory when the recording thread records the draw (4 bytes an index
+        // at most; the exact size is in the index type).
+        NotePendingGuestRead(liverpool->regs.index_base_address.Address<VAddr>(),
+                             u64(liverpool->regs.num_indices) * sizeof(u32));
     }
     const u32 interval = VerifyInterval();
     const bool verify = interval && (draw_pipe->packets % interval) == 0;
@@ -1177,6 +1287,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     packet.num_blocks = static_cast<u16>(num_blocks);
     packet.num_stages = num_stages;
     packet.verify = verify;
+    packet.flags = scalar_copy_ahead ? 1u : 0u;
     packet.cb_extent = liverpool->last_cb_extent;
     packet.db_extent = liverpool->last_db_extent;
     packet.ring_end = constant_ring ? constant_ring->Position() : 0;
@@ -1512,12 +1623,14 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         self.FilterDraw();
     } else if (cs) {
         self.stage_cs = cs;
+        self.scalar_copy_guest_done = (packet.flags & 1u) != 0;
         const auto* pipeline = static_cast<const ComputePipeline*>(packet.pipeline);
         if (indirect) {
             self.DispatchIndirectRecord(pipeline, indirect->args, indirect->stride);
         } else {
             self.DispatchRecord(pipeline);
         }
+        self.scalar_copy_guest_done = false;
         self.stage_cs = nullptr;
     } else if (indirect) {
         self.DrawIndirectRecord(static_cast<const GraphicsPipeline*>(packet.pipeline),
@@ -2796,6 +2909,15 @@ void Rasterizer::DispatchDirect() {
             PostDraw(pipeline, nullptr, false, 0, &CsRegs());
             return;
         }
+        // g2-arm64: a copy from guest memory, made here and now when nothing handed over
+        // still reads or writes its ranges; the cache work and the GPU copy follow down the
+        // pipe (the packet flagged: the recording thread's HLE skips the guest copy).
+        if (ScalarCopyAheadHLE(cs, CsRegs(), *this)) {
+            scalar_copy_ahead = true;
+            PostDraw(pipeline, nullptr, false, 0, &CsRegs());
+            scalar_copy_ahead = false;
+            return;
+        }
     }
     DrainDrawPipe();
     DispatchRecord(pipeline);
@@ -3156,10 +3278,13 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
 }
 
 u64 Rasterizer::Flush() {
+    BbSubmitStats::Steps steps{"rasterizer flush"}; // g2-arm64 diagnosis: BB_SUBMIT_STATS
     DrainDrawPipe();
+    steps.Step("drain");
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
+    steps.Step("scheduler flush");
     return current_tick;
 }
 

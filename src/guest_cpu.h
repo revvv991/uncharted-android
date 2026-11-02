@@ -54,6 +54,10 @@ int guest_cpu_describe_stack(char *out, size_t size);
 /* g2-arm64: crash reports: all 16 guest registers (the state of the last host function call, or of
  * the last sync in guest code) and 256 bytes of guest memory at rbx; the guest rsp. */
 int guest_cpu_describe_registers(char *out, size_t size);
+/* g2-arm64: crash reports, a fault in translated code (context: the signal's ucontext): the guest
+ * instruction, the guest registers as they were, the frame chain through rbp, the live stack and
+ * memory at the registers that point into guest memory. 0 when the pc is not in translated code. */
+int guest_cpu_describe_fault(char *out, size_t size, const void *context);
 uint64_t guest_cpu_guest_rsp(void);
 /* g2-arm64: BB_HLE_TRACE_RING=1: writes the host function trace's last calls (the stall report
  * calls it once); nothing otherwise. */

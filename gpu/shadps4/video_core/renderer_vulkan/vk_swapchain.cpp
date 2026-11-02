@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include "bbport_present_pacing.h"
 #include "bbport_settings.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -93,6 +94,29 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetupImages();
     RefreshSemaphores();
+
+    // g2-arm64: BB_PRESENT_PACING (bbport_present_pacing.h): the display's refresh period.
+    present_timing = instance.IsDisplayTimingSupported();
+    if (present_timing) {
+        VkRefreshCycleDurationGOOGLE cycle{};
+        if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetRefreshCycleDurationGOOGLE(
+                static_cast<VkDevice>(instance.GetDevice()), static_cast<VkSwapchainKHR>(swapchain),
+                &cycle) == VK_SUCCESS &&
+            cycle.refreshDuration > 0) {
+            BbPresentPacing::refresh_ns.store(s64(cycle.refreshDuration), std::memory_order_relaxed);
+        }
+        static bool told = false;
+        if (!told) {
+            told = true;
+            std::printf("Present pacing: %s, refresh %.3f ms, %u images, a request taken %.1f ms "
+                        "before its vsync to start (%s, at most %.1f; a late one at least %.1f)\n",
+                        BbPresentPacing::Mode() == 1 ? "on" : "statistics only",
+                        BbPresentPacing::refresh_ns.load(std::memory_order_relaxed) / 1e6,
+                        image_count, BbPresentPacing::Lead() / 1e6,
+                        BbPresentPacing::Adapt() ? "adapting" : "fixed",
+                        BbPresentPacing::LeadMax() / 1e6, BbPresentPacing::LeadMin() / 1e6);
+        }
+    }
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
@@ -170,15 +194,32 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
-bool Swapchain::Present() {
-    const vk::PresentInfoKHR present_info = {
+bool Swapchain::Present(s64 desired_present_ns, const s64* trace, s64 trace_arg) {
+    vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &image_index,
     };
+    // g2-arm64: BB_PRESENT_PACING: every present carries an ID (its vsync comes back in the past
+    // presentation timings), a paced one its desired present time.
+    const vk::PresentTimeGOOGLE present_time{
+        .presentID = ++present_id,
+        .desiredPresentTime = u64(std::max<s64>(desired_present_ns, 0)),
+    };
+    const vk::PresentTimesInfoGOOGLE present_times{
+        .swapchainCount = 1,
+        .pTimes = &present_time,
+    };
+    if (present_timing) {
+        present_info.pNext = &present_times;
+    }
 
+    // g2-arm64: BB_PRESENT_TRACE: the frame's times so far, kept until it is shown.
+    if (trace && present_timing) {
+        BbPresentPacing::NotePresented(present_id, trace_arg, trace, BbPresentPacing::NowNs());
+    }
     auto result = instance.GetPresentQueue().presentKHR(present_info);
 #ifdef __ANDROID__
     if (result == vk::Result::eSuboptimalKHR) {
@@ -198,8 +239,27 @@ bool Swapchain::Present() {
     }
 
     frame_index = (frame_index + 1) % image_count;
+    NotePresentTimes();
 
     return !needs_recreation;
+}
+
+void Swapchain::NotePresentTimes() {
+    if (!present_timing || !swapchain) {
+        return;
+    }
+    std::array<VkPastPresentationTimingGOOGLE, 16> past{};
+    u32 count = u32(past.size());
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPastPresentationTimingGOOGLE(
+        static_cast<VkDevice>(instance.GetDevice()), static_cast<VkSwapchainKHR>(swapchain), &count,
+        past.data());
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        BbPresentPacing::NoteShown(past[i].presentID, s64(past[i].desiredPresentTime),
+                                   s64(past[i].actualPresentTime), s64(past[i].presentMargin));
+    }
 }
 
 bool Swapchain::SurfaceReady() {

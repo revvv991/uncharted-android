@@ -1050,7 +1050,8 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
                 liverpool->SendCommand(std::forward<decltype(command)>(command));
             });
         } else {
-            liverpool->SendCommand<true>(std::move(resolve));
+            // g2-arm64: in order on the draw recording thread (Liverpool::ProcessCommands).
+            liverpool->SendCommand<true, true>(std::move(resolve));
         }
     });
 }
