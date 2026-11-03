@@ -1000,8 +1000,15 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
         }();
         const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
         const u64 length = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
+        // g2-arm64: a helper thread's fault (the recording thread's fence label, a copy thread's
+        // write) is resolved while the helper waits for it, so the resolution must not wait for
+        // the GPU: a read back (Finish -> SyncRecording, the host copies) or a submitted tick
+        // (the recording thread submits it) would wait for the helper itself. With accurate GPU
+        // memory (BB_GPU_MERGE=0, U2's default) U3's market hung so at loading (findings
+        // 2026-11-04); a helper's fault merges, as the default does.
+        const bool helper = BbOwnerWait::helper_thread;
         // Decided on the GPU thread, where GPU writes are recorded: none can come in between.
-        auto resolve = [this, page, length, device_addr, size] {
+        auto resolve = [this, page, length, device_addr, size, helper] {
             const u32 frames = g_guest_frames.load(std::memory_order_relaxed);
             const u32 gpu_write = memory_tracker->LatestGpuWriteFrame(page, length);
             const u32 gpu_use = LastGpuUse(page, length);
@@ -1013,7 +1020,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
                 NoteFault(page, length, frames, gpu_write, gpu_use, 5);
                 return;
             }
-            if (DownloadOnSideQueue(page, length)) {
+            if (!helper && DownloadOnSideQueue(page, length)) {
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
                 BbStats::gpu_side_downloads.fetch_add(1, std::memory_order_relaxed);
                 NoteFault(page, length, frames, gpu_write, gpu_use, 4);
@@ -1028,7 +1035,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
                 NoteFault(page, length, frames, gpu_write, gpu_use, 1);
                 return;
             }
-            if (merge) {
+            if (merge || helper) {
                 ShadowGpuData(page, length);
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
                 BbStats::gpu_merges.fetch_add(1, std::memory_order_relaxed);

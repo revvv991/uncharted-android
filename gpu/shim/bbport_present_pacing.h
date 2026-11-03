@@ -22,11 +22,18 @@
 //             frames off the cadence against 14.9%, the frame rate within 0.1);
 //   0         off: no present times (0.2.11's presenting);
 //   2         the presents carry IDs: the statistics only.
-// BB_PRESENT_PACING_LEAD_US (30000): the lead to start with (BB_PRESENT_PACING_ADAPT=0: always;
-// =2: 2 ms more at every frame shown late, 1 ms less only after 10 s without one in which every
-// frame reached SurfaceFlinger's latch 8 ms early - the presents' margins - or, without margins
-// from the driver, after 20 s; the default rule probes down 1 ms every 2 s and so keeps finding
-// late frames, each a hold and a jump on the screen, findings 2026-11-02 "frames go missing");
+// BB_PRESENT_PACING_LEAD_US (30000): the lead to start with. It adapts by the presents' margins
+// (BB_PRESENT_PACING_ADAPT unset or 2, the default since 2026-11-03): 2 ms more at every frame
+// shown late, 1 ms less only after 10 s without one in which every frame reached SurfaceFlinger's
+// latch 8 ms early, or, without margins from the driver, after 20 s. U1 at the 30 FPS limit, 4
+// interleaved pairs of 90 s (findings 2026-11-03 "U3's workers asleep"): frames on the screen for
+// 3+ refreshes 18-43 a run -> 6-11, off the cadence 1.4-2.2% -> 0.3-0.4%, the lead near its cap,
+// ~10 ms more from the guest's flip to the screen (100-106 -> 112-113 ms). =1: the rule before,
+// which probes down 1 ms every 2 s and so keeps finding late frames, each a hold and a jump on the
+// screen (findings 2026-11-02 "frames go missing"), which the launcher keeps for U2 (its frames
+// reach the present queue late, and at the margin rule's cap more of them missed their take: 4.6-6.1%
+// of them held 3 refreshes against 0.5-3.6%; U3 0.8-0.9% -> 0.3% with the margin rule, findings
+// 2026-11-03); =0: the lead fixed;
 // BB_PRESENT_PACING_MAX_US (50000): the most;
 // BB_PRESENT_PACING_MIN_US (22000): a request taken late goes to a vsync at least this far away
 // and at least the lead less a refresh (a game behind is usually GPU-bound: its frame's work ends
@@ -73,12 +80,13 @@ inline int64_t LeadMin() {
     return lead;
 }
 
-/// 0: the lead fixed; 1: the default rule (every 60 paced frames: 2 ms more per late frame from 2
-/// on, 1 ms less with none); 2: up at every late frame, down only with margin to spare.
+/// 0: the lead fixed; 1: the rule before 2026-11-03 (every 60 paced frames: 2 ms more per late
+/// frame from 2 on, 1 ms less with none); 2, the default: up at every late frame, down only with
+/// margin to spare.
 inline int AdaptMode() {
     static const int mode = [] {
         const char* env = std::getenv("BB_PRESENT_PACING_ADAPT");
-        return !env ? 1 : env[0] == '0' ? 0 : env[0] == '2' ? 2 : 1;
+        return !env ? 2 : env[0] == '0' ? 0 : env[0] == '1' ? 1 : 2;
     }();
     return mode;
 }

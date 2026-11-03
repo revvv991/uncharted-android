@@ -470,9 +470,10 @@ public class Launcher extends Activity {
         text(root, "Auto: shown while no gamepad is connected (phones). Left half of the screen: a stick under "
                  + "the finger; right half: drag to look around; the buttons at the edges. The panel in the game "
                  + "has the same setting with opacity and size.", 14, false);
-        accurateGpu = check(root, "Uncharted 2: accurate GPU memory", "u2_accurate_gpu", true);
+        accurateGpu = check(root, "Uncharted 2 and 3: accurate GPU memory", "u2_accurate_gpu", true);
         text(root, "Uncharted 2 reads the results of some GPU work back: grenade explosions, vehicle damage, the "
-                 + "convoy of chapter 21. Off: a few percent faster in busy scenes, and those break.", 14, false);
+                 + "convoy of chapter 21. Uncharted 3 without it gets slower the longer you play. Off: Uncharted 2 "
+                 + "a few percent faster in busy scenes, and those break.", 14, false);
         note(root, "In the game, swipe in from the right edge of the screen (or press L3+R3) for the settings "
                  + "panel: upscaling, sharpening, frame generation and more, applied at once.");
         text(root, "More environment for the port (KEY=VALUE per line, optional):", 14, false);
@@ -935,8 +936,13 @@ public class Launcher extends Activity {
                 env[i] += "BB_READBACK_SMALL_BUFFERS=1\n";
             // U2 reads GPU results back from memory it also writes (grenades, vehicle damage,
             // chapter 21's convoy), which merging leaves on the GPU: accurate GPU memory, as
-            // upstream runs U2. More environment overrides.
-            if (u2 && accurateGpu.isChecked() && !envNames("BB_GPU_MERGE"))
+            // upstream runs U2. U3 too (findings 2026-11-04): merging leaves a page that once held
+            // GPU data faulting every frame the game writes it, more pages as the session goes
+            // (Cartagena's market: 1000 -> 2900 merges a second in 10 minutes in place, the owner's
+            // chase 25 -> 17 FPS); accurate memory reads such a page back once from the mapped
+            // arena memory: 25.5 against 22.4 FPS (4 pairs), 26.9 against 22.6 over 10 minutes,
+            // faults flat at ~280 a second. More environment overrides.
+            if ((u2 || u3) && accurateGpu.isChecked() && !envNames("BB_GPU_MERGE"))
                 env[i] += "BB_GPU_MERGE=0\n";
             // U2's mesh raycasters: their GPU results reach the record arrays the game reads,
             // once the GPU has made them (without it the game asserts "iSubMesh <
@@ -948,6 +954,13 @@ public class Launcher extends Activity {
             // More environment overrides.
             if (u2 && !envNames("BB_SCALAR_COPY64_SYNC") && !envNames("BB_SCALAR_COPY64_DEFER"))
                 env[i] += "BB_SCALAR_COPY64_SYNC=2\nBB_SCALAR_COPY64_DEFER=1\n";
+            // The present pacing's lead (findings 2026-11-03): the margin rule, the default since
+            // 0151, shows U1's and U3's frames on their refresh far more often (held 3 refreshes
+            // 1.0-1.2% -> 0.2-0.3% in U1, 0.8-0.9% -> 0.3% in U3); U2's frames come to the present
+            // queue late instead, and with the lead at its cap more of them missed their take (4.6-6.1%
+            // against 0.5-3.6%), so U2 keeps the probing rule. More environment overrides.
+            if (u2 && !envNames("BB_PRESENT_PACING_ADAPT"))
+                env[i] += "BB_PRESENT_PACING_ADAPT=1\n";
         }
         StringBuilder e = new StringBuilder();
         e.append("# Written by the launcher on every start; edit the settings there.\n");

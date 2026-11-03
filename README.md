@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Experimental, an early preview (version 0.2.13).** Tested on one device so far (Retroid Pocket G2).
+> **Experimental, an early preview (version 0.2.14).** Tested on one device so far (Retroid Pocket G2).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -18,9 +18,10 @@ at 1280x720.
   50 with the camera up (no frame limit). It runs with accurate GPU memory, as upstream does: its
   grenade explosions, vehicle damage and chapter 21's convoy need it (a few percent of the frame
   rate; the launcher's settings turn it off).
-- **Uncharted 3: Drake's Deception**: playable at 25-30 FPS in the first chapter's fight. It is
-  limited by the CPU: the game's job workers spin while idle, as designed for the PS4's dedicated
-  cores, and leave little CPU time for the port's renderer threads.
+- **Uncharted 3: Drake's Deception**: playable at 25-30 FPS in the first chapter's fight, 25-27
+  in Cartagena's market chase (the port's command processing is the limit there: 2,700 draws a
+  frame). It runs with accurate GPU memory too: without it the frame rate fell the longer one
+  played.
 - The app has a launcher: it finds your dump, makes the loader's files from it on the device and
   writes the settings. The APK is on the
   [Releases](https://github.com/revvv991/uncharted-android/releases) page.
@@ -72,7 +73,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.2.13.apk` from
+1. Install the APK (`uncharted-android-0.2.14.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
@@ -93,8 +94,9 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
    Adreno 8xx of the Snapdragon 8 Elite); they are untested with these games - on the G2 one of
    three worked. Showing each frame at once, the frame rate counter, the frame rate limit
    (30 / 60 / 120 / off; the panel in the game has it too), the on-screen gamepad (Auto: shown
-   while no gamepad is connected), Uncharted 2's accurate GPU memory (on: its grenade explosions,
-   vehicle damage and chapter 21's convoy need it; off is a few percent faster in busy scenes),
+   while no gamepad is connected), accurate GPU memory for Uncharted 2 and 3 (on: Uncharted 2's
+   grenade explosions, vehicle damage and chapter 21's convoy need it, and Uncharted 3 keeps its
+   frame rate in long sessions; off is a few percent faster in Uncharted 2's busy scenes),
    extra environment variables for the port (for example
    `TU_DEBUG=sysmem` for a driver package).
 5. **Play**: the collection's menu starts; Uncharted 2 and 3 are started from it (the app

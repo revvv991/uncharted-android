@@ -568,6 +568,14 @@ void Scheduler::WaitSubmitted() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    // g2-arm64: a tick the GPU has done needs no flush and no owner Scope. The stream buffers
+    // "wait" for done ticks with region locks held (ForEachUploadRange of a written range ->
+    // UploadCopies -> StreamBuffer::Reserve); a helper thread with a fault ran the owner's work
+    // in that Scope, took the same region lock and spun, while the owner, leaving the Scope,
+    // waited for the helper: U3 hung in Cartagena's market (findings 2026-11-03).
+    if (work_semaphore.IsFree(tick)) {
+        return;
+    }
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};

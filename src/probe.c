@@ -673,6 +673,7 @@ static void *stall_watch(void *arg) {
  * (address u64, length u32, status u32: 0 or an errno) and, when read, the bytes. The request
  * is removed; write it elsewhere and move it to <file> so that it is read whole. */
 static volatile uint32_t u1_set_job_skips, u1_set_maker_null; /* install_u1_set_job_guard below */
+static volatile uint32_t u3_particle_job_skips; /* install_u3_particle_job_guard below */
 /* g2-arm64: patch_job_lock_wait's waits in place that got their counter (count, time, the longest,
  * in us), those that suspended after the full wait, the counter waits that reached it on workers
  * (with a render context open or not), and the render contexts opened (the Begin callback in
@@ -680,18 +681,18 @@ static volatile uint32_t u1_set_job_skips, u1_set_maker_null; /* install_u1_set_
 static volatile uint32_t job_lock_waits, job_lock_wait_max_us, job_lock_suspends, job_lock_tries, job_lock_tries_open;
 static volatile uint64_t job_lock_wait_total_us;
 volatile uint32_t probe_ndgi_begins;
-/* install_u1_dt_smooth below: nominal (s, 0 = off), debt, k, correction low/high, debt low/high,
+/* install_dt_smooth below: nominal (s, 0 = off), debt, k, correction low/high, debt low/high,
  * the last raw dt - read and written by the guest stub. */
-static float u1_dt_state[8];
-static int u1_dt_installed, u1_dt_fixed; /* the stub is in; BB_U1_DT_SMOOTH=<ms> fixed the nominal */
+static float dt_state[8];
+static int dt_installed, dt_fixed; /* the stub is in; BB_DT_SMOOTH=<ms> fixed the nominal */
 /* g2-arm64: the present thread's frame time on the screen (s; 0: frames not paced, movies), the
- * nominal of U1's frame dt smoothing (install_u1_dt_smooth); the debt starts over when it turns on. */
+ * nominal of the games' frame dt smoothing (install_dt_smooth); the debt starts over when it turns on. */
 void runtime_frame_time_hint(float seconds) {
-    if (!u1_dt_installed || u1_dt_fixed || u1_dt_state[0] == seconds) return;
-    if (u1_dt_state[0] == 0.0f) u1_dt_state[1] = 0.0f;
-    u1_dt_state[3] = -seconds / 4;
-    u1_dt_state[4] = seconds;
-    u1_dt_state[0] = seconds;
+    if (!dt_installed || dt_fixed || dt_state[0] == seconds) return;
+    if (dt_state[0] == 0.0f) dt_state[1] = 0.0f;
+    dt_state[3] = -seconds / 4;
+    dt_state[4] = seconds;
+    dt_state[0] = seconds;
     printf("Frame dt smoothing: %.3f ms a frame%s\n", seconds * 1e3, seconds > 0.0f ? "" : " (off: frames not paced)");
 }
 static void *peek_on_request(void *arg) {
@@ -700,7 +701,7 @@ static void *peek_on_request(void *arg) {
     snprintf(out,sizeof(out),"%s.out",path);
     snprintf(part,sizeof(part),"%s.part",path);
     static unsigned char data[1<<20];
-    uint32_t skips_told=0;
+    uint32_t skips_told=0, particle_skips_told=0;
     unsigned ticks=0;
     int contexts_told=0;
     for (;;) {
@@ -713,6 +714,14 @@ static void *peek_on_request(void *arg) {
                    "it null %u times\n",skips,nulls);
             fflush(stdout);
             skips_told=skips+nulls;
+        }
+        /* g2-arm64: and U3's particle job guard's skips, when they grow. */
+        const uint32_t particle_skips=__atomic_load_n(&u3_particle_job_skips,__ATOMIC_RELAXED);
+        if (particle_skips!=particle_skips_told) {
+            printf("Particle job guard: %u of U3's particle draw registration jobs skipped with no data\n",
+                   particle_skips);
+            fflush(stdout);
+            particle_skips_told=particle_skips;
         }
         /* g2-arm64: and the job wait's waits every 10 s when there were any (the render contexts
          * once, to show that its callbacks run). */
@@ -981,29 +990,47 @@ static void install_u1_set_job_guard(uint64_t image_size) {
     printf("Set job guard: U1's node set job skips a null set (%zu bytes of stubs at %#" PRIx64 ")\n", k, cave);
 }
 
-/* g2-arm64 (U1's jumps, findings 2026-11-02): U1 moves its world each frame by the time since the
- * last frame began (the frame clock at 0xe66f10: 0x4fac70 clamps the raw time and stores it at
- * +0x8, every game clock is advanced by it). On PS4 its frames begin evenly, held by the GPU's
- * vsync-locked frame ends; here they follow the port's frame ends three frames back, 12-70 ms apart
- * while the screen shows every frame 33.3 ms: the picture moved by the game's steps, not by the
- * screen's (a recording's frame-to-frame shift correlated 0.91 with the game's frame intervals).
+/* g2-arm64 (the games' jumps, findings 2026-11-02 and 2026-11-03): each game moves its world every
+ * frame by the time since the last frame began, through a frame clock that clamps the raw time and
+ * stores it (U1: 0x4fac70 into 0xe66f10+0x8; U2: 0x8ca5c0 into 0x1516180+0x4; U3: 0x14ff5c0, called
+ * by 0x960690, into 0x1bb4a90+0xc); every game clock is advanced by it. On PS4 the frames begin
+ * evenly, held by the GPU's vsync-locked frame ends; here they follow the port's frame ends three
+ * frames back, 12-70 ms apart while the screen shows every frame 33.3 ms: the picture moved by the
+ * game's steps, not by the screen's (in U1 a recording's frame-to-frame shift correlated 0.91 with
+ * the game's frame intervals; U2 moved the same way, 364 steps of a refresh's worth a minute).
  * A stub replaces that store:
  *   out = nominal + clamp(0.15 * (debt + raw - nominal), -nominal/4, +nominal),
  *   debt = clamp(debt + raw - out, -100 ms, +250 ms)
  * so the game time follows real time with a bounded debt and moves by the screen's steps. The
  * nominal is the paced frame's time on the screen from the present thread (runtime_frame_time_hint;
- * 0, the raw dt, when frames are not paced and during movies). BB_U1_DT_SMOOTH=0: off; =<ms>: that
- * nominal always. A 60 s screen recording while the camera turned (2026-11-02): steps of a
- * refresh's worth or more off the screen's time 418 a minute -> 56, the game's dt p5-p95 15-59 ms
- * -> 31-37 ms, the debt within -23..+44 ms (p1, p99), 30.0 FPS either way. */
-static void install_u1_dt_smooth(uint64_t image_size) {
-    const char *env = getenv("BB_U1_DT_SMOOTH");
-    if (env && env[0] == '0' && !env[1]) return;
-    const double nominal_ms = env ? atof(env) : 0.0;
-    const uint64_t base = 0x400000, cave = 0xd20080, site = 0x4fad20;
-    static const unsigned char site_old[] = {0xc5, 0xea, 0x5d, 0xc0,         /* vminss %xmm0,%xmm2,%xmm0 */
-                                             0xc5, 0xfa, 0x11, 0x43, 0x08,   /* vmovss %xmm0,0x8(%rbx) */
-                                             0x48, 0x8d, 0x05, 0xdc, 0xd4, 0x85, 0x00};
+ * 0, the raw dt, when frames are not paced and during movies). On in U1 and U3, opt-in in U2:
+ * BB_DT_SMOOTH=0 off, =1 on (U2 too), =<ms> that nominal always (BB_U1_DT_SMOOTH, its first name,
+ * still works for U1). 60 s screen recordings while the camera turned, 30 FPS either way: U1
+ * (2026-11-02) steps of a refresh's worth or more off the screen's time 418 a minute -> 56, the
+ * game's dt p5-p95 15-59 ms -> 31-37 ms, the debt within -23..+44 ms (p1, p99); U3 (2026-11-03, 2
+ * pairs) 456 and 468 -> 142 and 134 a minute, the picture's step p5-p95 0.37-2.09 -> 0.59-1.46
+ * refreshes' worth, its dt 30-38 ms while the raw one ran 11-48. U2's clock follows the stub as well, yet its picture moved as
+ * unevenly (499/499 -> 512/511 a minute, 2 pairs): what moves its view is timed elsewhere (open), so
+ * U2 stays as it was unless asked. The sites are found by their bytes, each unique in its game; the
+ * stub uses rax, xmm2 and xmm3, dead at all three stores (the next instruction loads rax, xmm2 is
+ * loaded or zeroed before it is read, xmm3 is not read before the next call). */
+static unsigned char *near_image_memory(size_t size);
+static int64_t find_unique_pattern(uint64_t image_size, const char *pattern);
+static void install_dt_smooth(uint64_t image_size) {
+    struct Site {
+        const char *game, *pattern;
+        unsigned offset, store_size;
+        unsigned char store[6];
+        int opt_in; /* only with BB_DT_SMOOTH=1 or =<ms> */
+    };
+    static const struct Site sites[] = {
+        /* vmulsd disp(%rax); vcvtsd2ss; vminss %xmm0,%xmm2,%xmm0; [vmovss %xmm0,0x8(%rbx)]; lea rax */
+        {"U1", "c5fb5940?? c5fb5ac0 c5ea5dc0 c5fa114308 488d05", 13, 5, {0xc5, 0xfa, 0x11, 0x43, 0x08}, 0},
+        /* vmulsd disp(%rax); vcvtsd2ss; vminss %xmm0,%xmm1,%xmm0; [vmovss %xmm0,0x4(%r15)]; lea rax */
+        {"U2", "c5fb5940?? c5fb5ac0 c5f25dc0 c4c17a114704 488d05", 13, 6, {0xc4, 0xc1, 0x7a, 0x11, 0x47, 0x04}, 1},
+        /* vdivss 0x20(%r15),%xmm1,%xmm2; vminss %xmm0,%xmm2,%xmm0; [vmovss %xmm0,0xc(%r15)]; lea rax */
+        {"U3", "c4c1725e5720 c5ea5dc0 c4c17a11470c 488d05", 10, 6, {0xc4, 0xc1, 0x7a, 0x11, 0x47, 0x0c}, 0},
+    };
     static const unsigned char stub[] = {
         0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,        /* movabs $state,%rax */
         0xc5, 0xfa, 0x10, 0x10,                    /* vmovss (%rax),%xmm2: nominal */
@@ -1022,36 +1049,94 @@ static void install_u1_dt_smooth(uint64_t image_size) {
         0xc5, 0xea, 0x5f, 0x50, 0x14,              /* vmaxss 0x14(%rax),%xmm2,%xmm2 */
         0xc5, 0xea, 0x5d, 0x50, 0x18,              /* vminss 0x18(%rax),%xmm2,%xmm2 */
         0xc5, 0xfa, 0x11, 0x50, 0x04,              /* vmovss %xmm2,0x4(%rax): debt */
-        0xc5, 0xf8, 0x28, 0xc3,                    /* vmovaps %xmm3,%xmm0 */
-        0xc5, 0xfa, 0x11, 0x43, 0x08,              /* store: vmovss %xmm0,0x8(%rbx) */
-        0xe9, 0, 0, 0, 0};                         /* jmp site + 5 */
-    if (cave - base + 128 > image_size || site - base + sizeof(site_old) > image_size) return;
-    if (memcmp(image + site - 4 - base, site_old, sizeof(site_old))) return; /* not U1 */
-    for (size_t i = 0; i < 128; ++i)
-        if (image[cave - base + i]) { printf("Frame dt smoothing: the code cave is not empty, off\n"); return; }
+        0xc5, 0xf8, 0x28, 0xc3};                   /* vmovaps %xmm3,%xmm0 */
+                                                   /* store: the game's own store, then jmp back */
+    const struct Site *s = NULL;
+    unsigned char *p = NULL;
+    for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]) && !s; ++i) {
+        const int64_t at = find_unique_pattern(image_size, sites[i].pattern);
+        if (at >= 0) { s = &sites[i]; p = image + at + s->offset; }
+    }
+    if (!s) return; /* another build: no smoothing */
+    const char *env = getenv("BB_DT_SMOOTH");
+    if (!env && s == &sites[0]) env = getenv("BB_U1_DT_SMOOTH");
+    if (env && env[0] == '0' && !env[1]) { printf("Frame dt smoothing: off (BB_DT_SMOOTH=0)\n"); return; }
+    if (!env && s->opt_in) { printf("Frame dt smoothing: off in %s (BB_DT_SMOOTH=1 turns it on)\n", s->game); return; }
+    unsigned char *t = near_image_memory(256);
+    if (!t) { printf("Frame dt smoothing: no thunk memory, off\n"); return; }
+    const double nominal_ms = env && strcmp(env, "1") ? atof(env) : 0.0;
     const float nominal = (float)(nominal_ms > 0.0 ? nominal_ms / 1000.0 : 0.0);
-    u1_dt_fixed = nominal > 0.0f;
-    u1_dt_state[0] = nominal;
-    u1_dt_state[1] = 0.0f;
-    u1_dt_state[2] = 0.15f;
-    u1_dt_state[3] = -nominal / 4;
-    u1_dt_state[4] = nominal;
-    u1_dt_state[5] = -0.1f;
-    u1_dt_state[6] = 0.25f;
-    unsigned char *t = image + cave - base;
-    memcpy(t, stub, sizeof(stub));
-    const uint64_t state = (uint64_t)(uintptr_t)u1_dt_state;
+    dt_fixed = nominal > 0.0f;
+    dt_state[0] = nominal;
+    dt_state[1] = 0.0f;
+    dt_state[2] = 0.15f;
+    dt_state[3] = -nominal / 4;
+    dt_state[4] = nominal;
+    dt_state[5] = -0.1f;
+    dt_state[6] = 0.25f;
+    size_t k = sizeof(stub);
+    memcpy(t, stub, k);
+    const uint64_t state = (uint64_t)(uintptr_t)dt_state;
     memcpy(t + 2, &state, 8);
-    int32_t rel = (int32_t)((int64_t)(site + 5) - (int64_t)(cave + sizeof(stub)));
-    memcpy(t + sizeof(stub) - 4, &rel, 4);
-    unsigned char *p = image + site - base;
-    rel = (int32_t)((int64_t)cave - (int64_t)(site + 5));
+    memcpy(t + k, s->store, s->store_size);
+    k += s->store_size;
+    t[k++] = 0xe9;                                                       /* jmp site + store */
+    int32_t rel = (int32_t)((int64_t)(uintptr_t)(p + s->store_size) - (int64_t)(uintptr_t)(t + k + 4));
+    memcpy(t + k, &rel, 4);
+    k += 4;
+    rel = (int32_t)((int64_t)(uintptr_t)t - (int64_t)(uintptr_t)(p + 5)); /* the store -> jmp stub */
     p[0] = 0xe9;
     memcpy(p + 1, &rel, 4);
-    u1_dt_installed = 1;
-    printf("Frame dt smoothing: U1's frame clock moves by the screen's frame time with a debt to real "
-           "time (%s; %zu bytes of stub at %#" PRIx64 ")\n", u1_dt_fixed ? "fixed by BB_U1_DT_SMOOTH" : "from the present thread",
-           sizeof(stub), cave);
+    if (s->store_size > 5) p[5] = 0x90;
+    dt_installed = 1;
+    printf("Frame dt smoothing: %s's frame clock moves by the screen's frame time with a debt to real "
+           "time (%s; %zu bytes of stub)\n", s->game, dt_fixed ? "fixed by BB_DT_SMOOTH" : "from the present thread", k);
+}
+
+/* g2-arm64 (U3's particle job crash, findings 2026-11-03): U3's particle draw registration job
+ * 0x1388f10 (submitted by DrawRegJob 0x136c9d0, which does not wait for it) copies `data+8`'s fields
+ * and faulted at 0x1388f74 reading +0x20 of a null `data+8` - its 0x50 bytes of data come from the
+ * single render frame's memory, so a job that runs after that frame's memory is reused reads it
+ * empty (2026-10-21/22 with the sleep mode; js-ab-u3-A1 of 2026-11-03 with spinning workers, no
+ * frame limit). It has the shape of U1's job 0xa16aa0 byte for byte (the prologue, the load at
+ * +0x60) and gets the same guard as 0143's: it returns at its entry when `data+8` is null (its
+ * particles go undrawn for that frame instead of the fault; the job runner completes it as usual),
+ * the peek thread reports the skips. Garbage that is not null still faults (a job late by more than
+ * its frame). BB_U3_PARTICLE_GUARD=0: off. */
+static void install_u3_particle_job_guard(uint64_t image_size) {
+    const char *env = getenv("BB_U3_PARTICLE_GUARD");
+    if (env && env[0] == '0') return;
+    const uint64_t base = 0x400000, job = 0x1388f10, load_at = 0x1388f70;
+    static const unsigned char job_old[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                            0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x18, 0x01, 0x00, 0x00};
+    static const unsigned char load_old[] = {0x49, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0x48, 0x20};
+    if (load_at - base + sizeof(load_old) > image_size ||
+        memcmp(image + job - base, job_old, sizeof(job_old)) ||
+        memcmp(image + load_at - base, load_old, sizeof(load_old)))
+        return; /* not U3 */
+    unsigned char *t = near_image_memory(64);
+    if (!t) { printf("Particle job guard: no thunk memory, off\n"); return; }
+    unsigned char *entry = image + job - base;
+    size_t k = 0;
+    const uint64_t skips = (uint64_t)(uintptr_t)&u3_particle_job_skips;
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+    B(0x48, 0x83, 0x7f, 0x08, 0x00);                        /* cmp qword [rdi+8], 0: the data's +8 */
+    B(0x74); const size_t skip = k; B(0x00);                /* je skip */
+    B(0x55);                                                /* push rbp (the moved prologue) */
+    B(0x48, 0x89, 0xe5);                                    /* mov rbp, rsp */
+    B(0x41, 0x57);                                          /* push r15 */
+    B(0xe9);                                                /* jmp job + 6 */
+    { const int32_t rel = (int32_t)((int64_t)(uintptr_t)(entry + 6) - (int64_t)(uintptr_t)(t + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
+    t[skip] = (unsigned char)(k - (skip + 1));
+    B(0x48, 0xb8); memcpy(t + k, &skips, 8); k += 8;        /* skip: movabs rax, &skips */
+    B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
+    B(0xc3);                                                /* ret */
+#undef B
+    const int32_t rel = (int32_t)((int64_t)(uintptr_t)t - (int64_t)(uintptr_t)(entry + 5));
+    entry[0] = 0xe9;                                        /* jmp the stub */
+    memcpy(entry + 1, &rel, 4);
+    entry[5] = 0x90;
+    printf("Particle job guard: U3's particle draw registration job skips a null data+8 (%zu bytes of stub)\n", k);
 }
 
 /* g2-arm64 diagnosis (U1's job fiber crash, 2026-11-01): BB_U1_VIEW_WATCH=1 watches the table
@@ -1088,11 +1173,11 @@ static void *u1_frame_watch(void *arg) {
             peek_guest(&tick3, 0x14cdb40 + ((frame - 3) & 31) * 0xa50 + 0xa08, 8);
             peek_guest(&tick1, 0x14cdb40 + ((frame - 1) & 31) * 0xa50 + 0xa08, 8);
             float dt = 0;
-            peek_guest(&dt, 0xe66f18, 4); /* the frame clock's dt (install_u1_dt_smooth) */
+            peek_guest(&dt, 0xe66f18, 4); /* the frame clock's dt (install_dt_smooth) */
             printf("Frame watch: %.3f %c frame %" PRIu64 " (+%" PRId64 "), eop tick of frame-3 %#" PRIx64
                    ", frame-1 %#" PRIx64 "; dt %.2f raw %.2f debt %.2f\n", now.tv_sec * 1e3 + now.tv_nsec / 1e6,
                    which ? 'b' : 'a', frame, (int64_t)(frame - last[which]), tick3, tick1, dt * 1e3,
-                   u1_dt_state[7] * 1e3, u1_dt_state[1] * 1e3);
+                   dt_state[7] * 1e3, dt_state[1] * 1e3);
             last[which] = frame;
         }
     }
@@ -2130,27 +2215,24 @@ static void patch_job_lock_wait(uint64_t image_size) {
  * its worker loop is identical, but its re-check loads the manager through r13 (not r15) and its
  * submit path tests rdi and jumps with a short je. A build that matches no set keeps spinning.
  * BB_JOB_SLEEP=0 keeps the spinning workers. */
-#ifdef __ANDROID__
-/* g2-arm64: U1's eboot (the entry of its node set job 0xa16aa0, as port 0143 checks it). */
-static int u1_image(uint64_t image_size) {
-    static const unsigned char entry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
-                                          0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x18, 0x01, 0x00, 0x00};
-    return 0xa16aa0 - 0x400000 + sizeof(entry) <= image_size &&
-           !memcmp(image + 0xa16aa0 - 0x400000, entry, sizeof(entry));
-}
-#endif
 static void patch_job_sleep(uint64_t image_size) {
     const char *env=getenv("BB_JOB_SLEEP");
     if (env && env[0]=='0') { printf("Job workers: spin while idle (BB_JOB_SLEEP=0)\n"); return; }
 #ifdef __ANDROID__
-    /* g2-arm64: off unless BB_JOB_SLEEP=1. On a phone's CPU the sleeping workers start jobs late
-     * enough to outlive the frame memory they use: U3's particle jobs crashed within minutes,
-     * U2's navmesh queries and U1's loading end failed too (android/notes/findings.md, 2026-10-21).
-     * U1 sleeps by default since 2026-11-02: its six spinning workers held six of the G2's eight
-     * cores, and the worker with the frame's job lost its core for tens of ms - hitches of 70-700 ms
-     * about every 15 s at the 30 FPS limit; asleep, 3 frames over 70 ms in 8 runs (none over 100),
-     * its loading end fine (the counter waits are robust since 5fe325c; findings 2026-11-02 night). */
-    if (!env && !u1_image(image_size)) { printf("Job workers: spin while idle (BB_JOB_SLEEP=1 lets them sleep)\n"); return; }
+    /* g2-arm64: on Android the idle workers sleep in every game. Off at first: on a phone's CPU
+     * the sleeping workers started jobs late enough to outlive the frame memory they use - U3's
+     * particle jobs crashed within minutes, U2's navmesh queries and U1's loading end failed too
+     * (android/notes/findings.md, 2026-10-21/22). Since then the counter waits are robust
+     * (5fe325c) and U2's freed counters wait in a quarantine (0109). U1 sleeps since 2026-11-02:
+     * its six spinning workers held six of the G2's eight cores, and the worker with the frame's
+     * job lost its core for tens of ms - hitches of 70-700 ms about every 15 s at the 30 FPS limit;
+     * asleep, 3 frames over 70 ms in 8 runs (none over 100). U3 since 2026-11-03: its museum at the
+     * 30 limit, 3 interleaved pairs of 300 s, seconds with a frame over 100 ms 10/11/10 spinning
+     * against 1/2/2 asleep, the longest 350-668 against 315-349 ms, no crash or stall in 15 minutes;
+     * without the limit (4 pairs of 90 s, one run on each side lost to 0153's particle job crash)
+     * 35.5/35.3/35.2 spinning against 35.0/35.7/34.6 asleep, no gain and no loss beyond the noise.
+     * U2's recipe makes its workers sleep already (five writes: 2 spins, a 1 ms wait), so its
+     * worker loop does not match here. */
 #endif
 #ifdef _WIN32
     /* Sleeping workers free the cores of small CPUs, but cost ~8% in busy scenes on a 16-thread
@@ -2193,6 +2275,11 @@ static void patch_job_sleep(uint64_t image_size) {
         }
         if (i<3) {
             if (b+1<nbuilds) continue;
+            /* g2-arm64: U2's recipe nopped the worker loop's je and made 1000 spins 2 */
+            if (find_unique_pattern(image_size,"4d8d7001 807f5900 9090 4981f802000000 7c??")>=0) {
+                printf("Job workers: idle workers sleep (the recipe's writes: 2 spins, a 1 ms wait)\n");
+                return;
+            }
             printf("Job workers: %s not found, idle workers keep spinning\n",builds[b][i].name);
             return;
         }
@@ -2560,7 +2647,8 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         install_u1_view_lock(image_end);
         install_u1_set_job_guard(image_end);
-        install_u1_dt_smooth(image_end);
+        install_dt_smooth(image_end);
+        install_u3_particle_job_guard(image_end);
 #endif
         patch_job_lock_wait(image_end);
         runtime_display_patch(image, image_end);
