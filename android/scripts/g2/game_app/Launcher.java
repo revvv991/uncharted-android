@@ -3,6 +3,7 @@ package dev.unchartedg2.game;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.content.Intent;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.res.ColorStateList;
@@ -11,6 +12,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
@@ -19,17 +21,26 @@ import android.provider.Settings;
 import android.system.Os;
 import android.system.OsConstants;
 import android.text.InputType;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
 import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.CompoundButton;
+import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.io.File;
@@ -82,12 +93,13 @@ public class Launcher extends Activity {
         {"u3", "big3-ps4_Shipping.elf", "u3", "recipes/u3.json"},
     };
     /** The sizes the game can render at: its own 1920x1080 and three below it, made by the
-     *  recipes' byte patches (the display configuration's size pairs and the light tile grid). */
+     *  recipes' byte patches (the display configuration's size pairs and the light tile grid):
+     *  the setting, the chip's label, the line of help shown for the chosen one. */
     private static final String[][] RESOLUTIONS = {
-        {"640x360", "640x360 (fastest, a soft picture)"},
-        {"960x540", "960x540"},
-        {"1280x720", "1280x720 (recommended)"},
-        {"1920x1080", "1920x1080, the game's own (much slower)"},
+        {"640x360", "640x360", "The fastest; a soft picture, scaled up to the screen."},
+        {"960x540", "960x540", "A middle ground: faster than 720p, a softer picture."},
+        {"1280x720", "1280x720", "Recommended: a sharp picture at a frame rate most devices hold."},
+        {"1920x1080", "1920x1080", "The game's own size: no byte patches, and the slowest by far."},
     };
     private static final String[] MODULES = {"sce_module/libc.prx", "sce_module/libSceFios2.prx", "sce_sys/param.sfo"};
     private static final int PICK_FOLDER = 1, PICK_DRIVER = 2;
@@ -99,13 +111,11 @@ public class Launcher extends Activity {
 
     private SharedPreferences prefs;
     private File files;
-    private TextView folderText, folderInfo, prepareInfo, statusText;
+    private TextView folderText, folderInfo, prepareInfo, statusText, resolutionHint, fpsHint, padHint;
     private EditText pathEdit, extraEnv;
     private Button accessButton, prepareButton, playButton;
-    private RadioGroup resolution;
-    private RadioGroup fpsLimit;
-    private RadioGroup touchPad;
-    private CheckBox showFps, uncapped, accurateGpu;
+    private RadioGroup resolution, fpsLimit, touchPad;
+    private CompoundButton showFps, uncapped, accurateGpu;
     private LinearLayout driverList;
     private RadioGroup drivers;
     private volatile boolean busy;
@@ -200,9 +210,10 @@ public class Launcher extends Activity {
 
     // ---- views ----
     // Plain widgets styled by hand (no AndroidX in this build): the theme's accent colour, sections
-    // as rounded cards, a filled Play button, outlined secondary buttons, muted explanations.
+    // as rounded cards, chips for the choices, switches for the toggles, one line of help where it
+    // earns its place, the status line and Play in a bar at the bottom of the screen.
 
-    private int accent, muted, cardColor;
+    private int accent, onAccent, textColor, muted, cardColor, outline, warnColor;
 
     private void initPalette() {
         TypedValue v = new TypedValue();
@@ -214,99 +225,302 @@ public class Launcher extends Activity {
         }
         boolean night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                 == Configuration.UI_MODE_NIGHT_YES;
-        muted = night ? 0xB3FFFFFF : 0x99000000;
-        cardColor = night ? 0x16FFFFFF : 0x0D000000;
+        textColor = night ? 0xFFF3F3F5 : 0xFF1B1B1F;
+        muted = night ? 0xA8FFFFFF : 0x99000000;
+        cardColor = night ? 0x14FFFFFF : 0x0A000000;
+        outline = night ? 0x3DFFFFFF : 0x2E000000;
+        warnColor = night ? 0xFFFFB454 : 0xFF9A5B00;
+        // Dark text on a light accent (a pastel system colour), white on a deep one.
+        double luma = 0.299 * Color.red(accent) + 0.587 * Color.green(accent) + 0.114 * Color.blue(accent);
+        onAccent = luma > 150 ? 0xFF14161A : Color.WHITE;
     }
 
-    private TextView text(LinearLayout parent, String s, float size, boolean bold) {
+    private TextView text(ViewGroup parent, String s, float size, boolean bold) {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextSize(size);
+        t.setTextColor(textColor);
         if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setPadding(0, dp(6), 0, dp(2));
         parent.addView(t);
         return t;
     }
 
-    private TextView note(LinearLayout parent, String s) {
-        TextView t = text(parent, s, 14, false);
+    /** An explanation under a control: smaller, muted, a line or two. */
+    private TextView note(ViewGroup parent, String s) {
+        TextView t = text(parent, s, 13.5f, false);
         t.setTextColor(muted);
-        t.setLineSpacing(0, 1.1f);
+        t.setLineSpacing(0, 1.15f);
         return t;
     }
 
-    private LinearLayout card(LinearLayout parent, String title) {
+    /** A small heading over a row of chips. */
+    private TextView label(ViewGroup parent, String s) {
+        TextView t = text(parent, s, 13, false);
+        t.setTextColor(muted);
+        t.setPadding(0, dp(14), 0, dp(4));
+        t.setLetterSpacing(0.04f);
+        return t;
+    }
+
+    private LinearLayout card(ViewGroup parent, String title) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(cardColor);
-        bg.setCornerRadius(dp(16));
+        bg.setCornerRadius(dp(20));
         c.setBackground(bg);
-        c.setPadding(dp(18), dp(12), dp(18), dp(16));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                                                                     ViewGroup.LayoutParams.WRAP_CONTENT);
+        c.setPadding(dp(18), dp(14), dp(18), dp(16));
+        ViewGroup.MarginLayoutParams lp = new ViewGroup.MarginLayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                                                         ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(12);
         parent.addView(c, lp);
-        if (title != null) text(c, title, 17, true).setPadding(0, 0, 0, dp(4));
+        if (title != null) text(c, title, 18, true).setPadding(0, 0, 0, dp(2));
         return c;
     }
 
-    private LinearLayout row(LinearLayout parent) {
-        LinearLayout r = new LinearLayout(this);
-        r.setOrientation(LinearLayout.HORIZONTAL);
-        parent.addView(r);
+    /** A warning worth reading before Play: tinted, not shouted. */
+    private TextView alert(ViewGroup parent, String s) {
+        LinearLayout c = card(parent, null);
+        GradientDrawable bg = (GradientDrawable) c.getBackground();
+        bg.setColor((warnColor & 0x00FFFFFF) | 0x1F000000);
+        bg.setStroke(dp(1), (warnColor & 0x00FFFFFF) | 0x66000000);
+        TextView t = text(c, s, 14, false);
+        t.setTextColor(warnColor);
+        t.setLineSpacing(0, 1.15f);
+        return t;
+    }
+
+    /** A card whose title row opens and closes its body; the state is remembered. */
+    private LinearLayout collapsible(ViewGroup parent, String title, String key) {
+        LinearLayout c = card(parent, null);
+        TextView head = text(c, "", 18, true);
+        head.setPadding(0, 0, 0, dp(2));
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        c.addView(body);
+        boolean[] open = {prefs.getBoolean(key, false)};
+        Runnable show = () -> {
+            head.setText(title + (open[0] ? "  \u25BE" : "  \u25B8"));
+            body.setVisibility(open[0] ? View.VISIBLE : View.GONE);
+        };
+        show.run();
+        head.setOnClickListener(v -> {
+            open[0] = !open[0];
+            prefs.edit().putBoolean(key, open[0]).apply();
+            show.run();
+        });
+        return body;
+    }
+
+    /** Buttons that wrap to the next line when the row is full. */
+    private static class Flow extends ViewGroup {
+        private final int gap;
+
+        Flow(Context context, int gap) {
+            super(context);
+            this.gap = gap;
+        }
+
+        @Override
+        protected void onMeasure(int widthSpec, int heightSpec) {
+            int width = MeasureSpec.getSize(widthSpec);
+            int x = 0, y = 0, rowHeight = 0;
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                if (child.getVisibility() == GONE) continue;
+                child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.AT_MOST),
+                              MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                int w = child.getMeasuredWidth(), h = child.getMeasuredHeight();
+                if (x > 0 && x + w > width) {
+                    x = 0;
+                    y += rowHeight + gap;
+                    rowHeight = 0;
+                }
+                x += w + gap;
+                rowHeight = Math.max(rowHeight, h);
+            }
+            setMeasuredDimension(width, y + rowHeight);
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int l, int t, int r, int b) {
+            int width = r - l;
+            int x = 0, y = 0, rowHeight = 0;
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                if (child.getVisibility() == GONE) continue;
+                int w = child.getMeasuredWidth(), h = child.getMeasuredHeight();
+                if (x > 0 && x + w > width) {
+                    x = 0;
+                    y += rowHeight + gap;
+                    rowHeight = 0;
+                }
+                child.layout(x, y, x + w, y + h);
+                x += w + gap;
+                rowHeight = Math.max(rowHeight, h);
+            }
+        }
+    }
+
+    /** A column no wider than its limit, centred: phones use the whole width, the G2's wide
+     *  screen and tablets get margins instead of lines a foot long. */
+    private static class Column extends FrameLayout {
+        private final int limit;
+
+        Column(Context context, int limit) {
+            super(context);
+            this.limit = limit;
+        }
+
+        @Override
+        protected void onMeasure(int widthSpec, int heightSpec) {
+            int width = MeasureSpec.getSize(widthSpec);
+            int inner = Math.min(width, limit);
+            int height = 0;
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                child.measure(MeasureSpec.makeMeasureSpec(inner, MeasureSpec.EXACTLY),
+                              MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                height = Math.max(height, child.getMeasuredHeight());
+            }
+            setMeasuredDimension(width, height);
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int l, int t, int r, int b) {
+            int width = r - l;
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                int w = child.getMeasuredWidth(), x = (width - w) / 2;
+                child.layout(x, 0, x + w, child.getMeasuredHeight());
+            }
+        }
+    }
+
+    private Flow row(ViewGroup parent) {
+        Flow r = new Flow(this, dp(8));
+        ViewGroup.MarginLayoutParams lp = new ViewGroup.MarginLayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                                                         ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(8);
+        parent.addView(r, lp);
         return r;
     }
 
-    private Button button(LinearLayout parent, String s, View.OnClickListener l) {
+    private Button button(ViewGroup parent, String s, View.OnClickListener l) {
         Button b = new Button(this, null, android.R.attr.borderlessButtonStyle);
         b.setText(s);
         b.setAllCaps(false);
         b.setOnClickListener(l);
+        b.setTextSize(14.5f);
         b.setTextColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}},
                                           new int[] {muted, accent}));
-        b.setMinHeight(dp(44));
-        b.setMinimumHeight(dp(44));
+        b.setMinHeight(0);
+        b.setMinimumHeight(dp(42));
         b.setPadding(dp(18), 0, dp(18), 0);
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.TRANSPARENT);
-        bg.setStroke(dp(1), (accent & 0x00FFFFFF) | 0x66000000);
-        bg.setCornerRadius(dp(22));
+        bg.setStroke(dp(1), (accent & 0x00FFFFFF) | 0x73000000);
+        bg.setCornerRadius(dp(21));
         b.setBackground(new RippleDrawable(ColorStateList.valueOf((accent & 0x00FFFFFF) | 0x33000000), bg, null));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                                                                     ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(8);
-        lp.rightMargin = dp(8);
+        ViewGroup.MarginLayoutParams lp = new ViewGroup.MarginLayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                                                                         ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = parent instanceof Flow ? 0 : dp(8);
         parent.addView(b, lp);
         return b;
     }
 
-    private Button primaryButton(LinearLayout parent, String s, View.OnClickListener l) {
+    private Button primaryButton(ViewGroup parent, String s, View.OnClickListener l) {
         Button b = new Button(this, null, android.R.attr.borderlessButtonStyle);
         b.setText(s);
         b.setAllCaps(false);
         b.setOnClickListener(l);
         b.setTextSize(18);
         b.setTypeface(Typeface.DEFAULT_BOLD);
-        b.setTextColor(Color.WHITE);
+        b.setTextColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}},
+                                          new int[] {(onAccent & 0x00FFFFFF) | 0x99000000, onAccent}));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}},
                                        new int[] {(accent & 0x00FFFFFF) | 0x59000000, accent}));
         bg.setCornerRadius(dp(28));
         b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), bg, null));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56));
-        lp.topMargin = dp(14);
+        ViewGroup.MarginLayoutParams lp = new ViewGroup.MarginLayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56));
+        lp.topMargin = dp(8);
         parent.addView(b, lp);
         return b;
     }
 
-    private CheckBox check(LinearLayout parent, String s, String key, boolean byDefault) {
-        CheckBox c = new CheckBox(this);
-        c.setText(s);
-        c.setChecked(prefs.getBoolean(key, byDefault));
-        c.setOnCheckedChangeListener((v, on) -> prefs.edit().putBoolean(key, on).apply());
-        parent.addView(c);
-        return c;
+    private Switch toggle(ViewGroup parent, String s, String key, boolean byDefault) {
+        Switch sw = new Switch(this);
+        sw.setText(s);
+        sw.setTextSize(15);
+        sw.setTextColor(textColor);
+        sw.setSwitchPadding(dp(16));
+        sw.setChecked(prefs.getBoolean(key, byDefault));
+        sw.setOnCheckedChangeListener((v, on) -> prefs.edit().putBoolean(key, on).apply());
+        sw.setPadding(0, dp(10), 0, dp(10));
+        parent.addView(sw, new ViewGroup.MarginLayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                                            ViewGroup.LayoutParams.WRAP_CONTENT));
+        return sw;
+    }
+
+    private interface Chosen {
+        void on(String tag);
+    }
+
+    /** A row of chips, one of them chosen (options: the setting's value, the label); it scrolls
+     *  sideways on a narrow screen. */
+    private RadioGroup chips(ViewGroup parent, String[][] options, String current, Chosen chosen) {
+        RadioGroup g = new RadioGroup(this);
+        g.setOrientation(RadioGroup.HORIZONTAL);
+        for (String[] o : options) {
+            RadioButton b = new RadioButton(this);
+            b.setButtonDrawable(null);
+            b.setText(o[1]);
+            b.setTag(o[0]);
+            b.setId(View.generateViewId());
+            b.setTextSize(14);
+            b.setGravity(Gravity.CENTER);
+            b.setMinWidth(0);
+            b.setMinHeight(0);
+            b.setMinimumWidth(dp(56));
+            b.setMinimumHeight(dp(36));
+            b.setPadding(dp(16), dp(6), dp(16), dp(6));
+            b.setTextColor(new ColorStateList(new int[][] {{android.R.attr.state_checked}, {}},
+                                              new int[] {onAccent, textColor}));
+            GradientDrawable on = new GradientDrawable();
+            on.setColor(accent);
+            on.setCornerRadius(dp(18));
+            GradientDrawable off = new GradientDrawable();
+            off.setColor(Color.TRANSPARENT);
+            off.setStroke(dp(1), outline);
+            off.setCornerRadius(dp(18));
+            StateListDrawable bg = new StateListDrawable();
+            bg.addState(new int[] {android.R.attr.state_checked}, on);
+            bg.addState(new int[] {}, off);
+            b.setBackground(new RippleDrawable(ColorStateList.valueOf((accent & 0x00FFFFFF) | 0x33000000), bg, null));
+            RadioGroup.LayoutParams lp = new RadioGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                                                                     ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = dp(8);
+            g.addView(b, lp);
+            if (o[0].equals(current)) g.check(b.getId());
+        }
+        g.setOnCheckedChangeListener((group, id) -> {
+            RadioButton b = group.findViewById(id);
+            if (b != null) chosen.on((String) b.getTag());
+        });
+        HorizontalScrollView scroller = new HorizontalScrollView(this);
+        scroller.setHorizontalScrollBarEnabled(false);
+        scroller.addView(g);
+        parent.addView(scroller, new ViewGroup.MarginLayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                                                  ViewGroup.LayoutParams.WRAP_CONTENT));
+        return g;
+    }
+
+    private static String resolutionHint(String tag) {
+        for (String[] r : RESOLUTIONS)
+            if (r[0].equals(tag)) return r[2];
+        return "";
     }
 
     private int dp(int v) {
@@ -315,22 +529,34 @@ public class Launcher extends Activity {
 
     private void buildViews() {
         initPalette();
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
         ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        Column column = new Column(this, dp(720));
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(20), dp(20), dp(20), dp(28));
-        scroll.addView(root);
+        root.setPadding(dp(20), dp(16), dp(20), dp(24));
+        column.addView(root);
+        scroll.addView(column);
+        screen.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        text(root, "Uncharted: The Nathan Drake Collection", 24, true);
         String version = "";
         try {
             version = " " + getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Exception e) {
         }
-        note(root, "uncharted-android" + version + ": uncharted_pc for Android, the PS4 game's code on "
-                 + "FEXCore and the shadPS4 renderer. It needs your own copy of the game, already "
-                 + "decrypted (a dump of CUSA02344, CUSA02320 or CUSA02343, version 01.02 for the "
-                 + "sizes below 1920x1080).");
+        TextView title = text(root, "Uncharted: The Nathan Drake Collection", 26, true);
+        title.setLineSpacing(0, 1.05f);
+        note(root, "uncharted-android" + version + ": uncharted_pc on Android, the PS4 games on FEXCore and the "
+                 + "shadPS4 renderer. Needs your own decrypted copy of the collection (CUSA02344, CUSA02320 or "
+                 + "CUSA02343; update 1.02 for the sizes below 1920x1080).");
+
+        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+        ((ActivityManager) getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(memory);
+        // An 8 GB device shows ~7.1-7.5 GiB to apps (the G2: 7.15), a 6 GB one ~5.5.
+        if (memory.totalMem < (6656L << 20))
+            alert(root, "This device has less than 8 GB of RAM: the games use about 6 GB, so the system may close them.");
 
         // A newer release (Updater.java): shown by showUpdates, tinted with the accent.
         updateCard = card(root, null);
@@ -338,68 +564,77 @@ public class Launcher extends Activity {
         updateTitle = text(updateCard, "", 17, true);
         updateTitle.setPadding(0, 0, 0, dp(2));
         updateInfo = note(updateCard, "");
-        LinearLayout updateRow = row(updateCard);
+        Flow updateRow = row(updateCard);
         button(updateRow, "Update", v -> startUpdate());
         button(updateRow, "What's new", v -> offerUpdate(true));
         updateCard.setVisibility(View.GONE);
 
-        LinearLayout folder = card(root, "Game folder");
-        folderText = text(folder, "", 15, false);
-        folderInfo = note(folder, "");
-        LinearLayout row = row(folder);
-        button(row, "Choose folder", v -> {
+        LinearLayout game = card(root, "Game");
+        folderText = text(game, "", 13, false);
+        folderText.setTypeface(Typeface.MONOSPACE);
+        folderText.setTextColor(muted);
+        folderInfo = text(game, "", 15, false);
+        prepareInfo = note(game, "");
+        Flow gameRow = row(game);
+        button(gameRow, "Choose folder", v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
             startActivityForResult(i, PICK_FOLDER);
         });
-        accessButton = button(row, "Allow access to all files", v -> {
+        prepareButton = button(gameRow, "Prepare", v -> prepare(false));
+        accessButton = button(gameRow, "Allow access to all files", v -> {
             Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                                   Uri.parse("package:" + getPackageName()));
             startActivity(i);
         });
+        LinearLayout pathBox = new LinearLayout(this);
+        pathBox.setOrientation(LinearLayout.VERTICAL);
+        pathBox.setVisibility(View.GONE);
+        button(gameRow, "Type a path", v -> pathBox.setVisibility(pathBox.getVisibility() == View.GONE ? View.VISIBLE : View.GONE));
         pathEdit = new EditText(this);
-        pathEdit.setHint("or type the path, e.g. /storage/XXXX-XXXX/PS4/CUSA02344");
+        pathEdit.setHint("e.g. /storage/XXXX-XXXX/PS4/CUSA02344");
         pathEdit.setSingleLine(true);
         pathEdit.setTextSize(14);
         pathEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        folder.addView(pathEdit);
-        button(folder, "Use this path", v -> {
+        pathBox.addView(pathEdit);
+        button(pathBox, "Use this path", v -> {
             String p = pathEdit.getText().toString().trim();
             if (!p.isEmpty()) setFolder(p);
             refresh();
         });
+        game.addView(pathBox);
 
-        LinearLayout prepareCard = card(root, "Game files");
-        prepareInfo = note(prepareCard, "");
-        prepareButton = button(prepareCard, "Prepare", v -> prepare(false));
-
-        LinearLayout page = root;
-        root = card(page, "Settings"); // the settings widgets below go into the card
-        text(root, "The game renders at:", 14, false);
-        resolution = new RadioGroup(this);
-        String chosen = chosenResolution();
-        for (String[] r : RESOLUTIONS) {
-            RadioButton b = new RadioButton(this);
-            b.setText(r[1]);
-            b.setId(View.generateViewId());
-            b.setTag(r[0]);
-            resolution.addView(b);
-            if (r[0].equals(chosen)) resolution.check(b.getId());
-        }
-        resolution.setOnCheckedChangeListener((g, id) -> {
-            RadioButton b = g.findViewById(id);
-            if (b != null) prefs.edit().putString("resolution", (String) b.getTag()).apply();
+        LinearLayout graphics = card(root, "Graphics");
+        label(graphics, "Render size");
+        String chosenSize = chosenResolution();
+        resolution = chips(graphics, RESOLUTIONS, chosenSize, tag -> {
+            prefs.edit().putString("resolution", tag).apply();
+            resolutionHint.setText(resolutionHint(tag));
         });
-        root.addView(resolution);
-        text(root, "Below 1920x1080 the game's size is set by a few byte patches made here from your own "
-                 + "executables (the app ships recipes, no code of the game) and the movies play through the "
-                 + "port's decoder. FSR 3.1 and TAA (the panel in the game) are anti-aliasing at that size; the port "
-                 + "scales the picture to the screen.", 14, false);
-        text(root, "Vulkan driver:", 14, false);
+        resolutionHint = note(graphics, resolutionHint(chosenSize));
+        note(graphics, "Below 1920x1080 the game itself renders at that size, through byte patches made here from your "
+                     + "own executables (the app ships recipes, no code of the game). Anti-aliasing (FSR 3.1, TAA): the "
+                     + "panel in the game.");
+        label(graphics, "Frame rate limit");
+        // Shared with the in-game panel through bbport.ini: what the panel last chose is shown.
+        String current = iniGet("fps_limit");
+        if (current == null || current.equals("auto")) current = prefs.getString("fps_limit", defaultFpsLimit());
+        fpsLimit = chips(graphics, new String[][] {{"30", "30"}, {"60", "60"}, {"120", "120"}, {"0", "Off"}}, current, tag -> {
+            prefs.edit().putString("fps_limit", tag).apply();
+            iniPut("fps_limit", tag);
+            fpsHint.setVisibility(tag.equals("0") ? View.VISIBLE : View.GONE);
+        });
+        fpsHint = note(graphics, "No limit: above 120 FPS the game's movement timing breaks. The panel in the game has the "
+                               + "same setting.");
+        fpsHint.setVisibility(current.equals("0") ? View.VISIBLE : View.GONE);
+        showFps = toggle(graphics, "Show the frame rate", "show_fps", false);
+        uncapped = toggle(graphics, "Show frames as soon as they are ready (up to the display's refresh rate)", "uncapped", true);
+
+        LinearLayout driverCard = card(root, "Vulkan driver");
         driverList = new LinearLayout(this);
         driverList.setOrientation(LinearLayout.VERTICAL);
-        root.addView(driverList);
+        driverCard.addView(driverList);
         buildDriverList();
-        LinearLayout driverRow = row(root);
+        Flow driverRow = row(driverCard);
         button(driverRow, "Add a package (zip)", v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -409,114 +644,79 @@ public class Launcher extends Activity {
         });
         button(driverRow, "Download...", v -> downloadDriver());
         button(driverRow, "Remove", v -> removeDriver());
-        text(root, "The bundled Turnip (tested, with the port's KGSL fixes) is the one to keep on Adreno. Driver "
-                 + "packages are the zips the Android emulators use (meta.json and the driver library): the Turnip "
-                 + "builds by K11MCH1, MrPurple, StevenMXZ (the Gen8 ones for Adreno 8xx: Snapdragon 8 Elite) and "
-                 + "others, or Qualcomm's own driver builds. They are untested with these games; if the bundled "
-                 + "driver gives a black screen, try one of them.", 14, false);
-        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
-        ((ActivityManager) getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(memory);
-        // An 8 GB device shows ~7.1-7.5 GiB to apps (the G2: 7.15), a 6 GB one ~5.5.
-        if (memory.totalMem < (6656L << 20))
-            text(root, "This device has less than 8 GB of RAM: the games use about 6 GB (tested with 8 GB), "
-                     + "so the system may close them.", 14, false);
-        uncapped = check(root, "Show each frame at once (up to the display's refresh rate)", "uncapped", true);
-        showFps = check(root, "Show the frame rate", "show_fps", false);
-        text(root, "Frame rate limit:", 14, false);
-        fpsLimit = new RadioGroup(this);
-        fpsLimit.setOrientation(RadioGroup.HORIZONTAL);
-        // Shared with the in-game panel through bbport.ini: what the panel last chose is shown.
-        String current = iniGet("fps_limit");
-        if (current == null || current.equals("auto")) current = prefs.getString("fps_limit", defaultFpsLimit());
-        for (String l : new String[] {"30", "60", "120", "Off"}) {
-            RadioButton b = new RadioButton(this);
-            b.setText(l);
-            b.setId(View.generateViewId());
-            b.setTag(l.equals("Off") ? "0" : l);
-            fpsLimit.addView(b);
-            if (b.getTag().equals(current)) fpsLimit.check(b.getId());
-        }
-        fpsLimit.setOnCheckedChangeListener((g, id) -> {
-            RadioButton b = g.findViewById(id);
-            if (b != null) {
-                prefs.edit().putString("fps_limit", (String) b.getTag()).apply();
-                iniPut("fps_limit", (String) b.getTag());
-            }
-        });
-        root.addView(fpsLimit);
-        text(root, "Off: no limit; above 120 FPS the game's movement timing breaks. The panel in the game "
-                 + "has the same setting.", 14, false);
-        text(root, "On-screen gamepad:", 14, false);
-        touchPad = new RadioGroup(this);
-        touchPad.setOrientation(RadioGroup.HORIZONTAL);
+        note(driverCard, "The bundled Turnip is the one tested with these games. Packages are the zips the Android "
+                       + "emulators use (meta.json and the library): the Turnip builds by K11MCH1, MrPurple and "
+                       + "StevenMXZ (Gen8 for Adreno 8xx), or Qualcomm's own.");
+
+        LinearLayout controls = card(root, "Controls");
+        label(controls, "On-screen gamepad");
         String pad = iniGet("touch_pad");
         if (pad == null) pad = prefs.getString("touch_pad", "auto");
-        for (String[] o : new String[][] {{"0", "Off"}, {"auto", "Auto"}, {"1", "On"}}) {
-            RadioButton b = new RadioButton(this);
-            b.setText(o[1]);
-            b.setId(View.generateViewId());
-            b.setTag(o[0]);
-            touchPad.addView(b);
-            if (o[0].equals(pad)) touchPad.check(b.getId());
-        }
-        touchPad.setOnCheckedChangeListener((g, id) -> {
-            RadioButton b = g.findViewById(id);
-            if (b != null) {
-                prefs.edit().putString("touch_pad", (String) b.getTag()).apply();
-                iniPut("touch_pad", (String) b.getTag());
-            }
+        touchPad = chips(controls, new String[][] {{"0", "Off"}, {"auto", "Auto"}, {"1", "On"}}, pad, tag -> {
+            prefs.edit().putString("touch_pad", tag).apply();
+            iniPut("touch_pad", tag);
+            padHint.setVisibility(tag.equals("0") ? View.GONE : View.VISIBLE);
         });
-        root.addView(touchPad);
-        text(root, "Auto: shown while no gamepad is connected (phones). Left half of the screen: a stick under "
-                 + "the finger; right half: drag to look around; the buttons at the edges. The panel in the game "
-                 + "has the same setting with opacity and size.", 14, false);
-        accurateGpu = check(root, "Uncharted 2 and 3: accurate GPU memory", "u2_accurate_gpu", true);
-        text(root, "Uncharted 2 reads the results of some GPU work back: grenade explosions, vehicle damage, the "
-                 + "convoy of chapter 21. Uncharted 3 without it gets slower the longer you play. Off: Uncharted 2 "
-                 + "a few percent faster in busy scenes, and those break.", 14, false);
-        note(root, "In the game, swipe in from the right edge of the screen (or press L3+R3) for the settings "
-                 + "panel: upscaling, sharpening, frame generation and more, applied at once.");
-        text(root, "More environment for the port (KEY=VALUE per line, optional):", 14, false);
+        padHint = note(controls, "Auto: shown while no gamepad is connected. Left half of the screen: a stick under the "
+                               + "finger; right half: drag to look around; the buttons at the edges.");
+        padHint.setVisibility(pad.equals("0") ? View.GONE : View.VISIBLE);
+        note(controls, "In the game, swipe in from the right edge (or press L3+R3) for the settings panel: upscaling, "
+                     + "sharpening, effects, the pad's size and opacity.");
+
+        LinearLayout advanced = collapsible(root, "Advanced", "advanced_open");
+        accurateGpu = toggle(advanced, "Uncharted 2 and 3: accurate GPU memory", "u2_accurate_gpu", true);
+        note(advanced, "Uncharted 2 reads some GPU results back (grenades, vehicle damage, the convoy of chapter 21), and "
+                     + "Uncharted 3 slows down over a session without it. Off: Uncharted 2 a few percent faster in busy "
+                     + "scenes, and those break.");
+        label(advanced, "Extra environment for the port (KEY=VALUE per line)");
         extraEnv = new EditText(this);
         extraEnv.setText(prefs.getString("extra_env", ""));
         extraEnv.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         extraEnv.setMinLines(2);
-        root.addView(extraEnv);
-        root = page;
+        extraEnv.setTextSize(14);
+        extraEnv.setTypeface(Typeface.MONOSPACE);
+        advanced.addView(extraEnv);
+        button(advanced, "Licenses", v -> showLicenses());
 
-        playButton = primaryButton(root, "Play", v -> play());
-        statusText = note(root, "");
-
-        LinearLayout savesCard = card(root, "Saves");
-        note(savesCard, "The game's saves are in the app's own folder, which Android deletes together with the app. "
-                      + "Back them up to " + backups() + " before uninstalling.");
-        LinearLayout saves = row(savesCard);
-        button(saves, "Back up saves", v -> {
+        LinearLayout data = card(root, "Saves and logs");
+        note(data, "The saves live in the app's own folder, which Android deletes with the app. Backups and copies of "
+                 + "the game's log go to " + backups() + ".");
+        Flow dataRow = row(data);
+        button(dataRow, "Back up saves", v -> {
             String done = backupSaves();
             status(done != null ? "Saves copied to " + done : "Backing up failed (no saves yet, or no access).");
         });
-        button(saves, "Restore saves", v -> restoreSaves());
-        LinearLayout helpCard = card(root, "Bug reports");
-        note(helpCard, "The game writes its log to the app's own folder, which other apps cannot read on recent "
-                     + "Android. Copy it to " + backups() + " to attach it to a report.");
-        button(helpCard, "Copy the log", v -> {
+        button(dataRow, "Restore saves", v -> restoreSaves());
+        button(dataRow, "Copy the log", v -> {
             String done = exportLog();
             status(done != null ? "Log copied to " + done : "No log yet (the game has not run), or no access.");
         });
+
         String repo = Updater.repo(this);
         if (repo != null) {
             LinearLayout updatesCard = card(root, "Updates");
             note(updatesCard, "This is version " + Updater.installed(this) + ". New versions come from github.com/" + repo
-                              + "/releases: the app downloads the APK from there and checks it (its checksum, and that it is "
-                              + "this app signed with the same key), then Android installs it over this one and keeps the "
-                              + "settings and saves. The first time, Android asks to let this app install apps.");
-            check(updatesCard, "Check for a new version when the app starts", "update_check", true);
+                              + "/releases: the app checks the APK (its checksum, and that it is this app signed with the "
+                              + "same key), then Android installs it over this one and keeps the settings and saves.");
+            toggle(updatesCard, "Check for a new version when the app starts", "update_check", true);
             button(updatesCard, "Check now", v -> checkUpdates(true));
             updateCheckText = note(updatesCard, "");
             updateCheckText.setVisibility(View.GONE);
         }
-        button(root, "Licenses", v -> showLicenses());
-        setContentView(scroll);
+
+        View line = new View(this);
+        line.setBackgroundColor(outline);
+        screen.addView(line, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1))));
+        Column barColumn = new Column(this, dp(720));
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.VERTICAL);
+        bar.setPadding(dp(20), dp(4), dp(20), dp(14));
+        statusText = note(bar, "");
+        statusText.setMaxLines(3);
+        playButton = primaryButton(bar, "Play", v -> play());
+        barColumn.addView(bar);
+        screen.addView(barColumn);
+        setContentView(screen);
     }
 
     // ---- the game folder ----
@@ -664,9 +864,12 @@ public class Launcher extends Activity {
                       + " (another version of the executables): " + String.join(", ", not)
                       + " run at 1920x1080 without patches.";
         }
-        prepareInfo.setText(problem != null ? "-" : ready ? "Prepared for this folder." + presets
-                                                     : "Not prepared yet: the app makes the loader's files from the game (a few seconds).");
+        prepareInfo.setText(problem != null ? "" : ready ? "Ready to play." + presets
+                                                      : "Not prepared yet: the app makes the loader's files from the game (a few seconds).");
+        prepareInfo.setTextColor(ready ? accent : muted);
+        folderInfo.setTextColor(problem == null ? textColor : warnColor);
         prepareButton.setEnabled(problem == null && !busy);
+        prepareButton.setVisibility(ready ? View.GONE : View.VISIBLE);
         playButton.setEnabled(ready && !busy);
     }
 
@@ -965,7 +1168,18 @@ public class Launcher extends Activity {
         StringBuilder e = new StringBuilder();
         e.append("# Written by the launcher on every start; edit the settings there.\n");
         e.append("BB_FULLSCREEN=1\nBB_FPS_LOG=1\nBB_MIDFRAME_FLUSH=10\nBB_DEFERRED_SUBMIT=1\nBB_SKIN_BATCH=1\n");
-        e.append("BB_CS_SPLIT=256:8f067540\nBB_OBJECT_MOTION=0\nBB_THREAD_NICE=0\n");
+        e.append("BB_CS_SPLIT=256:8f067540\nBB_THREAD_NICE=0\n");
+        // The characters' motion vectors for FSR 3.1 and TAA (findings 2026-11-06): up to 0.2.14
+        // the launcher set BB_OBJECT_MOTION=0 ("FSR does not run at 720p", true until port 0075
+        // of 2026-10-24 found U1-U3's scenes), and the in-game panel saved that 0 into
+        // bbport.ini. FSR then had the camera's motion only and blended moving characters with
+        // their old places (arms see-through, ghosts flickering with the jitter). The port's
+        // default is on (and off by itself with anti-aliasing Off); the 0 written that way goes
+        // back to 1 once, so the panel's "Character motion vectors" keeps a later choice.
+        if (!prefs.getBoolean("object_motion_on", false)) {
+            if ("0".equals(iniGet("object_motion"))) iniPut("object_motion", "1");
+            prefs.edit().putBoolean("object_motion_on", true).apply();
+        }
         // The game waits when it is two frames ahead of the GPU side (gnmdriver.cpp): a GPU that
         // falls behind (shaders compiling, a slow device) made it trip its own command buffer
         // check (issue #5); no cost on the G2.
@@ -1035,22 +1249,22 @@ public class Launcher extends Activity {
         driverList.removeAllViews();
         drivers = new RadioGroup(this);
         boolean kgsl = new File("/dev/kgsl-3d0").exists();
-        List<String[]> options = new ArrayList<>();
-        options.add(new String[] {"turnip", "Bundled Turnip (Mesa 26.2.5 with the port's fixes; Adreno)"
-                                            + (kgsl ? "" : " - no Adreno GPU (KGSL) found here")});
-        options.add(new String[] {"system", "The system's Vulkan driver" + (kgsl ? " (untested with these games)" : "")});
+        List<String[]> options = new ArrayList<>(); // the setting's value, the name, the detail line
+        options.add(new String[] {"turnip", "Bundled Turnip",
+                                  kgsl ? "Mesa 26.2.5 with the port's KGSL fixes; the one tested with these games"
+                                       : "no Adreno GPU (KGSL) found here"});
+        options.add(new String[] {"system", "The system's Vulkan driver", kgsl ? "untested with these games" : ""});
         File[] installed = driversDir().listFiles(File::isDirectory);
         if (installed != null) {
             java.util.Arrays.sort(installed);
             for (File d : installed) {
                 JSONObject meta = packageMeta(d);
-                String label = meta != null ? meta.optString("name", d.getName()) : d.getName();
+                String name = meta != null ? meta.optString("name", d.getName()) : d.getName();
                 String version = meta != null ? meta.optString("driverVersion", "") : "";
                 String author = meta != null ? meta.optString("author", "") : "";
                 String detail = version.isEmpty() ? author : author.isEmpty() ? version : version + ", " + author;
-                if (!detail.isEmpty()) label += " (" + detail + ")";
-                if (packageLibrary(d) == null) label += " - broken: no library";
-                options.add(new String[] {"pkg:" + d.getName(), label});
+                if (packageLibrary(d) == null) detail = (detail.isEmpty() ? "" : detail + "; ") + "broken: no library";
+                options.add(new String[] {"pkg:" + d.getName(), name, detail});
             }
         }
         drivers.setOnCheckedChangeListener((g, id) -> {
@@ -1060,7 +1274,18 @@ public class Launcher extends Activity {
         String current = driver();
         for (String[] o : options) {
             RadioButton b = new RadioButton(this);
-            b.setText(o[1]);
+            SpannableStringBuilder s = new SpannableStringBuilder(o[1]);
+            if (!o[2].isEmpty()) {
+                int from = s.length();
+                s.append('\n').append(o[2]);
+                s.setSpan(new RelativeSizeSpan(0.85f), from, s.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                s.setSpan(new ForegroundColorSpan(muted), from, s.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            b.setText(s);
+            b.setTextSize(15);
+            b.setTextColor(textColor);
+            b.setLineSpacing(0, 1.1f);
+            b.setPadding(dp(8), dp(8), 0, dp(8));
             b.setId(View.generateViewId());
             b.setTag(o[0]);
             drivers.addView(b);

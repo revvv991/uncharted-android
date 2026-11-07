@@ -28,7 +28,30 @@
   `KGSL_MEMFLAGS_FORCE_32BIT` is 1 << 32 and `kgsl_gpumem_alloc_id` has 32-bit flags; 0017: **those
   BOs come from `kgsl_gpuobj_alloc`, whose flags carry it, so the command streams do go below 4 GB**
   (`TU_IB_LOW4G=0` turns it off; without room there the usual allocation): with 0012 and 0014 off,
-  6 U3 processes with it had no CP fault, 3 of 6 without it had 56 (2026-10-30); 0012 and 0014 stay.
+  6 U3 processes with it had no CP fault, 3 of 6 without it had 56 (2026-10-30); 0012 and 0014 stay;
+  0022: **the Adreno 825** (KGSL chip id 0x44030000, Snapdragon 8s Gen 4; without it "No physical
+  devices found"): the a830's entry (a8xx_gen1) with 2 slices and 4 CCUs - KGSL reports 2432 KiB of
+  GMEM, exactly the a8xx_gen1 sysmem CCU caches and VPC buffers of 4 CCUs; 0023: **the private
+  handle of newer Qualcomm grallocs** (no 'gmsm' magic: 0, 1, the flags with the same UBWC bit, the
+  stride in bytes): before, a swapchain buffer kept an invalid modifier and Turnip laid the linear
+  buffer out tiled with UBWC - a garbage picture and CCU write faults past the buffer's end
+  (Nothing Phone 3, Android 17, 2026-11-06); 0024: **0017's rule stays off on the Adreno 8xx** -
+  on the A825 command BOs placed below 4 GB (at 0x4000000 and up, right above the chip's UCHE GMEM
+  aperture) stalled the CP: GPU timeouts every few seconds from the menus on, particle passes a
+  hundred times slower, the device lost at level loads; with the BOs where KGSL puts them the same
+  scene ran clean at 47-58 FPS (2026-11-07; `TU_IB_LOW4G=1` asks for the rule on an 8xx anyway);
+  0025: **sysmem rendering by default on the Adreno 8xx** - GMEM (binned) rendering hangs the A825
+  every 5-10 s (GPU timeouts, CP opcode errors) with this driver's entry and the community's values
+  alike, with or without the low-4 GB rule, while sysmem runs clean at 40-58 FPS; `TU_A8XX_GMEM=1`
+  lets the autotuner choose as before (other 8xx chips untested: the same default until they are).
+  `experimental/` holds two A8xx experiments the build does not apply (`build_all.sh` takes
+  `mesa-*.patch` of this directory only): the command BOs behind a virtual BO alias with a cache
+  of retired BOs (the idea of WinNative's A8xx patches, written for Mesa main; no gain over
+  0024 + 0025 in sysmem, and GMEM does not start with it) and the community's A825 tile and CCU
+  cache values (GMEM rendering then runs on the A825, slower than sysmem). Both measured 2026-11-07.
+  0018-0021 are the standalone Turnip package's (revvv991/turnip-a735: the top GPU clock switch,
+  the descriptor buffer switch, upstream's A7xx varyings quirk, the KGSL node for DroidDeck), not
+  applied here: one numbering for both.
   Experiments 0004-0011 are off by default; their variables stay for diagnostics.
 
 The port's changes on top of upstream `b787c10` (uncharted_pc 0.3.6), in the order they were made
@@ -194,4 +217,10 @@ The port's changes on top of upstream `b787c10` (uncharted_pc 0.3.6), in the ord
 | 0155 | `Scheduler::Wait` returns at once for a tick the GPU has done (no flush, no owner Scope): the stream buffers asked for done ticks with a region lock held (ForEachUploadRange of a written range), and a helper running owner work in that Scope spun on the lock while the owner, leaving the Scope, waited for the helper - U3 hung in Cartagena's market (the owner's play on rc3; a scripted run ~15 s into the chase); 10 minutes of the chase clean after |
 | 0156 | A helper thread's write fault (the recording thread's fence label, a copy thread's write) merges and never waits for the GPU in its resolution (no side-queue download with its tick wait, no read back): with accurate GPU memory (`BB_GPU_MERGE=0`, U2's default) the command thread read back for the recording thread's fault (Finish -> SyncRecording) and waited for that very thread - U3's market hung at loading; 10 minutes clean after |
 | 0157 | The launcher runs U3 with accurate GPU memory too (`BB_GPU_MERGE=0`, the setting "Uncharted 2 and 3: accurate GPU memory", on): with merging every page that once held GPU data faulted every frame the game wrote it, more pages as the session went (the market: 1000 -> 2900 merges a second in 10 minutes); Cartagena's market 25.5 against 22.4 FPS (4 pairs, every pair), 26.9 against 22.6 over 10 minutes with the faults flat at ~280 a second; README's U3 lines |
+| 0158 | The game stays landscape on phones: GameActivity overrides SDL's `setOrientationBis`, which asked for `SCREEN_ORIENTATION_FULL_USER` for the resizable window and replaced the manifest's `sensorLandscape` - a phone (natural orientation portrait) kept the game in portrait, stretched (the owner's Nothing Phone 3, 2026-11-06); the G2's natural orientation is landscape |
+| 0159 | The launcher leaves the characters' motion vectors on (no `BB_OBJECT_MOTION=0`; the ini's 0 reset once): FSR 3.1 blended moving characters with their old places without them (findings 2026-11-06, the Nothing Phone 3) |
+| 0160 | The launcher's page redone: a header, one card per topic, chips for the sizes, the limit and the pad, switches for the toggles, one line of help each, Advanced folded away, the status line and Play in a bar at the bottom, a column of at most 720 dp on wide screens, buttons that wrap; the settings, prefs keys, adb extras and written files unchanged |
+| 0161 | `BB_JOB_SPINS=<n>` (1..999; 2 on Android since 0163, 0 = the game's 1000) and `BB_JOB_WAIT_US` (1000): the job manager's idle workers spin n pauses instead of 1000 between queue scans before their wait, whose timeout becomes 1 ms instead of 10 (by pattern, U1 and U3; U2's recipe has 2 and 1 ms). A pause is a wfe of ~100 us on the G2: the 1000 held each worker's core ~100 ms after every job and the command thread was preempted 30-68 times a frame. With 2: U3's market chase 25.4 -> 29.0 FPS uncapped (4 pairs, +3.3 +3.4 +3.5 +5.9), the p99 frame 64 -> 44 ms, 27.3 -> 29.7 at the 30 limit; U1 41.2 -> 43.2, frames over 40 ms 620-642 -> 7-12 a run. One U1 run at the limit with 2 had a GPU page-fault storm that 75 minutes of the same did not repeat (findings 2026-11-07) |
+| 0162 | `BB_JOB_RESUME_WAKE` (on on Android since 0163, =0 off): the job manager's two fiber resume paths broadcast the condition variable the sleeping workers wait on (a thunk after each ready-counter loop calls the game's CondBroadcast stub on the manager's +0x80, no mutex; the sites and the stub found by bytes, U1 and U3) - before, a resumed fiber waited for a worker until the timed wait ran out (1 ms with `BB_JOB_SPINS`, 10 ms without). With 2 spins: U3's market chase 29.2 -> 30.1 FPS uncapped (4 pairs, +0.9 +0.8 +0.8 +0.8), frames over 40 ms 1611-1790 -> 1220-1367 a run; U1 at the limit 2 x 600 s clean (findings 2026-11-07) |
+| 0163 | The Android defaults: 2 spins before the workers' wait with the 1 ms timeout (`BB_JOB_SPINS=0` keeps the game's 1000 and 10 ms) and the resume wake (`BB_JOB_RESUME_WAKE=0` off) - the market chase 25.4 -> 30.1 FPS uncapped and 27.3 -> 29.7 at the 30 limit, U1 41.2 -> 43.2 with its 40 ms frames gone (the 0.3.0 criterion (1)) |
 

@@ -2,6 +2,7 @@ package dev.unchartedg2.game;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.Process;
@@ -183,6 +184,15 @@ public class GameActivity extends SDLActivity {
             bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             bars.hide(WindowInsets.Type.systemBars());
         }
+    }
+
+    /** SDL asks for SCREEN_ORIENTATION_FULL_USER for the port's resizable window (no orientation
+     *  hint), which replaces the manifest's sensorLandscape: on a phone, whose natural orientation
+     *  is portrait, the game stayed in portrait, stretched (Nothing Phone 3, 2026-11-06); the G2's
+     *  natural orientation is landscape. The games are landscape only. */
+    @Override
+    public void setOrientationBis(int w, int h, boolean resizable, String hint) {
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
 
     @Override

@@ -1,0 +1,60 @@
+From 166f8907573b68263020fe4d0f739186c55879b6 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip: sysmem rendering by default on the Adreno 8xx
+ (TU_A8XX_GMEM=1 lets the autotuner choose)
+
+GMEM (binned) rendering hangs the Adreno 825 through KGSL about every 5-10 s in
+the Uncharted collection (GPU timeouts, CP opcode errors; KGSL resets the
+context), with this driver's entry and the community's values alike and with or
+without the low-4 GB rule, while sysmem rendering runs clean at 40-58 FPS.
+Other 8xx chips are untested: the same default until they are.
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 5df2fc1bf43..73c67dfd826 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1377,6 +1377,25 @@ use_hw_binning(struct tu_cmd_buffer *cmd)
+    return vsc->binning_possible && vsc->binning_useful;
+ }
+ 
++/* uncharted-android: GMEM (binned) rendering hangs the Adreno 825 through KGSL about once a
++ * minute in the Uncharted collection (GPU timeouts, "RBBM: GPC error", CP opcode errors; KGSL then
++ * resets the context), with this driver's A825 entry and with the community's values alike, while
++ * sysmem rendering ran clean; reports from the A840 look the same. Sysmem by default on A8xx;
++ * TU_A8XX_GMEM=1 (or TU_DEBUG=gmem) lets the autotuner choose as before.
++ */
++static bool
++tu_a8xx_gmem_allowed(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = os_get_option("TU_A8XX_GMEM");
++      on = env && env[0] == '1';
++      if (on)
++         tu_note("tu: GMEM rendering allowed on A8xx (TU_A8XX_GMEM=1)");
++   }
++   return on;
++}
++
+ static bool
+ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+                      tu_autotune::rp_ctx_t *rp_ctx,
+@@ -1387,6 +1406,12 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
++   if (cmd->device->physical_device->info->chip == 8 && !TU_DEBUG(GMEM) &&
++       !tu_a8xx_gmem_allowed()) {
++      cmd->state.rp.gmem_disable_reason = "A8xx: sysmem by default (TU_A8XX_GMEM=1)";
++      return true;
++   }
++
+    /* can't fit attachments into gmem */
+    if (!cmd->state.tiling->possible) {
+       cmd->state.rp.gmem_disable_reason = "Can't fit attachments into gmem";
+-- 
+2.43.0
+

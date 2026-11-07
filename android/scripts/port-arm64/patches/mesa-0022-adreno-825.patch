@@ -1,0 +1,50 @@
+From 07372f11be0b2ae322c59020dcb749ccb2823a20 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH 1/2] freedreno: Adreno 825 (KGSL chip id 0x44030000)
+
+The a830 generation (a8xx_gen1) with 2 slices and 4 CCUs: KGSL reports
+2432 KiB of GMEM, exactly the a8xx_gen1 sysmem CCU caches and VPC buffers
+of 4 CCUs. Checked on a Nothing Phone 3 (Snapdragon 8s Gen 4, Android 17).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/freedreno/common/freedreno_devices.py | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index 100eb6591fe..890baca9734 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1404,6 +1404,29 @@ add_gpus([
+         raw_magic_regs = a8xx_base_raw_magic_regs,
+     ))
+ 
++# Adreno 825 (Snapdragon 8s Gen 4): the a830 generation (a8xx_gen1) with 2 slices and 4 CCUs.
++# KGSL reports 2432 KiB of GMEM, exactly the a8xx_gen1 sysmem CCU caches and VPC buffers of
++# 4 CCUs (4 * (256 + 128 + 128 + 64 + 32) KiB); the 2-slice tile alignment of the a829 and of the
++# 2-slice a840.
++add_gpus([
++        GPUId(chip_id=0x44030000, name="Adreno (TM) 825"), # KGSL
++    ], A6xxGPUInfo(
++        CHIP.A8XX,
++        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen1],
++        num_ccu = 4,
++        num_slices = 2,
++        tile_align_w = 64,
++        tile_align_h = 32,
++        tile_max_w = 16384,
++        tile_max_h = 16384,
++        num_vsc_pipes = 32,
++        cs_shared_mem_size = 32 * 1024,
++        wave_granularity = 2,
++        fibers_per_sp = 128 * 2 * 16,
++        magic_regs = dict(),
++        raw_magic_regs = a8xx_base_raw_magic_regs,
++    ))
++
+ add_gpus([
+         GPUId(chip_id=0x44030a20, name="Adreno (TM) 829"), # KGSL
+     ], A6xxGPUInfo(
+-- 
+2.43.0
+

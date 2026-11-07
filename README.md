@@ -4,24 +4,26 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Experimental, an early preview (version 0.2.14).** Tested on one device so far (Retroid Pocket G2).
+> **Experimental, an early preview (version 0.3.0).** Tested on the Retroid Pocket G2 and, for a day, a Nothing Phone 3 (Adreno 825).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
 ## Status
 
-Tested on one device so far: the Retroid Pocket G2 (Snapdragon G2 Gen 2, Adreno A735, 8 GB),
-at 1280x720.
+Tested on the Retroid Pocket G2 (Snapdragon G2 Gen 2, Adreno A735, 8 GB) at 1280x720 - the numbers
+below are its - and for a day on a Nothing Phone 3 (Snapdragon 8s Gen 4, Adreno 825), where the
+bundled driver runs the three games since 0.3.0.
 
-- **Uncharted: Drake's Fortune**: playable, about 30-37 FPS in the places measured (GPU-bound).
+- **Uncharted: Drake's Fortune**: playable, about 30-43 FPS in the places measured (GPU-bound); the
+  30 limit holds without the hitches of the earlier versions since 0.3.0.
 - **Uncharted 2: Among Thieves**: playable, about 30 FPS in heavy places (the museum's rooftops),
   50 with the camera up (no frame limit). It runs with accurate GPU memory, as upstream does: its
   grenade explosions, vehicle damage and chapter 21's convoy need it (a few percent of the frame
   rate; the launcher's settings turn it off).
-- **Uncharted 3: Drake's Deception**: playable at 25-30 FPS in the first chapter's fight, 25-27
-  in Cartagena's market chase (the port's command processing is the limit there: 2,700 draws a
-  frame). It runs with accurate GPU memory too: without it the frame rate fell the longer one
-  played.
+- **Uncharted 3: Drake's Deception**: playable at 25-30 FPS in the first chapter's fight; Cartagena's
+  market chase holds 29-30 at the 30 limit since 0.3.0 (25-27 before: the game's job workers held
+  the cores the port's command processing needed for its 2,300-2,700 draws a frame). It runs with
+  accurate GPU memory too: without it the frame rate fell the longer one played.
 - The app has a launcher: it finds your dump, makes the loader's files from it on the device and
   writes the settings. The APK is on the
   [Releases](https://github.com/revvv991/uncharted-android/releases) page.
@@ -73,7 +75,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.2.14.apk` from
+1. Install the APK (`uncharted-android-0.3.0.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
@@ -92,7 +94,8 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
    Android emulators use (meta.json and the driver library), from a file or downloaded in the
    app from the GitHub releases of K11MCH1, MrPurple and StevenMXZ (the Gen8 builds are for the
    Adreno 8xx of the Snapdragon 8 Elite); they are untested with these games - on the G2 one of
-   three worked. Showing each frame at once, the frame rate counter, the frame rate limit
+   three worked, and on the Adreno 8xx the bundled driver is the one to use since 0.3.0 (the Gen8
+   packages lose the device at level loads in this port). Showing each frame at once, the frame rate counter, the frame rate limit
    (30 / 60 / 120 / off; the panel in the game has it too), the on-screen gamepad (Auto: shown
    while no gamepad is connected), accurate GPU memory for Uncharted 2 and 3 (on: Uncharted 2's
    grenade explosions, vehicle damage and chapter 21's convoy need it, and Uncharted 3 keeps its

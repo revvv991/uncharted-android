@@ -2203,6 +2203,75 @@ static void patch_job_lock_wait(uint64_t image_size) {
     printf("Job wait: workers with a render context open wait for a job counter in place for up to %u ms before suspending their job (0x%" PRIx64 ")\n",
            job_lock_wait_ms,(uint64_t)at);
 }
+/* g2-arm64: the job manager's two fiber resume paths bump the ready counters of the workers
+ * (+0x2040+worker*8 of the priority level) without waking a worker asleep in the timed wait - the
+ * add path locks the manager's mutex (+0x60) and broadcasts its condition variable (+0x80), these
+ * two do not (U1, U2 and U3 alike: findings 2026-10-21 and 2026-11-07). With BB_JOB_SPINS the
+ * workers are asleep most of the time, so a resumed fiber waited up to BB_JOB_WAIT_US for one.
+ * BB_JOB_RESUME_WAKE=1: a thunk after each counter loop broadcasts the condition variable through
+ * the game's own import stub (the call of the add path), without the mutex: a worker between its
+ * re-check and its wait still sleeps the timeout, as before. The manager: the first path keeps it
+ * in its frame ([rbp-0x48], the load the thunk displaces), the second in rdi. The stub is a
+ * hypercall into the port, which hands the guest's registers back as they were except rax; the
+ * thunk saves the caller-saved ones anyway and keeps the stack as the function left it. */
+static void patch_job_resume_wake(uint64_t image_size, int64_t submit_at) {
+    const char *env=getenv("BB_JOB_RESUME_WAKE");
+#ifdef __ANDROID__
+    /* g2-arm64: on by default on Android (=0 off): with 2 spins the chase 29.2 -> 30.1 FPS, every
+     * pair +0.8 or more, fewer frames over 40 ms; U1 at the limit 2 x 600 s clean (2026-11-07). */
+    if (env && env[0]=='0') return;
+#else
+    if (!env || env[0]!='1') return;
+#endif
+    /* the add path's broadcast within 0x200 bytes after its sleep-flag check:
+     * mov rdi,[r14]; sub rdi,-0x80; call CondBroadcast */
+    static const unsigned char bc[]={0x49,0x8b,0x3e,0x48,0x83,0xef,0x80,0xe8};
+    int64_t b=-1;
+    for (int64_t i=submit_at;i>=0 && i+12<=(int64_t)image_size && i<submit_at+0x200;++i)
+        if (!memcmp(image+i,bc,sizeof(bc))) { b=i; break; }
+    if (b<0) { printf("Job resume wake: the add path's broadcast not found, off\n"); return; }
+    int32_t rel; memcpy(&rel,image+b+8,4);
+    const uint64_t stub=(uint64_t)(uintptr_t)(image+b+12+rel);
+    /* resume 1: incq [rsi+rdi*8]; mov rdx,[rax+0x100]; inc rdi; cmp rdi,rdx; jb | mov rbx,[rbp-0x48]; mov rax,[rbx+0x4ed8]; mov rcx,[rbx+0x4ee0] */
+    const int64_t s1=find_unique_pattern(image_size,"48ff04fe 488b9000010000 48ffc7 4839d7 72e4 488b5db8 488b83d84e0000 488b8be04e0000");
+    /* resume 2: incq [rdx+rsi*8]; mov rcx,[rdi+0x100]; inc rsi; cmp rsi,rcx; jb | mov [rsp+0x78],r8; mov r12,r9; xor eax,eax; mov [rsp+0x38],rax; jmp */
+    const int64_t s2=find_unique_pattern(image_size,"48ff04f2 488b8f00010000 48ffc6 4839ce 72e4 4c89442478 4d89cc 31c0 4889442438 e9");
+    if (s1<0 || s2<0) { printf("Job resume wake: the resume paths not found (%lld, %lld), off\n",(long long)s1,(long long)s2); return; }
+    unsigned char *t=near_image_memory(512);
+    if (!t) { printf("Job resume wake: no thunk memory, off\n"); return; }
+    size_t k=0;
+    uint64_t thunk[2];
+#define B(...) do { const unsigned char b_[]={__VA_ARGS__}; memcpy(t+k,b_,sizeof(b_)); k+=sizeof(b_); } while (0)
+    for (int n=0;n<2;++n) {
+        unsigned char *site=image+(n==0?s1:s2)+19;
+        const size_t moved=n==0?11:5;
+        thunk[n]=(uint64_t)(uintptr_t)(t+k);
+        B(0x55, 0x48,0x89,0xe5);                                            /* push rbp; mov rbp,rsp */
+        B(0x50,0x51,0x52,0x56,0x57, 0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53); /* push rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11 */
+        B(0x48,0x83,0xe4,0xf0);                                             /* and rsp,-16 */
+        if (n==0) B(0x48,0x8b,0x7d,0x00, 0x48,0x8b,0x7f,0xb8);              /* mov rdi,[rbp]; mov rdi,[rdi-0x48]: the manager */
+        B(0x48,0x85,0xff);                                                  /* test rdi,rdi */
+        B(0x74); const size_t skip=k; B(0x00);                              /* jz skip */
+        B(0x48,0x83,0xef,0x80);                                             /* sub rdi,-0x80: the condition variable */
+        B(0x48,0xb8); memcpy(t+k,&stub,8); k+=8;                            /* movabs rax, the broadcast stub */
+        B(0xff,0xd0);                                                       /* call rax */
+        t[skip]=(unsigned char)(k-(skip+1));
+        B(0x48,0x8d,0x65,0xb8);                                             /* lea rsp,[rbp-72] */
+        B(0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58, 0x5f,0x5e,0x5a,0x59,0x58); /* pop r11,r10,r9,r8,rdi,rsi,rdx,rcx,rax */
+        B(0x5d);                                                            /* pop rbp */
+        memcpy(t+k,site,moved); k+=moved;                                   /* the displaced instructions */
+        k+=jump_abs(t+k,(uint64_t)(uintptr_t)(site+moved));                 /* back */
+    }
+#undef B
+    for (int n=0;n<2;++n) {
+        unsigned char *site=image+(n==0?s1:s2)+19;
+        const int32_t to=(int32_t)((int64_t)thunk[n]-(int64_t)(uintptr_t)(site+5));
+        site[0]=0xe9; memcpy(site+1,&to,4);
+        if (n==0) { static const unsigned char nop6[]={0x66,0x0f,0x1f,0x44,0x00,0x00}; memcpy(site+5,nop6,6); }
+    }
+    printf("Job resume wake: a fiber resume broadcasts the job manager's condition variable (sites %#" PRIx64 ", %#" PRIx64 "; the stub %#" PRIx64 ")\n",
+           (uint64_t)(uintptr_t)(image+s1+19),(uint64_t)(uintptr_t)(image+s2+19),stub);
+}
 /* Naughty Dog's job manager (all three games): the six NdJobWorkerThreads spin on their queues
  * with `pause` unless the manager's sleep flag (byte +0x59, set by its own SetSleepMode) is on.
  * With it on, an idle worker waits on the manager's condition variable after 1000 spins (10 ms
@@ -2288,6 +2357,38 @@ static void patch_job_sleep(uint64_t image_size) {
             printf("Job workers: %s at %#" PRIx64 " (idle workers sleep)\n",builds[b][i].name,
                    (uint64_t)at[i]+builds[b][i].offset);
         }
+        /* g2-arm64: BB_JOB_SPINS=<n> (1..999): an idle worker spins n pauses instead of 1000 before
+         * it waits, and the wait times out after BB_JOB_WAIT_US (1000) instead of 10 ms - what U2's
+         * recipe does ("2 spins, a 1 ms wait"). A guest pause is a wfe of ~100 us on the G2, so the
+         * 1000 spins held each of the six workers' cores for ~100 ms after every job: in U3's market
+         * chase the workers sat in that spin 70-90% of the time (the guest profiler, 2026-11-07) and
+         * the command thread, which shares the big cores with them, was preempted 68 times a frame
+         * (its 23 ms of decoding a frame took 29 ms). The A/Bs of 2026-11-07 (the G2, 4 pairs of 120 s,
+         * the limit off) with 2: the chase 25.4 -> 29.0 FPS, every pair +3.3 or more, the p99 frame
+         * 64 -> 44 ms, at the 30 limit 27.3 -> 29.7; U1 41.2 -> 43.2 and its frames over 40 ms
+         * 620-642 -> 7-12 a run. So 2 by default on Android, as U2's recipe has; BB_JOB_SPINS=0 keeps
+         * the game's 1000 and 10 ms. One U1 run at the limit with 2 had a GPU page-fault storm that
+         * 75 minutes of the same did not repeat (findings 2026-11-07): BB_JOB_SPINS=0 if it comes back. */
+        const char *spins_env=getenv("BB_JOB_SPINS");
+#ifdef __ANDROID__
+        const long spins=spins_env?strtol(spins_env,NULL,10):2;
+#else
+        const long spins=spins_env?strtol(spins_env,NULL,10):0;
+#endif
+        if (spins>0 && spins<1000) {
+            const uint32_t n=(uint32_t)spins;
+            memcpy(image+at[0]+13,&n,4);                         /* cmp r8, 1000 -> cmp r8, n */
+            const char *wait_env=getenv("BB_JOB_WAIT_US");
+            long wait_us=wait_env?strtol(wait_env,NULL,10):1000;
+            if (wait_us<100 || wait_us>10000) wait_us=1000;
+            /* add rax,0x60; mov edx,10000; mov rsi,rax; call CondTimedwait; mov ecx,eax; cmp ecx,ETIMEDOUT */
+            const int64_t w=find_unique_pattern(image_size,"4883c060 ba10270000 4889c6 e8???????? 89c1 81f93c000280");
+            if (w>=0) { const uint32_t us=(uint32_t)wait_us; memcpy(image+w+5,&us,4); }
+            printf("Job workers: %ld spins before the wait (BB_JOB_SPINS); the wait times out after %s\n",
+                   spins,w>=0?"":"10 ms (the timed wait not found; BB_JOB_WAIT_US ignored)");
+            if (w>=0) printf("Job workers: the idle wait times out after %ld us (BB_JOB_WAIT_US)\n",wait_us);
+        }
+        patch_job_resume_wake(image_size,at[2]);
         return;
     }
 }

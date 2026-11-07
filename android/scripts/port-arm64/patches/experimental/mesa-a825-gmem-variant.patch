@@ -1,0 +1,38 @@
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [EXPERIMENT] freedreno: the community's Adreno 825 entry values (tile 96, smaller CCU caches)
+
+Not in the build. The A825 entry of 0022 copies the A830's tile and CCU cache values; the
+community's turnip/gen8 branch (whitebelyash, the base of StevenMXZ's Gen8 packages) gives the
+A825 tile_align_w 96, tile_max_w 16416 and half-size CCU color and depth caches. With these and
+the IB alias GMEM (binned) rendering started on the A825 and ran without hangs (main3, findings
+2026-11-07), but slower than sysmem (26-30 against 49-57 FPS in the boat fight), so 0025 keeps
+sysmem the default and this stays an experiment for the day GMEM is wanted on the 8xx. The
+values are a guess at the hardware (no datasheet): verify before trusting them elsewhere.
+---
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index 0fa49360eeb..4995df654b4 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1543,12 +1543,19 @@ add_gpus([
+         GPUId(chip_id=0x44030000, name="Adreno (TM) 825"), # KGSL
+     ], A6xxGPUInfo(
+         CHIP.A8XX,
+-        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen1],
++        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen1, GPUProps(
++            gmem_ccu_color_cache_fraction = CCUColorCacheFraction.HALF.value,
++            gmem_per_ccu_color_cache_size = 128 * 1024,
++            gmem_ccu_depth_cache_fraction = CCUColorCacheFraction.HALF.value,
++            gmem_per_ccu_depth_cache_size = 128 * 1024,
++            sysmem_ccu_depth_cache_fraction = CCUColorCacheFraction.THREE_QUARTER.value,
++            sysmem_per_ccu_depth_cache_size = 96 * 1024,
++        )],
+         num_ccu = 4,
+         num_slices = 2,
+-        tile_align_w = 64,
++        tile_align_w = 96,
+         tile_align_h = 32,
+-        tile_max_w = 16384,
++        tile_max_w = 16416,
+         tile_max_h = 16384,
+         num_vsc_pipes = 32,
+         cs_shared_mem_size = 32 * 1024,

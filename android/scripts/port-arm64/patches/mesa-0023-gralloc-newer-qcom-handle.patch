@@ -1,0 +1,45 @@
+From 12d4840a6bc4b20c45c275a5e93df1bd8a5fc871 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH 2/2] u_gralloc/fallback: the private handle of newer Qualcomm
+ grallocs
+
+No 'gmsm' magic: 0, 1, the flags (the same UBWC bit), the stride in bytes.
+Before, its buffers kept DRM_FORMAT_MOD_INVALID and Turnip laid a linear
+swapchain buffer out tiled with UBWC: a garbage picture and CCU write
+faults past the buffer's end (Nothing Phone 3, Android 17).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/util/u_gralloc/u_gralloc_fallback.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 44fb32d8cfd..2216b158769 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -148,10 +148,20 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+    out->strides[0] = stride;
+ 
+ #ifdef HAS_FREEDRENO
++   const int *ints = hnd->handle->data + hnd->handle->numFds;
+    uint32_t gmsm = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
+-   if (hnd->handle->numInts >= 2 && hnd->handle->data[hnd->handle->numFds] == gmsm) {
++   if (hnd->handle->numInts >= 2 && ints[0] == gmsm) {
+       /* This UBWC flag was introduced in a5xx. */
+-      bool ubwc = hnd->handle->data[hnd->handle->numFds + 1] & 0x08000000;
++      bool ubwc = ints[1] & 0x08000000;
++      out->modifier = ubwc ? DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
++   } else if (hnd->handle->numInts >= 4 && ints[0] == 0 && ints[1] == 1 && ints[3] == stride) {
++      /* The private handle of newer Qualcomm grallocs (seen on Android 17 with a Snapdragon 8s
++       * Gen 4) has no magic: 0, 1, the flags, the stride in bytes, the aligned width and height,
++       * ... The same UBWC flag: 0x00000200 for a linear buffer, 0x0a000000 for a UBWC one. Without
++       * this the modifier stayed invalid, and an invalid modifier makes the driver choose its own
++       * (tiled, UBWC) layout for a linear swapchain buffer.
++       */
++      bool ubwc = ints[2] & 0x08000000;
+       out->modifier = ubwc ? DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
+    }
+ #endif
+-- 
+2.43.0
+

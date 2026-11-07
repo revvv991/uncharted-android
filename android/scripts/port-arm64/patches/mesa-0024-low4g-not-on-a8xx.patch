@@ -1,0 +1,55 @@
+From 86d067420e309790defd1d84cdfcf6c67d399295 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip/kgsl: the low-4 GB rule for command BOs stays off on
+ the Adreno 8xx
+
+On the Adreno 825 command BOs placed below 4 GB (0017), at 0x4000000 and up
+right above the UCHE GMEM aperture, stall the CP: GPU timeouts every few
+seconds from the menus on, particle passes a hundred times slower, the device
+lost at level loads. With the BOs where KGSL puts them the same scene ran
+clean at 47-58 FPS. TU_IB_LOW4G=1 asks for the rule on an 8xx anyway.
+---
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index b646ac88452..09edbb0e0d5 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -341,15 +341,31 @@ kgsl_sparse_vma_map(struct tu_device *dev,
+ static bool
+ kgsl_alloc_low4g(struct tu_device *dev, struct kgsl_gpumem_alloc_id *req)
+ {
+-   static int on = -1;
++   static int on = -1; /* 0 off, 1 on where it helps, 2 forced (TU_IB_LOW4G=1) */
+    if (on < 0) {
+       const char *env = os_get_option("TU_IB_LOW4G");
+-      on = !env || env[0] != '0';
++      on = !env || !env[0] ? 1 : env[0] == '0' ? 0 : env[0] == '1' ? 2 : 1;
+       if (!on)
+          tu_note("tu/kgsl: command BOs go where KGSL puts them, not below 4 GB (TU_IB_LOW4G=0)");
+    }
+    if (!on)
+       return false;
++   /* uncharted-android: not on the Adreno 8xx. On the Adreno 825 (Nothing Phone 3, 2026-11-07)
++    * command BOs placed this way, at 0x4000000 and up, right above the chip's UCHE GMEM aperture,
++    * stall the CP: GPU timeouts every few seconds from the menus on, the draws of a particle
++    * pass a hundred times slower (20-300 ms a pass), the device lost at level loads; with the
++    * BOs where KGSL puts them (0x41xxxxxxxx) the same scene ran clean at 47-58 FPS. The rule is
++    * the A735's (0017); TU_IB_LOW4G=1 asks for it on an 8xx anyway.
++    */
++   if (on == 1 && dev->physical_device->info->chip >= A8XX) {
++      static bool said;
++      if (!said) {
++         said = true;
++         tu_note("tu/kgsl: an Adreno 8xx: command BOs stay where KGSL puts them (TU_IB_LOW4G=1 "
++                 "asks for the 4 GB rule anyway)");
++      }
++      return false;
++   }
+ 
+    struct kgsl_gpuobj_alloc obj = {
+       .size = req->size,
+-- 
+2.43.0
+
