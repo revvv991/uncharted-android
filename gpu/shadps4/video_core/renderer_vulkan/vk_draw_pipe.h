@@ -268,6 +268,7 @@ private:
                 continue;
             }
             const u64 start = bb_rdtsc();
+            BbStageTax::Pay(BbStageTax::StageB()); // g2-arm64 diagnosis (bbport_tsc.h)
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             busy_cycles.fetch_add(bb_rdtsc() - start, std::memory_order_relaxed);
             at += header->size;

@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// g2-arm64: Uncharted 3's GPU skinning compute shader (cs 0c936dd6) for a batch of its
+// dispatches at once (vk_skin_batch.cpp): Uncharted 1's algorithm (skin_batch.comp, cs 8f067540)
+// without the tangent - one dispatch per character of 1024-thread groups, 93 a frame in the
+// Cartagena market at ~8 us each on the G2, the GPU's per-dispatch cost. The game dispatches it ~750 times a frame for a few
+// hundred vertices each: on the GPU those ran one after another, each a compute state change for
+// one workgroup. Here one workgroup of 64 invocations skins 64 vertices of one dispatch (a
+// "job"); the job's buffers come by device address from the job table.
+//
+// The arithmetic is the translated guest shader's operation for operation, the order of the
+// multiplies and adds included. Loads outside a buffer's bound range read zero and stores there
+// are dropped, as robust buffer access does for the descriptors of the translated shader.
+//
+// Guest buffers of a job (the shader's V# order):
+//   0  per vertex: influence count, byte offset of its first influence in buffer 3
+//   1  position, float3
+//   2  normal, half4
+//   3  influences: matrix index (bits 22..31), weight (bits 0..21, of 4194303)
+//   4  bone matrices, 3x4 rows
+//   5  out: position float3, 20-byte vertices
+//   6  out: normal half4, 20-byte vertices (the same vertices, 12 bytes in)
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+// As the translated shader: 32-bit denormals flushed, signed zeros, infinities and NaNs kept.
+spirv_execution_mode(capabilities = [4465], 4460, 32); // DenormFlushToZero
+spirv_execution_mode(capabilities = [4466], 4461, 32); // SignedZeroInfNanPreserve
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Dword {
+    uint value;
+};
+
+struct Job {
+    uint64_t address[12]; // guest buffers 0..6 (0: none); the job layout of skin_batch.comp
+    uint size[12];        // their bound bytes
+    uint count;           // vertices: min(the guest's vertex count, its invocations)
+    uint first_group;     // the job's first workgroup in this dispatch
+    uint scale;           // unused here
+    uint pad;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer JobTable {
+    Job jobs[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer GroupTable {
+    uint job_of_group[];
+};
+
+layout(push_constant) uniform Push {
+    JobTable job_table;
+    GroupTable group_table;
+    uint num_groups;
+} push;
+
+uint Load(uint64_t base, uint size, uint dword) {
+    if (dword >= (size >> 2u)) {
+        return 0u;
+    }
+    return Dword(base + uint64_t(dword) * 4ul).value;
+}
+
+void Store(uint64_t base, uint size, uint dword, uint value) {
+    if (dword >= (size >> 2u)) {
+        return;
+    }
+    Dword(base + uint64_t(dword) * 4ul).value = value;
+}
+
+float LoadF(uint64_t base, uint size, uint dword) {
+    return uintBitsToFloat(Load(base, size, dword));
+}
+
+// The workgroup's output vertices, 5 dwords each, for the row stores.
+shared uint rows_out[64 * 5];
+
+void main() {
+    const uint group = gl_WorkGroupID.x;
+    if (group >= push.num_groups) {
+        return;
+    }
+    const uint job_index = push.group_table.job_of_group[group];
+    const Job job = push.job_table.jobs[job_index];
+    const uint local = gl_LocalInvocationID.x;
+    const uint vertex = (group - job.first_group) * 64u + local;
+    const uint64_t a0 = job.address[0], a1 = job.address[1], a2 = job.address[2];
+    const uint64_t a3 = job.address[3], a4 = job.address[4], a5 = job.address[5];
+    const uint64_t a6 = job.address[6];
+    const uint s0 = job.size[0], s1 = job.size[1], s2 = job.size[2], s3 = job.size[3];
+    const uint s4 = job.size[4], s5 = job.size[5], s6 = job.size[6];
+    // The two output V#s interleave (the normal at +12, the same size): a vertex's outputs are 5
+    // consecutive dwords of buffer 5, stored as whole rows through shared memory (skin_batch.comp
+    // explains the path; every lane takes part, a lane past the count stores nothing).
+    const bool rows = a6 == a5 + 12ul && s6 == s5;
+    if (!rows && !(job.count > vertex)) {
+        return;
+    }
+    const uint gid = rows ? min(vertex, job.count - 1u) : vertex;
+
+    const uint i2 = gid * 2u;
+    const uint influences = Load(a0, s0, i2);
+    const uint first_offset = Load(a0, s0, i2 + 1u);
+    const uint i3 = gid * 3u;
+    const float px = LoadF(a1, s1, i3);
+    const float py = LoadF(a1, s1, i3 + 1u);
+    const float pz = LoadF(a1, s1, i3 + 2u);
+    const vec2 n01 = unpackHalf2x16(Load(a2, s2, i2));
+    const vec2 n23 = unpackHalf2x16(Load(a2, s2, i2 + 1u));
+    const float nx = n01.x, ny = n01.y, nz = n23.x;
+
+    // The first influence's matrix: the position it gives is the base the others add to.
+    const uint first = Load(a3, s3, first_offset >> 2u);
+    const uint m0 = (first >> 22u) * 48u;
+    const uint q0 = m0 >> 2u, q1 = (m0 + 16u) >> 2u, q2 = (m0 + 32u) >> 2u;
+    const float b00 = LoadF(a4, s4, q0), b01 = LoadF(a4, s4, q0 + 1u);
+    const float b02 = LoadF(a4, s4, q0 + 2u), b03 = LoadF(a4, s4, q0 + 3u);
+    const float b10 = LoadF(a4, s4, q1), b11 = LoadF(a4, s4, q1 + 1u);
+    const float b12 = LoadF(a4, s4, q1 + 2u), b13 = LoadF(a4, s4, q1 + 3u);
+    const float b20 = LoadF(a4, s4, q2), b21 = LoadF(a4, s4, q2 + 1u);
+    const float b22 = LoadF(a4, s4, q2 + 2u), b23 = LoadF(a4, s4, q2 + 3u);
+    const float p0x = ((b00 * px + b03) + py * b01) + b02 * pz;
+    const float p0y = ((b10 * px + b13) + b11 * py) + pz * b12;
+    const float p0z = ((px * b20 + b23) + py * b21) + b22 * pz;
+
+    float dpx = 0.0, dpy = 0.0, dpz = 0.0;
+    float anx = 0.0, any_ = 0.0, anz = 0.0;
+    const float weight_scale = uintBitsToFloat(0x34800002u); // 1 / 4194303
+    uint offset = first_offset;
+    for (uint i = 0u; i < influences; ++i) {
+        const uint packed = Load(a3, s3, offset >> 2u);
+        offset += 4u;
+        const uint m = (packed >> 22u) * 48u;
+        const uint r0 = m >> 2u, r1 = (m + 16u) >> 2u, r2 = (m + 32u) >> 2u;
+        const float c00 = LoadF(a4, s4, r0), c01 = LoadF(a4, s4, r0 + 1u);
+        const float c02 = LoadF(a4, s4, r0 + 2u), c03 = LoadF(a4, s4, r0 + 3u);
+        const float c10 = LoadF(a4, s4, r1), c11 = LoadF(a4, s4, r1 + 1u);
+        const float c12 = LoadF(a4, s4, r1 + 2u), c13 = LoadF(a4, s4, r1 + 3u);
+        const float weight = weight_scale * float(packed & 0x3FFFFFu);
+        const float c20 = LoadF(a4, s4, r2), c21 = LoadF(a4, s4, r2 + 1u);
+        const float c22 = LoadF(a4, s4, r2 + 2u), c23 = LoadF(a4, s4, r2 + 3u);
+        const float qx = ((px * c00 + c03) + c01 * py) + pz * c02;
+        const float qy = ((px * c10 + c13) + c11 * py) + pz * c12;
+        const float qz = ((px * c20 + c23) + c21 * py) + pz * c22;
+        const float ex = qx - p0x, ey = qy - p0y, ez = qz - p0z;
+        const float rnx = (ny * c01 + c00 * nx) + nz * c02;
+        const float rny = (ny * c11 + c10 * nx) + nz * c12;
+        const float rnz = (ny * c21 + c20 * nx) + nz * c22;
+        dpx = ex * weight + dpx;
+        dpy = ey * weight + dpy;
+        dpz = ez * weight + dpz;
+        anx = rnx * weight + anx;
+        any_ = rny * weight + any_;
+        anz = rnz * weight + anz;
+    }
+
+    // Normal: the weighted rotation, normalized.
+    const float len2 = (any_ * any_ + anx * anx) + anz * anz;
+    const float inv = inversesqrt(len2);
+    const float nnx = inv * anx, nny = inv * any_, nnz = inv * anz;
+    const float ox = dpx + p0x, oy = dpy + p0y, oz = dpz + p0z;
+
+    const uint o = gid * 5u;
+    if (rows) {
+        const uint w = local * 5u;
+        rows_out[w] = floatBitsToUint(ox);
+        rows_out[w + 1u] = floatBitsToUint(oy);
+        rows_out[w + 2u] = floatBitsToUint(oz);
+        rows_out[w + 3u] = packHalf2x16(vec2(nnx, nny));
+        rows_out[w + 4u] = packHalf2x16(vec2(nnz, 0.0));
+        memoryBarrierShared();
+        barrier();
+        const uint first_dword = (group - job.first_group) * (64u * 5u);
+        const uint end = min(job.count * 5u, s5 >> 2u);
+        for (uint k = 0u; k < 5u; ++k) {
+            const uint i = local + k * 64u;
+            if (first_dword + i < end) {
+                Dword(a5 + uint64_t(first_dword + i) * 4ul).value = rows_out[i];
+            }
+        }
+        return;
+    }
+    Store(a5, s5, o, floatBitsToUint(ox));
+    Store(a5, s5, o + 1u, floatBitsToUint(oy));
+    Store(a5, s5, o + 2u, floatBitsToUint(oz));
+    Store(a6, s6, o, packHalf2x16(vec2(nnx, nny)));
+    Store(a6, s6, o + 1u, packHalf2x16(vec2(nnz, 0.0)));
+}

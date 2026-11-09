@@ -1,0 +1,371 @@
+From dbd5f0e30506292d5d821bb50c5258212769b2c0 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip/kgsl: command BOs behind a virtual BO alias and a
+ retired-BO cache on the Adreno 8xx
+
+The idea of WinNative's A8xx patches (MaxsTechReview, 2026-09: freeing command stream
+memory with GPUMEM_FREE_ID hangs the A8xx even when the GPU is idle), written anew: every
+command BO (TU_BO_ALLOC_NO_32B_ROLLOVER) is reached through a virtual BO alias that is
+unbound before the memory goes away, and retired command BOs go to a cache (up to 256 MiB
+idle) and are reused instead of freed. A8xx with KGSL's virtual BOs only; sysmem rendering
+only (the alias and GMEM start-up do not go together). TU_KGSL_IB_ALIAS=0 and
+TU_KGSL_IB_CACHE=0 turn the two parts off.
+
+Kept in reserve since 2026-11-07 for the fatal class "CP DDE BR opcode error |
+opcode=0x00000000" (zeros read where a command stream was). 2026-11-08: the owner's
+Nothing Phone 3 (A825) on 0.3.0 lost the device during a submit in U3's Cartagena market
+after 3.5 minutes - the heaviest command stream of the three games; the phone's kernel
+log is not readable, the class is the one left after 0024 and 0025.
+---
+ src/freedreno/vulkan/tu_device.h    |   5 +
+ src/freedreno/vulkan/tu_knl.h       |   5 +
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 249 +++++++++++++++++++++++++++-
+ 3 files changed, 257 insertions(+), 2 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 9063357fc7d..7c34bcff537 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -357,6 +357,11 @@ struct tu_device
+    struct tu_suballocator kgsl_profiling_suballoc;
+    mtx_t kgsl_profiling_mutex;
+ 
++#ifdef TU_HAS_KGSL
++   /* uncharted-android: retired command BOs kept for reuse on the Adreno 8xx (tu_knl_kgsl.cc). */
++   struct kgsl_ib_cache *kgsl_ib_cache;
++#endif
++
+    /* VkEvent BO suballocator.  Synchronized by event_mutex.
+     */
+    struct tu_suballocator event_suballoc;
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index fb607a1a43c..8702c024300 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -57,6 +57,11 @@ struct tu_bo {
+     * export file descriptor.
+     */
+    int shared_fd;
++   /* uncharted-android: the virtual BO the GPU reaches this command BO through (A8xx), the
++    * allocation's flags and requested size (the key of the command BO cache). */
++   uint32_t alias_handle;
++   uint32_t kgsl_alloc_flags;
++   uint64_t kgsl_alloc_size;
+ #endif
+ 
+    bool implicit_sync : 1;
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 09edbb0e0d5..111c8bb4033 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -398,6 +398,196 @@ kgsl_alloc_low4g(struct tu_device *dev, struct kgsl_gpumem_alloc_id *req)
+    return true;
+ }
+ 
++/* uncharted-android: Mesa main's KGSL alignment flag (26.2 requests no alignment: its BOs are
++ * page aligned); the alias of a command BO asks for the same. */
++static uint32_t
++kgsl_align_flag(uint64_t align)
++{
++   if (align > 4096) {
++      if (align <= (1 << 16))
++         return 16 << KGSL_MEMALIGN_SHIFT;
++      assert(align <= (1 << 20));
++      return 20 << KGSL_MEMALIGN_SHIFT;
++   }
++   return 0;
++}
++
++/* uncharted-android: on the Adreno 8xx the CP hangs or reads zeros where command streams were
++ * ("CP DDE BR opcode error | opcode=0x00000000", GPU timeouts in the Uncharted collection's
++ * heavy scenes and while levels load) once command BOs are freed with GPUMEM_FREE_ID. The idea
++ * of WinNative's A8xx patches (MaxsTechReview, 2026-09): the GPU reaches every command BO
++ * (TU_BO_ALLOC_NO_32B_ROLLOVER) through a virtual BO alias, which is unbound before the memory
++ * goes away, and retired command BOs are kept in a cache (up to 256 MiB idle) and reused instead
++ * of freed. A8xx with KGSL's virtual BOs only. TU_KGSL_IB_ALIAS=0 turns the alias off,
++ * TU_KGSL_IB_CACHE=0 the cache. The alias asks for an address below 4 GB too when TU_IB_LOW4G
++ * is on, so the CP firmware's IB rule (0016, 0017) still holds.
++ */
++static bool
++kgsl_ib_alias_wanted(struct tu_device *dev, enum tu_bo_alloc_flags flags)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = os_get_option("TU_KGSL_IB_ALIAS");
++      on = !(env && env[0] == '0');
++      if (!on)
++         tu_note("tu/kgsl: command BOs without the virtual BO alias (TU_KGSL_IB_ALIAS=0)");
++   }
++   return on && (flags & TU_BO_ALLOC_NO_32B_ROLLOVER) && dev->physical_device->has_sparse &&
++          dev->physical_device->info->chip >= A8XX;
++}
++
++/* The alias: a virtual BO of the command BO's size with the BO bound at its start; the GPU
++ * address handed out is the alias's. False when KGSL refuses (the BO is then used as it is). */
++static bool
++kgsl_ib_alias_bind(struct tu_device *dev, struct tu_bo *bo, uint64_t align)
++{
++   int fd = dev->physical_device->local_fd;
++   static int low4g = -1;
++   if (low4g < 0) {
++      const char *env = os_get_option("TU_IB_LOW4G");
++      low4g = !(env && env[0] == '0');
++   }
++   struct kgsl_gpuobj_alloc alloc = {
++      .size = bo->size,
++      .flags = KGSL_MEMFLAGS_VBO | KGSL_MEMFLAGS_VBO_NO_MAP_ZERO | kgsl_align_flag(align) |
++               (low4g ? KGSL_MEMFLAGS_FORCE_32BIT : 0),
++   };
++   if (safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc)) {
++      alloc.flags &= ~KGSL_MEMFLAGS_FORCE_32BIT;
++      if (safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc)) {
++         static bool said;
++         if (!said) {
++            said = true;
++            tu_note("tu/kgsl: no virtual BO for a command BO alias (%s): plain command BOs",
++                    strerror(errno));
++         }
++         return false;
++      }
++   }
++   struct kgsl_gpumem_bind_range range = {
++      .length = bo->size,
++      .child_id = bo->gem_handle,
++      .op = KGSL_GPUMEM_RANGE_OP_BIND,
++   };
++   struct kgsl_gpumem_bind_ranges bind = {
++      .ranges = (uint64_t) (uintptr_t) &range,
++      .ranges_nents = 1,
++      .ranges_size = sizeof(range),
++      .id = alloc.id,
++   };
++   struct kgsl_gpumem_get_info info = { .id = alloc.id };
++   if (safe_ioctl(fd, IOCTL_KGSL_GPUMEM_BIND_RANGES, &bind) ||
++       safe_ioctl(fd, IOCTL_KGSL_GPUMEM_GET_INFO, &info)) {
++      static bool said;
++      if (!said) {
++         said = true;
++         tu_note("tu/kgsl: binding a command BO alias failed (%s): plain command BOs",
++                 strerror(errno));
++      }
++      struct kgsl_gpumem_free_id req = { .id = alloc.id };
++      safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++      return false;
++   }
++   bo->alias_handle = alloc.id;
++   bo->iova = info.gpuaddr;
++   return true;
++}
++
++static void
++kgsl_ib_alias_unbind(struct tu_device *dev, uint32_t alias_handle, uint32_t gem_handle,
++                     uint64_t size)
++{
++   int fd = dev->physical_device->local_fd;
++   struct kgsl_gpumem_bind_range range = {
++      .length = size,
++      .child_id = gem_handle,
++      .op = KGSL_GPUMEM_RANGE_OP_UNBIND,
++   };
++   struct kgsl_gpumem_bind_ranges unbind = {
++      .ranges = (uint64_t) (uintptr_t) &range,
++      .ranges_nents = 1,
++      .ranges_size = sizeof(range),
++      .id = alias_handle,
++   };
++   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_BIND_RANGES, &unbind);
++   struct kgsl_gpumem_free_id req = { .id = alias_handle };
++   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++}
++
++/* Retired command BOs (their last reference dropped, so the command buffer that held them is
++ * reset or gone, which Vulkan allows only once the GPU is through with it) wait here for the
++ * next allocation of the same size and flags instead of being freed. */
++#define KGSL_IB_CACHE_MAX_BYTES (256ull << 20)
++struct kgsl_ib_cache_entry {
++   struct kgsl_ib_cache_entry *next;
++   uint32_t handle, alias, flags;
++   uint64_t size, iova, requested_size;
++};
++struct kgsl_ib_cache {
++   mtx_t mutex;
++   struct kgsl_ib_cache_entry *head;
++   uint64_t bytes;
++   uint32_t reuses;
++};
++
++static bool
++kgsl_ib_cache_take(struct tu_device *dev, uint64_t size, uint64_t align, uint32_t flags,
++                   struct kgsl_ib_cache_entry *out)
++{
++   struct kgsl_ib_cache *cache = dev->kgsl_ib_cache;
++   if (!cache)
++      return false;
++   mtx_lock(&cache->mutex);
++   for (struct kgsl_ib_cache_entry **link = &cache->head; *link; link = &(*link)->next) {
++      struct kgsl_ib_cache_entry *entry = *link;
++      if (entry->requested_size != size || entry->flags != flags ||
++          (align && entry->iova % align))
++         continue;
++      *link = entry->next;
++      cache->bytes -= entry->size;
++      *out = *entry;
++      free(entry);
++      cache->reuses++;
++      mtx_unlock(&cache->mutex);
++      return true;
++   }
++   mtx_unlock(&cache->mutex);
++   return false;
++}
++
++static bool
++kgsl_ib_cache_put(struct tu_device *dev, struct tu_bo *bo)
++{
++   struct kgsl_ib_cache *cache = dev->kgsl_ib_cache;
++   if (!cache || !bo->alias_handle)
++      return false;
++   struct kgsl_ib_cache_entry *entry =
++      (struct kgsl_ib_cache_entry *) malloc(sizeof(*entry));
++   if (!entry)
++      return false;
++   mtx_lock(&cache->mutex);
++   if (cache->bytes + bo->size > KGSL_IB_CACHE_MAX_BYTES) {
++      mtx_unlock(&cache->mutex);
++      free(entry);
++      return false;
++   }
++   *entry = (struct kgsl_ib_cache_entry) {
++      .next = cache->head,
++      .handle = bo->gem_handle,
++      .alias = bo->alias_handle,
++      .flags = bo->kgsl_alloc_flags,
++      .size = bo->size,
++      .iova = bo->iova,
++      .requested_size = bo->kgsl_alloc_size,
++   };
++   /* The sparse array's slot is free again before another thread can see the entry. */
++   memset(bo, 0, sizeof(*bo));
++   cache->head = entry;
++   cache->bytes += entry->size;
++   mtx_unlock(&cache->mutex);
++   return true;
++}
++
+ static VkResult
+ kgsl_bo_init(struct tu_device *dev,
+              struct vk_object_base *base,
+@@ -409,6 +599,7 @@ kgsl_bo_init(struct tu_device *dev,
+              struct tu_sparse_vma *lazy_vma,
+              const char *name)
+ {
++   const uint64_t align = 4096; /* uncharted-android: 26.2 requests no alignment (the alias) */
+    if (flags & TU_BO_ALLOC_SHAREABLE) {
+       /* The Vulkan spec doesn't forbid allocating exportable memory with a
+        * fixed address, only imported memory, but on kgsl we can't sensibly
+@@ -451,11 +642,24 @@ kgsl_bo_init(struct tu_device *dev,
+ 
+    int ret;
+ 
++   /* uncharted-android: a retired command BO of this size and these flags again (A8xx). */
++   const uint32_t requested_flags = req.flags;
++   struct kgsl_ib_cache_entry cached = {};
++   const bool alias = !lazy_vma && !(flags & TU_BO_ALLOC_REPLAYABLE) &&
++                      kgsl_ib_alias_wanted(dev, flags);
++   const bool reused = alias && kgsl_ib_cache_take(dev, size, align, requested_flags, &cached);
++   if (reused) {
++      req.id = cached.handle;
++      req.mmapsize = cached.size;
++      req.gpuaddr = cached.iova;
++   }
++
+    /* Forcing everything in the first 4GB is overkill, but we don't have many
+     * other options here since we don't control iova addresses and kgsl
+     * doesn't have a flag to avoid 32B rollover.
+     */
+-   if (!(flags & TU_BO_ALLOC_NO_32B_ROLLOVER) || !kgsl_alloc_low4g(dev, &req)) {
++   if (reused) {
++   } else if (!(flags & TU_BO_ALLOC_NO_32B_ROLLOVER) || !kgsl_alloc_low4g(dev, &req)) {
+       ret = safe_ioctl(dev->physical_device->local_fd,
+                        IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
+       if (ret) {
+@@ -474,6 +678,9 @@ kgsl_bo_init(struct tu_device *dev,
+       .name = tu_debug_bos_add(dev, req.mmapsize, name),
+       .refcnt = 1,
+       .shared_fd = -1,
++      .alias_handle = cached.alias,
++      .kgsl_alloc_flags = requested_flags,
++      .kgsl_alloc_size = size,
+       .base = base,
+    };
+ 
+@@ -486,6 +693,8 @@ kgsl_bo_init(struct tu_device *dev,
+       result = kgsl_sparse_vma_map(dev, lazy_vma, bo, 0);
+    } else if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       result = kgsl_bo_user_map(dev, bo, client_iova);
++   } else if (alias && !reused) {
++      kgsl_ib_alias_bind(dev, bo, align);
+    }
+ 
+    if (result != VK_SUCCESS)
+@@ -621,6 +830,12 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    TU_RMV(bo_destroy, dev, bo);
+ 
++   /* uncharted-android: a command BO goes to the cache (A8xx), else its alias goes first. */
++   if (kgsl_ib_cache_put(dev, bo))
++      return;
++   if (bo->alias_handle)
++      kgsl_ib_alias_unbind(dev, bo->alias_handle, bo->gem_handle, bo->size);
++
+    struct kgsl_gpumem_free_id req = {
+       .id = bo->gem_handle
+    };
+@@ -2078,13 +2293,43 @@ static VkResult
+ kgsl_device_init(struct tu_device *dev)
+ {
+    dev->fd = dev->physical_device->local_fd;
++   /* uncharted-android: the command BO cache of the A8xx (see kgsl_ib_alias_wanted). */
++   const char *env = os_get_option("TU_KGSL_IB_CACHE");
++   if (dev->physical_device->info->chip >= A8XX && dev->physical_device->has_sparse &&
++       !(env && env[0] == '0')) {
++      dev->kgsl_ib_cache = (struct kgsl_ib_cache *) calloc(1, sizeof(struct kgsl_ib_cache));
++      if (!dev->kgsl_ib_cache)
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      if (mtx_init(&dev->kgsl_ib_cache->mutex, mtx_plain) != thrd_success) {
++         free(dev->kgsl_ib_cache);
++         dev->kgsl_ib_cache = NULL;
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++   } else if (env && env[0] == '0') {
++      tu_note("tu/kgsl: retired command BOs are freed, not kept (TU_KGSL_IB_CACHE=0)");
++   }
+    return VK_SUCCESS;
+ }
+ 
+ static void
+ kgsl_device_finish(struct tu_device *dev)
+ {
+-   /* No-op */
++   struct kgsl_ib_cache *cache = dev->kgsl_ib_cache;
++   if (!cache)
++      return;
++   tu_note("tu/kgsl: command BO cache: %u reuses, %llu KiB idle at the end", cache->reuses,
++           (unsigned long long) (cache->bytes >> 10));
++   for (struct kgsl_ib_cache_entry *entry = cache->head; entry;) {
++      struct kgsl_ib_cache_entry *next = entry->next;
++      kgsl_ib_alias_unbind(dev, entry->alias, entry->handle, entry->size);
++      struct kgsl_gpumem_free_id req = { .id = entry->handle };
++      safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++      free(entry);
++      entry = next;
++   }
++   mtx_destroy(&cache->mutex);
++   free(cache);
++   dev->kgsl_ib_cache = NULL;
+ }
+ 
+ static int
+-- 
+2.43.0
+

@@ -614,6 +614,13 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
 
+    const auto eop_flip_reached = [] {
+        {
+            std::scoped_lock lock{eop_flip_mutex};
+            eop_flips_reached.fetch_add(1, std::memory_order_relaxed);
+        }
+        eop_flip_cv.notify_all();
+    };
     if (!is_eop) {
         // g2-arm64: BB_PRESENT_TRACE: a flip of the guest's own (sceVideoOutSubmitFlip) is its
         // call; an end-of-pipe flip's call was noted by gnmdriver.
@@ -621,11 +628,20 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
             BbPresentPacing::NoteGuestFlip(flip_arg, BbPresentPacing::NowNs(), 0);
         }
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); },
+                               "flip");
+    } else if (Vulkan::Scheduler::OnRecorderThread()) {
+        // bbport: the end-of-pipe label of this flip was signalled by the Vulkan recording
+        // thread (RecorderFences). PrepareFrame there waits in SyncRecording for that thread to
+        // go idle, i.e. for itself: the game froze (U1 jeep chase). The GPU thread makes it.
+        liverpool->SendCommand([=, this]() {
+            SubmitFlipInternal(port, index, flip_arg, is_eop);
+            eop_flip_reached();
+        }, "flip (recorder)");
     } else {
         // g2-arm64: an end-of-pipe flip is raised on a GPU thread (SignalFlip), the owner of the
-        // draw scheduler the frame is prepared with; on the Vulkan recording thread one waited
-        // for that thread itself and the game froze (#21). Said once if one comes from elsewhere.
+        // draw scheduler the frame is prepared with (#21; the branch above is upstream's net for
+        // the recording thread). Said once if one comes from elsewhere.
         if (!AmdGpu::Liverpool::OnProcessorThread() && !Vulkan::DrawPipe::OnStageB()) {
             static std::atomic<bool> told{false};
             if (!told.exchange(true, std::memory_order_relaxed)) {
@@ -633,11 +649,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
             }
         }
         SubmitFlipInternal(port, index, flip_arg, is_eop);
-        {
-            std::scoped_lock lock{eop_flip_mutex};
-            eop_flips_reached.fetch_add(1, std::memory_order_relaxed);
-        }
-        eop_flip_cv.notify_all();
+        eop_flip_reached();
     }
 
     return true;

@@ -6,7 +6,12 @@
 // state change for one workgroup: ~19% of the GPU's frame time at 720p on the G2). Stage B
 // collects consecutive direct dispatches of it and records them as one dispatch of
 // host_shaders/skin_batch.comp, which does the same arithmetic with each dispatch's buffers by
-// device address (BB_SKIN_BATCH=1).
+// device address (BB_SKIN_BATCH=1). Uncharted 3's skinning (cs 0c936dd6, host_shaders/
+// skin_u3_batch.comp: U1's algorithm without the tangent, one dispatch of 1024-thread groups per
+// character, 93 a frame in the Cartagena market at ~8 us each) joins the same way with
+// BB_SKIN_BATCH_U3=1: its batches take 0.27 ms a frame where the dispatches took ~0.75, and the
+// chase's frame did not move (-0.1 0.0 0.0 0.0 over 4 pairs on the G2, 2026-11-09: the GPU's gain
+// hides behind the display's cadence), so it stays opt-in until a frame shows it.
 //
 // A dispatch joins the batch after the regular resource binding (BindResources: the same buffer
 // lookups, uploads and barrier checks); its buffer accesses go to the barrier tracker when the
@@ -30,6 +35,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/host_shaders/skin_batch_comp.h"
 #include "video_core/host_shaders/skin_mv_batch_comp.h"
+#include "video_core/host_shaders/skin_u3_batch_comp.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -63,13 +69,25 @@ struct SkinKind {
     std::array<u32, 4> written_bytes;       ///< the outputs' fields
     const char* label;
 };
-constexpr std::array<SkinKind, 2> Kinds{{
+constexpr std::array<SkinKind, 3> Kinds{{
     // U1: position, normal, tangent.
     {0x8f067540, 9, 6, 52, 0, {8, 12, 8, 8, 0, 0}, 28, {12, 8, 8}, "skinning batch (cs 8f067540)"},
     // U2: position, normal, tangent, motion.
     {0x7d7e7206, 12, 8, 64, 65, {8, 12, 8, 8, 0, 0, 0, 0}, 36, {12, 8, 8, 8},
      "skinning batch (cs 7d7e7206)"},
+    // U3: position, normal (g2-arm64, 2026-11-09).
+    {0x0c936dd6, 7, 5, 44, 0, {8, 12, 8, 0, 0}, 20, {12, 8}, "skinning batch (cs 0c936dd6)"},
 }};
+
+/// g2-arm64: the kind of a compute shader, or Kinds.size() for any other.
+constexpr u32 KindIndex(u64 hash) {
+    for (u32 k = 0; k < Kinds.size(); ++k) {
+        if (Kinds[k].hash == u32(hash)) {
+            return k;
+        }
+    }
+    return static_cast<u32>(Kinds.size());
+}
 
 /// One dispatch, as the batch shaders read it (std430).
 struct SkinJob {
@@ -156,6 +174,15 @@ bool MvBatchWanted() {
     return wanted;
 }
 
+/// g2-arm64: BB_SKIN_BATCH_U3=1: U3's 0c936dd6 dispatches batched too (with BB_SKIN_BATCH=1).
+bool U3BatchWanted() {
+    static const bool wanted = [] {
+        const char* env = std::getenv("BB_SKIN_BATCH_U3");
+        return env && env[0] == '1';
+    }();
+    return wanted;
+}
+
 bool SkinBatchStats() {
     static const bool stats = std::getenv("BB_SKIN_BATCH_STATS") != nullptr;
     return stats;
@@ -213,13 +240,30 @@ void Rasterizer::InitSkinBatch() {
     skin_batch = std::make_shared<SkinBatch>();
     skin_batch->window = std::chrono::steady_clock::now();
     draw_pipe->SetIdleHandler(&FlushSkinBatchIdle);
-    std::printf("Skin batch: dispatches of cs %08x%s run in batches\n", Kinds[0].hash,
-                MvBatchWanted() ? " and cs 7d7e7206" : "");
+    std::printf("Skin batch: dispatches of cs %08x%s%s run in batches\n", Kinds[0].hash,
+                MvBatchWanted() ? ", cs 7d7e7206" : "", U3BatchWanted() ? ", cs 0c936dd6" : "");
 }
 
 bool Rasterizer::IsSkinBatchShader(u64 hash) const noexcept {
-    return skin_batch && (u32(hash) == Kinds[0].hash || (MvBatchWanted() && u32(hash) == Kinds[1].hash));
+    if (!skin_batch) {
+        return false;
+    }
+    const u32 k = KindIndex(hash);
+    return k == 0 || (k == 1 && MvBatchWanted()) || (k == 2 && U3BatchWanted());
 }
+
+namespace {
+/// g2-arm64: no job of any kind collected.
+template <typename Batch>
+bool NoJobs(const Batch& batch) {
+    for (const auto& jobs : batch.jobs) {
+        if (!jobs.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
 
 void Rasterizer::FlushSkinBatchIdle(void* rasterizer) {
     auto& self = *static_cast<Rasterizer*>(rasterizer);
@@ -231,7 +275,7 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
     auto& batch = *skin_batch;
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     const auto flat = cs.FlatUserData();
-    const u32 k = u32(cs.pgm_hash) == Kinds[1].hash ? 1 : 0;
+    const u32 k = std::min<u32>(KindIndex(cs.pgm_hash), Kinds.size() - 1);
     const SkinKind& kind = Kinds[k];
     const u32 num_buffers = kind.num_buffers;
     // What the batch shader assumes of the guest shader and its dispatch; anything else takes
@@ -289,8 +333,7 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
     } else if (batch.jobs[k].size() >= MaxJobs ||
                batch.job_of_group[k].size() + groups > MaxGroups) {
         FlushSkinBatch(SkinBatch::Full);
-    } else if ((!batch.jobs[0].empty() || !batch.jobs[1].empty()) &&
-               scheduler.CurrentTick() != batch.tick) {
+    } else if (!NoJobs(batch) && scheduler.CurrentTick() != batch.tick) {
         // Constant ring data is retired with the submission it was stamped in.
         FlushSkinBatch(SkinBatch::Tick);
     }
@@ -333,7 +376,7 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
         return false;
     }
 
-    const bool first_job = batch.jobs[0].empty() && batch.jobs[1].empty();
+    const bool first_job = NoJobs(batch);
     const u32 index = static_cast<u32>(batch.jobs[k].size());
     job.count = count;
     job.first_group = static_cast<u32>(batch.job_of_group[k].size());
@@ -378,7 +421,7 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
 }
 
 void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
-    if (!skin_batch || (skin_batch->jobs[0].empty() && skin_batch->jobs[1].empty())) {
+    if (!skin_batch || NoJobs(*skin_batch)) {
         return;
     }
     auto& batch = *skin_batch;
@@ -388,6 +431,7 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
     static const std::array<SkinPipeline, Kinds.size()> pipes{
         CreateSkinPipeline(instance, SKIN_BATCH_COMP),
         CreateSkinPipeline(instance, SKIN_MV_BATCH_COMP),
+        CreateSkinPipeline(instance, SKIN_U3_BATCH_COMP),
     };
     if (batch.needs_barrier) {
         runtime.FlushBarriers();

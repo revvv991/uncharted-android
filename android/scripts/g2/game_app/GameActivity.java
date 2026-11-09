@@ -130,9 +130,11 @@ public class GameActivity extends SDLActivity {
             Os.setenv("BB_VELOCITY_PS", "f4b18264", false);
             Os.setenv("BB_UPSCALE_BEFORE_CS", "aec539f0", false);
             Os.setenv("BB_HUDLESS_PS", "484cdbf5", false);
-            // The sun shadow pass rebuilds positions from the jittered depth: jittered with it,
-            // or its shadows flicker under FSR 3.1 / TAA (upstream 0.3.9's run.py).
-            Os.setenv("BB_JITTER_PS", "f614041e", false);
+            // The full-screen passes that rebuild positions from the jittered depth are jittered
+            // with it, or they flicker under FSR 3.1 / TAA: the sun shadow pass (upstream 0.3.9's
+            // run.py), U1's boat details and U3's London bar surfaces drawn against secondary
+            // scene depth (0.3.12's). The renderer has no list of its own.
+            Os.setenv("BB_JITTER_PS", "f614041e,b2a42acf,1a08df2d", false);
             // The games' own PlayStation buttons in their prompts: upstream's automatic choice
             // shows keyboard keys until a controller is used, and the touch gamepad is none.
             // BB_BUTTON_PROMPTS=xbox (or auto) in More environment picks another style.

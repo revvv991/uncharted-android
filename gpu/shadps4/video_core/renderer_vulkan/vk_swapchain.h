@@ -44,7 +44,9 @@ public:
 
     /// Presents the current image and move to the next one. g2-arm64: with display timing
     /// (BB_PRESENT_PACING) a desired present time (CLOCK_MONOTONIC ns, 0 = at once).
-    bool Present(s64 desired_present_ns = 0, const s64* trace = nullptr, s64 trace_arg = 0);
+    /// latency_id: the game frame's id in low latency mode (0: a generated or repeated frame).
+    bool Present(s64 desired_present_ns = 0, const s64* trace = nullptr, s64 trace_arg = 0,
+                 u64 latency_id = 0);
 
     vk::SurfaceKHR GetSurface() const {
         return surface;

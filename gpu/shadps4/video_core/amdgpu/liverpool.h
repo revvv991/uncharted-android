@@ -168,9 +168,12 @@ public:
     struct Command {
         Common::UniqueFunction<void> func;
         bool in_order = false;
+        const char* tag = nullptr; // g2-arm64: the sender, for the drain statistics (a literal)
     };
+    /// g2-arm64: `tag` names the sender in BB_FRAME_STATS' "command drains by source" (a string
+    /// literal: the pointer is the key).
     template <bool wait_done = false, bool in_order = false>
-    void SendCommand(auto&& func) {
+    void SendCommand(auto&& func, const char* tag = nullptr) {
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
@@ -179,18 +182,24 @@ public:
                                                func();
                                                sem.release();
                                            },
-                                           in_order});
+                                           in_order, tag});
                 ++num_commands;
                 submit_cv.notify_one();
             }
             sem.acquire();
         } else {
             std::scoped_lock lk{submit_mutex};
-            command_queue.push(Command{std::forward<decltype(func)>(func), in_order});
+            command_queue.push(Command{std::forward<decltype(func)>(func), in_order, tag});
             ++num_commands;
             submit_cv.notify_one();
         }
     }
+    /// g2-arm64: the plain commands the draw pipe was drained for, by their tag (statistics).
+    struct CommandDrainCount {
+        const char* tag;
+        u64 count;
+    };
+    std::array<CommandDrainCount, 8> command_drains{};
 
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];

@@ -21,6 +21,7 @@ import sys
 PORT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PORT / 'scripts'))
 import cheats
+from prepare import collection_folder
 EXECUTABLES = {'u1': 'eboot.bin', 'u2': 'big2-ps4_Shipping.elf', 'u3': 'big3-ps4_Shipping.elf'}
 LOADEXEC_EXIT = 101  # runtime_services.c: the game asked for another executable
 
@@ -75,7 +76,10 @@ def locate(env, name):
     if not folder:
         return None, name
     folder = Path(folder)
-    if own and not (folder / name).is_file() and (folder / 'eboot.bin').is_file():
+    # Not in a collection folder: there eboot.bin is Uncharted 1, and an incomplete dump without
+    # big2/big3 started Uncharted 1 on half its files (a player's log, 2026-11-01).
+    if own and not (folder / name).is_file() and (folder / 'eboot.bin').is_file() \
+            and not collection_folder(folder):
         name = 'eboot.bin'
     return folder, name
 
@@ -176,9 +180,9 @@ def main():
     env.setdefault('BB_VELOCITY_PS', 'f4b18264')
     env.setdefault('BB_UPSCALE_BEFORE_CS', 'aec539f0')
     env.setdefault('BB_HUDLESS_PS', '484cdbf5')
-    # Full-screen passes that rebuild positions from the jittered scene depth get the upscaler's
-    # jitter too: the sun shadow pass (without it its shadows flickered under FSR and TAA).
-    env.setdefault('BB_JITTER_PS', 'f614041e')
+    # These passes need the scene's jitter too: sun shadow reconstruction, U1 boat details,
+    # and U3 London bar surfaces drawn against secondary scene depth (otherwise they flicker).
+    env.setdefault('BB_JITTER_PS', 'f614041e,b2a42acf,1a08df2d')
     if not env.get('BB_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['BB_FSR411_DIR'] = str(data / 'fsr4_411')
 
@@ -210,6 +214,8 @@ def main():
     player_tiny = env.get('BB_TINY_READBACK')
     player_small = env.get('BB_READBACK_SMALL_BUFFERS')
     player_copy = env.get('BB_SCALAR_COPY64_SYNC')
+    player_gate = env.get('BB_READBACK_SMALL_GATE')
+    player_copy_eop = env.get('BB_COPY64_EOP_READBACK')
     all_cheats = env.setdefault('BB_CHEATS_ALL', env.get('BB_CHEATS', ''))
     while True:
         if player_merge is None:
@@ -225,6 +231,18 @@ def main():
         # once the GPU is done with them, so nothing waits (U3 Cartagena square: 60 FPS with and without).
         if player_small is None:
             env['BB_READBACK_SMALL_BUFFERS'] = '1' if exe in (EXECUTABLES['u2'], EXECUTABLES['u3']) else '0'
+        # U3 characters sinking into the ground, floating or twitching (#727, #745, #751; fix from
+        # drakolordx7's community build): the raycaster copy's results are read back and land once the
+        # GPU is done (no cost: Cartagena market 88 -> 96 FPS uncapped). The full fix also makes the
+        # end-of-pipe label wait for them and every small result (BB_COPY64_EOP_GATE=1,
+        # BB_READBACK_SMALL_GATE=1, launcher On: 53 FPS), so it is left to the player.
+        if player_copy_eop is None:
+            if exe == EXECUTABLES['u3']:
+                env['BB_COPY64_EOP_READBACK'] = '1'
+            else:
+                env.pop('BB_COPY64_EOP_READBACK', None)
+        if player_gate is None:
+            env.pop('BB_READBACK_SMALL_GATE', None)
         # The mesh raycaster copies land in guest memory too (iSubMesh after checkpoints; U1 crashes
         # in the Customs House and cutscenes without it). On for U1 and U2: -9 to -16% at 110-130 FPS
         # in U1, so none at 60. Off in U3: it cost 94 -> 54 FPS in Cartagena square.
@@ -236,7 +254,8 @@ def main():
         if not game:
             fail('Set BB_GAME_DIR to the game folder (the one with eboot.bin).')
         if not (game / file).is_file():
-            fail(f'No {file} in {game}.')
+            fail(f'No {file} in {game}: the game dump is incomplete (extract the game again) or the wrong folder '
+                 'is chosen for this game.')
         out = out_root / Path(exe).stem.split('-')[0]
         prepare(game, file, out)
         run_script('content_profile.py', game, '--out', out, '--sku', env.get('BB_CONTENT_SKU', 'full'))

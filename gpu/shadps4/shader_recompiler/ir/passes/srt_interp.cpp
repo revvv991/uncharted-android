@@ -59,9 +59,13 @@ struct Op {
     // A load that faulted: the destination gets 0 (shadPS4). A copy that faulted: not used any
     // more, its pairs run one by one.
     std::atomic<bool> zeroed{false};
+    // g2-arm64: a Mov whose load faulted reads 0 while the walk count is below this - not for
+    // good: a table the game freed or had not mapped yet is tried again after ZeroWalks walks.
+    std::atomic<u64> zero_until{0};
     Operand ops[3];
     Op(Kind k, u8 n) : kind{k}, count{n} {}
-    Op(Op&& o) noexcept : kind{o.kind}, count{o.count}, zeroed{o.zeroed.load()} {
+    Op(Op&& o) noexcept
+        : kind{o.kind}, count{o.count}, zeroed{o.zeroed.load()}, zero_until{o.zero_until.load()} {
         std::memcpy(ops, o.ops, sizeof(ops));
     }
 };
@@ -366,8 +370,13 @@ inline void Write(const Operand& o, State& s, u64 v) {
 
 // current_op: the op running, for the fault handler. On the caller's stack: a thread_local
 // cost a call to the dynamic TLS resolver per op.
+// g2-arm64: walks of every walker, counted; a faulting load's zero expires after ZeroWalks of them
+// (~20 ms at the chase's 200k walks/s).
+std::atomic<u64> g_walks{0};
+constexpr u64 ZeroWalks = 4096;
+
 void Execute(Program& p, const u32* user_data, u32* flat_dst, bool copies,
-             volatile size_t& current_op) {
+             volatile size_t& current_op, u64 walk) {
     u64 stack[64];
     State s{};
     s.r[7] = reinterpret_cast<u64>(user_data); // rdi
@@ -381,7 +390,7 @@ void Execute(Program& p, const u32* user_data, u32* flat_dst, bool copies,
         const u8 size = d.type == Operand::None ? 8 : d.size;
         switch (op.kind) {
         case Kind::Mov:
-            Write(d, s, op.zeroed.load(std::memory_order_relaxed) ? 0 : Read(a, s, size));
+            Write(d, s, op.zero_until.load(std::memory_order_relaxed) > walk ? 0 : Read(a, s, size));
             break;
         case Kind::Add: Write(d, s, Read(d, s, size) + Read(a, s, size)); break;
         case Kind::Sub: Write(d, s, Read(d, s, size) - Read(a, s, size)); break;
@@ -445,7 +454,7 @@ void Execute(Program& p, const u32* user_data, u32* flat_dst, bool copies,
 // BB_SRT_CHECK: the walk without block copies (every pair on its own, as before them) into a
 // copy of the flat buffer as it was before the walk; a fault there only skips the comparison.
 void CheckWalk(Program& p, PFN_SrtWalker walker, const u32* user_data, const u32* flat_dst,
-               std::vector<u32>& reference) {
+               std::vector<u32>& reference, u64 current_walk) {
     sigjmp_buf recover;
     sigjmp_buf* const saved = runtime_fault_recover;
     if (sigsetjmp(recover, 0)) {
@@ -454,7 +463,7 @@ void CheckWalk(Program& p, PFN_SrtWalker walker, const u32* user_data, const u32
     }
     runtime_fault_recover = &recover;
     volatile size_t current_op = 0;
-    Execute(p, user_data, reference.data(), false, current_op);
+    Execute(p, user_data, reference.data(), false, current_op, current_walk);
     runtime_fault_recover = saved;
     static std::atomic<u64> walks{0}, mismatches{0};
     const u64 walk = walks.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -526,6 +535,7 @@ bool RunSrtWalkerInterpreted(PFN_SrtWalker walker, const u32* user_data, u32* fl
         reference = &buffer;
     }
     volatile size_t current_op = 0;
+    const u64 walk = g_walks.fetch_add(1, std::memory_order_relaxed);
     for (size_t attempt = 0; attempt <= program->ops.size(); ++attempt) {
         sigjmp_buf recover;
         sigjmp_buf* const saved = runtime_fault_recover;
@@ -535,24 +545,30 @@ bool RunSrtWalkerInterpreted(PFN_SrtWalker walker, const u32* user_data, u32* fl
             if (op.kind == Kind::Copy && !op.zeroed.exchange(true)) {
                 continue; // its pairs run one by one from now on
             }
-            if (op.kind != Kind::Mov || op.zeroed.exchange(true)) {
+            if (op.kind != Kind::Mov || op.zero_until.load(std::memory_order_relaxed) > walk) {
                 std::printf("SRT interpreter: walker %p faulted in op %zu (kind %u), giving up\n",
                             reinterpret_cast<void*>(walker), static_cast<size_t>(current_op),
                             unsigned(op.kind));
                 std::abort();
             }
+            // g2-arm64: the zero was for good once - U3's chase, 2026-11-09: a whole chain of 70
+            // loads of one walker faulted at once (a table freed or not yet mapped), every later
+            // walk of it fed the recompiler a null buffer, an assertion stopped the process.
+            op.zero_until.store(walk + ZeroWalks, std::memory_order_relaxed);
             static std::atomic<u32> reports{0};
             if (reports.fetch_add(1) < 32) {
-                std::printf("SRT interpreter: walker %p load %zu faulted; it reads 0 from now on\n",
-                            reinterpret_cast<void*>(walker), static_cast<size_t>(current_op));
+                std::printf("SRT interpreter: walker %p load %zu faulted; it reads 0 for the next "
+                            "%llu walks\n",
+                            reinterpret_cast<void*>(walker), static_cast<size_t>(current_op),
+                            static_cast<unsigned long long>(ZeroWalks));
             }
             continue;
         }
         runtime_fault_recover = &recover;
-        Execute(*program, user_data, flat_dst, settings.copies, current_op);
+        Execute(*program, user_data, flat_dst, settings.copies, current_op, walk);
         runtime_fault_recover = saved;
         if (check && attempt == 0) {
-            CheckWalk(*program, walker, user_data, flat_dst, *reference);
+            CheckWalk(*program, walker, user_data, flat_dst, *reference, walk);
         }
         return true;
     }

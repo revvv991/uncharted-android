@@ -100,6 +100,36 @@ private:
 #endif
 };
 
+/// g2-arm64 diagnosis: BB_TAX_A_NS=<ns> burns that long on the command thread for every draw
+/// and dispatch (Rasterizer::PostDraw), BB_TAX_B_NS=<ns> on the recording thread for every
+/// packet (DrawPipe::Run, inside its busy time): the frame's sensitivity to a stage's time -
+/// what a diet of that stage would buy - measured before the diet is written. Off unless set.
+class BbStageTax {
+public:
+    static std::uint64_t StageA() {
+        static const std::uint64_t ns = Read("BB_TAX_A_NS");
+        return ns;
+    }
+    static std::uint64_t StageB() {
+        static const std::uint64_t ns = Read("BB_TAX_B_NS");
+        return ns;
+    }
+    static void Pay(std::uint64_t ns) {
+        if (ns == 0) {
+            return;
+        }
+        const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
+
+private:
+    static std::uint64_t Read(const char* name) {
+        const char* env = std::getenv(name);
+        return env ? std::strtoull(env, nullptr, 10) : 0;
+    }
+};
+
 /// g2-arm64: the calling thread's thread pointer, as an identity: one register read, where a
 /// thread_local in a dlopen-ed library costs a call to the dynamic TLS resolver per access.
 static inline std::uintptr_t bb_thread_pointer() {

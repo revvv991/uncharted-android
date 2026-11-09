@@ -1101,6 +1101,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     sel.fetch_shader = std::nullopt;
 
     Shader::Backend::Bindings binding{};
+    bool translation_failed = false; // g2-arm64: a stage's program could not be made
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -1122,6 +1123,10 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         std::tie(sel.infos[stage_out_idx], sel.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(sel, stage_in, stage_out, params, binding);
+        if (!sel.infos[stage_out_idx]) {
+            translation_failed = true; // g2-arm64: the draw is skipped (GetProgram)
+            return false;
+        }
         if (fetch_shader_) {
             sel.fetch_shader = fetch_shader_;
         }
@@ -1201,6 +1206,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         return false;
     }
 
+    if (translation_failed) {
+        return false;
+    }
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
     // g2-arm64 (from uncharted_Linux 055fac6): a draw whose vertex buffer table pointer is
     // null (Bloodborne, before a crash at the cutscene after Rom) has no vertex input to
@@ -1239,7 +1247,7 @@ bool PipelineCache::RefreshComputeKey() {
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
-    return true;
+    return sel.infos[0] != nullptr; // g2-arm64: no program (its translation abandoned), no dispatch
 }
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
@@ -1429,12 +1437,31 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     }
 
     Program* program = FindProgram(params.hash);
+    // g2-arm64: the translation reads guest memory through the resource tables; a table the
+    // game freed (U3's chase, 2026-11-09: the walker's loads faulted, the recompiler asserted on
+    // the null buffer and stopped the process) abandons this draw instead - an assertion or a
+    // fault in it returns here, the draw is skipped (its stage has no program), the next draw
+    // tries again. The claim is released and no lock is held across the translation.
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = nullptr;
+        ReleaseClaim(params.hash);
+        static std::atomic<u32> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("GPU: draw skipped: its shader %#llx could not be translated (an assertion "
+                        "or a fault reading its resource tables)\n",
+                        static_cast<unsigned long long>(params.hash));
+        }
+        return {};
+    }
     if (!program) {
         AcquireClaim(params.hash);
         program = FindProgram(params.hash);
         if (!program) {
+            runtime_fault_recover = &recover;
             const auto created = CreateProgram(hw_stage, sw_stage, params, runtime_info, binding,
                                                pools);
+            runtime_fault_recover = nullptr;
             ReleaseClaim(params.hash);
             return std::make_tuple(&created.program->info, created.module, created.fetch_shader,
                                    created.perm_hash);
@@ -1489,7 +1516,9 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             perm_idx = program->modules.size();
             const u64 perm_hash = HashCombine(params.hash, perm_idx);
             auto new_info = Shader::Info(hw_stage, sw_stage, params);
+            runtime_fault_recover = &recover; // g2-arm64: see above
             module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding, pools);
+            runtime_fault_recover = nullptr;
             fetch_shader = spec.fetch_shader_data;
 
             RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);

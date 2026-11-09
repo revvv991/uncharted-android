@@ -4,15 +4,15 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Experimental, an early preview (version 0.3.0).** Tested on the Retroid Pocket G2 and, for a day, a Nothing Phone 3 (Adreno 825).
+> **Beta (version 0.3.1): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
 ## Status
 
 Tested on the Retroid Pocket G2 (Snapdragon G2 Gen 2, Adreno A735, 8 GB) at 1280x720 - the numbers
-below are its - and for a day on a Nothing Phone 3 (Snapdragon 8s Gen 4, Adreno 825), where the
-bundled driver runs the three games since 0.3.0.
+below are its - and on a Nothing Phone 3 (Snapdragon 8s Gen 4, Adreno 825), where the bundled
+driver runs the three games since 0.3.0 and holds Uncharted 3's Cartagena market since 0.3.1.
 
 - **Uncharted: Drake's Fortune**: playable, about 30-43 FPS in the places measured (GPU-bound); the
   30 limit holds without the hitches of the earlier versions since 0.3.0.
@@ -22,8 +22,9 @@ bundled driver runs the three games since 0.3.0.
   rate; the launcher's settings turn it off).
 - **Uncharted 3: Drake's Deception**: playable at 25-30 FPS in the first chapter's fight; Cartagena's
   market chase holds 29-30 at the 30 limit since 0.3.0 (25-27 before: the game's job workers held
-  the cores the port's command processing needed for its 2,300-2,700 draws a frame). It runs with
-  accurate GPU memory too: without it the frame rate fell the longer one played.
+  the cores the port's command processing needed for its 2,300-2,700 draws a frame); its characters
+  no longer sink into the ground since 0.3.1 (uncharted_pc 0.3.13's fix). It runs with accurate GPU
+  memory too: without it the frame rate fell the longer one played.
 - The app has a launcher: it finds your dump, makes the loader's files from it on the device and
   writes the settings. The APK is on the
   [Releases](https://github.com/revvv991/uncharted-android/releases) page.
@@ -53,7 +54,7 @@ bundled driver runs the three games since 0.3.0.
 ## Repository layout
 
 - The root is the port: upstream uncharted_pc with our work on top, one commit per release
-  (base: uncharted_pc 0.3.11).
+  (base: uncharted_pc 0.3.14).
   The upstream README is kept as [README.uncharted_pc.md](README.uncharted_pc.md).
 - [`android/`](android/): the Android part. Build scripts, the APK and its launcher, device tools,
   the patches for FEX and Mesa.
@@ -75,7 +76,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.3.0.apk` from
+1. Install the APK (`uncharted-android-0.3.1.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),

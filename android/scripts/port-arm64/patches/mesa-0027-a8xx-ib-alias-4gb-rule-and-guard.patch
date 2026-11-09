@@ -1,0 +1,107 @@
+From 044bf037298b0d41fadb19208c9fa1bbf19682e3 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] turnip/kgsl: the command BO alias follows the chip's 4 GB
+ rule and carries a guard range
+
+The alias of mesa-0026 asked KGSL for an address below 4 GB on every chip
+(TU_IB_LOW4G unset meant on), which put the Adreno 825's command streams
+where the 4 GB rule put plain command BOs on 2026-11-07 (0x4000000 and up,
+above the UCHE GMEM aperture): the CP stalls there. On the owner's Nothing
+Phone 3 with main of 2026-11-10 U3's main menu ran at 2 FPS - every frame's
+~15 submits retired together ~600 ms later with the GPU and the kernel idle
+in between, the port's threads in vkWaitSemaphores. The alias now asks for an
+address below 4 GB only where kgsl_alloc_low4g would (the A7xx, or
+TU_IB_LOW4G=1), and is 64 KiB larger than its BO with that tail mapped to
+zeros: a plain KGSL allocation has a guard page for the CP's fetch past the
+end of a command stream, a VBO with VBO_NO_MAP_ZERO had none
+(TU_KGSL_IB_GUARD=0 drops it).
+---
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 59 +++++++++++++++++++++++------
+ 1 file changed, 48 insertions(+), 11 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 111c8bb4033..454fae98c4e 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -419,8 +419,9 @@ kgsl_align_flag(uint64_t align)
+  * (TU_BO_ALLOC_NO_32B_ROLLOVER) through a virtual BO alias, which is unbound before the memory
+  * goes away, and retired command BOs are kept in a cache (up to 256 MiB idle) and reused instead
+  * of freed. A8xx with KGSL's virtual BOs only. TU_KGSL_IB_ALIAS=0 turns the alias off,
+- * TU_KGSL_IB_CACHE=0 the cache. The alias asks for an address below 4 GB too when TU_IB_LOW4G
+- * is on, so the CP firmware's IB rule (0016, 0017) still holds.
++ * TU_KGSL_IB_CACHE=0 the cache. The alias asks for an address below 4 GB where plain command
++ * BOs would (kgsl_ib_low4g_wanted: the A7xx, or TU_IB_LOW4G=1), so the CP firmware's IB rule
++ * (0016, 0017) still holds there and the Adreno 8xx keeps its addresses (0024).
+  */
+ static bool
+ kgsl_ib_alias_wanted(struct tu_device *dev, enum tu_bo_alloc_flags flags)
+@@ -436,21 +437,57 @@ kgsl_ib_alias_wanted(struct tu_device *dev, enum tu_bo_alloc_flags flags)
+           dev->physical_device->info->chip >= A8XX;
+ }
+ 
+-/* The alias: a virtual BO of the command BO's size with the BO bound at its start; the GPU
+- * address handed out is the alias's. False when KGSL refuses (the BO is then used as it is). */
++/* uncharted-android: whether a command BO alias asks for an address below 4 GB: the rule of
++ * kgsl_alloc_low4g (TU_IB_LOW4G: 0 never, 1 always, unset on the A7xx only). The first alias
++ * version asked for it on every chip: on the Adreno 825 the aliases then sat where the 4 GB rule
++ * put plain command BOs on 2026-11-07 (0x4000000 and up, above the UCHE GMEM aperture) - U3's
++ * main menu at 2 FPS, every frame's GPU work retired ~600 ms after its submits with the GPU and
++ * the kernel idle in between (the Nothing Phone 3 on main, 2026-11-10). */
++static bool
++kgsl_ib_low4g_wanted(struct tu_device *dev)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = os_get_option("TU_IB_LOW4G");
++      on = !env || !env[0] ? 1 : env[0] == '0' ? 0 : env[0] == '1' ? 2 : 1;
++   }
++   return on == 2 || (on == 1 && dev->physical_device->info->chip < A8XX);
++}
++
++/* uncharted-android: a guard range after the command BO inside its alias. A plain KGSL
++ * allocation carries a guard page for the CP's fetch past the end of a command stream; a VBO
++ * maps nothing past its bound ranges, so the alias is this much larger and its tail reads as
++ * zeros (no VBO_NO_MAP_ZERO). TU_KGSL_IB_GUARD=0: none, the alias exactly the BO's size. */
++static uint64_t
++kgsl_ib_alias_guard(void)
++{
++   static int64_t guard = -1;
++   if (guard < 0) {
++      const char *env = os_get_option("TU_KGSL_IB_GUARD");
++      guard = env && env[0] == '0' ? 0 : 64 << 10;
++   }
++   return guard;
++}
++
++/* The alias: a virtual BO of the command BO's size (and the guard's) with the BO bound at its
++ * start; the GPU address handed out is the alias's. False when KGSL refuses (the BO is then
++ * used as it is). */
+ static bool
+ kgsl_ib_alias_bind(struct tu_device *dev, struct tu_bo *bo, uint64_t align)
+ {
+    int fd = dev->physical_device->local_fd;
+-   static int low4g = -1;
+-   if (low4g < 0) {
+-      const char *env = os_get_option("TU_IB_LOW4G");
+-      low4g = !(env && env[0] == '0');
++   const bool low4g = kgsl_ib_low4g_wanted(dev);
++   const uint64_t guard = kgsl_ib_alias_guard();
++   static bool said;
++   if (!said) {
++      said = true;
++      tu_note("tu/kgsl: command BO aliases %s, %llu KiB guard after each BO",
++              low4g ? "below 4 GB" : "where KGSL puts them", (unsigned long long) (guard >> 10));
+    }
+    struct kgsl_gpuobj_alloc alloc = {
+-      .size = bo->size,
+-      .flags = KGSL_MEMFLAGS_VBO | KGSL_MEMFLAGS_VBO_NO_MAP_ZERO | kgsl_align_flag(align) |
+-               (low4g ? KGSL_MEMFLAGS_FORCE_32BIT : 0),
++      .size = bo->size + guard,
++      .flags = KGSL_MEMFLAGS_VBO | (guard ? 0 : KGSL_MEMFLAGS_VBO_NO_MAP_ZERO) |
++               kgsl_align_flag(align) | (low4g ? KGSL_MEMFLAGS_FORCE_32BIT : 0),
+    };
+    if (safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc)) {
+       alloc.flags &= ~KGSL_MEMFLAGS_FORCE_32BIT;
+-- 
+2.43.0
+

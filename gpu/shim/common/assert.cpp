@@ -22,7 +22,10 @@ static void abandon_speculation() {
     }
     sigjmp_buf* recover = runtime_fault_recover;
     runtime_fault_recover = nullptr;
-    std::fputs("GPU assertion while preparing a draw ahead of the GPU thread: leaving the draw to the GPU thread\n",
+    // g2-arm64: the GPU thread arms the same point around a shader translation (GetProgram):
+    // there the draw is skipped.
+    std::fputs("GPU assertion under a recovery point: the draw is abandoned (a preparation "
+               "worker leaves it to the GPU thread; the GPU thread skips it)\n",
                stderr);
 #ifdef _WIN32
     bb_longjmp(*recover, 1);

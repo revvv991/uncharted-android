@@ -287,6 +287,15 @@ void Liverpool::ProcessCommands() {
         if (rasterizer && !drained) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
             drained = true;
+            // g2-arm64: who the pipe was drained for (BB_FRAME_STATS prints the counts).
+            const char* tag = command.tag ? command.tag : "untagged";
+            for (auto& entry : command_drains) {
+                if (entry.tag == tag || !entry.tag) {
+                    entry.tag = tag;
+                    ++entry.count;
+                    break;
+                }
+            }
         }
         command.func();
     }
@@ -1143,7 +1152,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
-            while ((cblock.de_count - cblock.ce_count) >= diff) {
+            while (cblock.ce_count >= cblock.de_count &&
+                   (cblock.ce_count - cblock.de_count) >= diff) {
                 YIELD_CE();
             }
             break;

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include "bbport_present_pacing.h"
 #include "bbport_settings.h"
@@ -11,6 +13,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_low_latency.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -41,6 +44,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
     needs_recreation = false;
 
     Destroy();
+    // RefreshSemaphores sizes the semaphores to the new image count: a smaller count left
+    // frame_index past their end (from BilalReloaded's port 0.8.0).
+    image_index = frame_index = 0;
 
     if (!SetSurfaceProperties()) {
         surface_lost = true;
@@ -58,6 +64,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
     const vk::SwapchainCreateInfoKHR swapchain_info = {
+        .pNext = LowLatency::SwapchainNext(),
         .surface = surface,
         .minImageCount = image_count,
         .imageFormat = format.format,
@@ -91,6 +98,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
+    LowLatency::OnSwapchain(swapchain);
 
     SetupImages();
     RefreshSemaphores();
@@ -194,8 +202,14 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
-bool Swapchain::Present(s64 desired_present_ns, const s64* trace, s64 trace_arg) {
+bool Swapchain::Present(s64 desired_present_ns, const s64* trace, s64 trace_arg, u64 latency_id) {
+    // bbport: low latency mode (vk_low_latency.h): the game's frame carries its frame id.
+    const vk::PresentIdKHR present_id_info{
+        .swapchainCount = 1,
+        .pPresentIds = &latency_id,
+    };
     vk::PresentInfoKHR present_info = {
+        .pNext = LowLatency::UsesPresentId() ? &present_id_info : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -208,11 +222,12 @@ bool Swapchain::Present(s64 desired_present_ns, const s64* trace, s64 trace_arg)
         .presentID = ++present_id,
         .desiredPresentTime = u64(std::max<s64>(desired_present_ns, 0)),
     };
-    const vk::PresentTimesInfoGOOGLE present_times{
+    vk::PresentTimesInfoGOOGLE present_times{
         .swapchainCount = 1,
         .pTimes = &present_time,
     };
     if (present_timing) {
+        present_times.pNext = present_info.pNext; // behind the present id, if any
         present_info.pNext = &present_times;
     }
 
@@ -220,7 +235,9 @@ bool Swapchain::Present(s64 desired_present_ns, const s64* trace, s64 trace_arg)
     if (trace && present_timing) {
         BbPresentPacing::NotePresented(present_id, trace_arg, trace, BbPresentPacing::NowNs());
     }
+    LowLatency::PresentStart(latency_id);
     auto result = instance.GetPresentQueue().presentKHR(present_info);
+    LowLatency::PresentEnd(latency_id);
 #ifdef __ANDROID__
     if (result == vk::Result::eSuboptimalKHR) {
         result = vk::Result::eSuccess; // rotated display, see AcquireNextImage
@@ -380,6 +397,36 @@ bool Swapchain::SetSurfaceProperties() {
         extent.height = std::max(capabilities.minImageExtent.height,
                                  std::min(capabilities.maxImageExtent.height, height));
     }
+    // g2-arm64: BB_SWAPCHAIN_SIZE=WxH (the current orientation's width and height) - the images
+    // at that size, scaled to the window by the display's compositor (Android's swapchain layer
+    // sets SCALE_TO_WINDOW on the native window): the port's own blit of a 1280x720 frame into the
+    // 1920x1080 window and the overlay pass cost ~1.5 ms of GPU a frame on the G2 (findings
+    // 2026-11-08 night, the present skipped: +1.6 FPS). With FSR on the blit is the upscaler
+    // itself: leave this unset then. Off unless set.
+    static const vk::Extent2D wanted = [] {
+        vk::Extent2D size{0, 0};
+        if (const char* env = std::getenv("BB_SWAPCHAIN_SIZE")) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(env, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 180 && w <= 7680 &&
+                h <= 4320) {
+                size = vk::Extent2D{w, h};
+            }
+        }
+        return size;
+    }();
+    if (wanted.width != 0) {
+        extent.width = std::max(capabilities.minImageExtent.width,
+                                std::min(capabilities.maxImageExtent.width, wanted.width));
+        extent.height = std::max(capabilities.minImageExtent.height,
+                                 std::min(capabilities.maxImageExtent.height, wanted.height));
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("Swapchain: %ux%u images for the %ux%u window (BB_SWAPCHAIN_SIZE)\n",
+                        extent.width, extent.height, capabilities.currentExtent.width,
+                        capabilities.currentExtent.height);
+        }
+    }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
     // (bbport: two with frame generation, which presents several images per game frame).
@@ -446,6 +493,7 @@ bool Swapchain::SetSurfaceProperties() {
 }
 
 void Swapchain::Destroy() {
+    LowLatency::OnSwapchainDestroy();
     vk::Device device = instance.GetDevice();
     const auto wait_result = device.waitIdle();
     if (wait_result != vk::Result::eSuccess) {

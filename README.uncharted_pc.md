@@ -87,6 +87,11 @@ Many of the 0.3.10 fixes were found and made by drakolordx7 in the
 memory leak fix is from Mevlock, the NVIDIA crash fix above 55 FPS (large compute
 workgroups) from Umar-Qayyum-dev.
 Most 0.3.11 fixes come from Mevlock's [dev builds](https://github.com/Mevlock/uncharted_pc-dev).
+The 0.3.12 fixes are pull requests by Jhojan Jiménez, FerManjarres, dbcalo and mato215, and picks
+from drakolordx7's community build (Mevlock, Alex, iannitram).
+0.3.13: the Uncharted 3 sinking characters fix is drakolordx7's, the Quit game button dbcalo's.
+0.3.14: crash, freeze and speed fixes from Mevlock's dev builds, drakolordx7's community build and
+Lalit Shankar Chowdhury; the job guard for 1.02 games follows BilalReloaded's port.
 
 Also used: [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK (FSR),
 FSR 4 assets from [FireBurn/Q2RTX](https://github.com/FireBurn/Q2RTX), the

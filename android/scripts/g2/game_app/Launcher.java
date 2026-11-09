@@ -1164,6 +1164,13 @@ public class Launcher extends Activity {
             // against 0.5-3.6%), so U2 keeps the probing rule. More environment overrides.
             if (u2 && !envNames("BB_PRESENT_PACING_ADAPT"))
                 env[i] += "BB_PRESENT_PACING_ADAPT=1\n";
+            // U3's characters sinking into the ground, floating or twitching (upstream 0.3.13,
+            // drakolordx7's fix; 0.3.14 made it free): the raycaster copy's results are read back
+            // at the end-of-pipe fence and land once the GPU is done, as upstream's run.py sets
+            // for U3. On the G2 (the market chase, the limit off, 4 pairs): 30.2/30.0/30.0 against
+            // 30.1/29.9/30.0, a thermal fourth pair - within 0.1 FPS. More environment overrides.
+            if (u3 && !envNames("BB_COPY64_EOP_READBACK"))
+                env[i] += "BB_COPY64_EOP_READBACK=1\n";
         }
         StringBuilder e = new StringBuilder();
         e.append("# Written by the launcher on every start; edit the settings there.\n");
@@ -1184,6 +1191,9 @@ public class Launcher extends Activity {
         // falls behind (shaders compiling, a slow device) made it trip its own command buffer
         // check (issue #5); no cost on the G2.
         e.append("BB_MAX_FRAMES_AHEAD=2\n");
+        // Continue and New Game go straight into the game: the "friends' stats are not available"
+        // notice is skipped (upstream 0.3.14's launcher option, on by default; nothing goes online).
+        e.append("BB_OFFLINE_NPID=1\n");
         e.append("BB_DUMP_REQUEST=").append(d).append("/dump-request\n");
         String cpus = fastCpus();
         if (cpus != null) e.append("BB_RENDER_CPUS=").append(cpus).append('\n');

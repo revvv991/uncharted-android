@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """The release of the public repository through the GitHub API, on the owner's word (every push and
 release needs it). The version is android/VERSION; the tag v<version>, the title
-"uncharted-android <version>", the asset uncharted-android-<version>.apk. The token comes from
+"uncharted-android <version> (<STAGE>)", the asset uncharted-android-<version>.apk. Since 0.3.1 a
+release is a full GitHub release marked latest, its stage in the title (the owner, 2026-11-10: "a
+release like alpha or beta, not a pre-release"); 0.1.0-0.3.0 were pre-releases. The token comes from
 git's credential helper (Git Credential Manager, account revvv991) and is never printed.
   publish.py check                       the token's user and scopes, the repositories
-  publish.py release <notes.md> <apk>    the pre-release with the APK (after the public push)
+  publish.py release <notes.md> <apk>    the release with the APK (after the public push)
   publish.py verify                      the public main, the release and its assets
   publish.py describe                    the public repository's description
 Run it with `python -I` from a directory that holds nothing untrusted. The steps around it:
@@ -20,7 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VERSION = open(os.path.join(HERE, '..', '..', 'VERSION'), encoding='utf-8').read().strip()
 OWNER = 'revvv991'
 PRIVATE, PUBLIC = 'uncharted-android-dev', 'uncharted-android'
-TAG, TITLE, ASSET = 'v' + VERSION, 'uncharted-android ' + VERSION, 'uncharted-android-%s.apk' % VERSION
+STAGE = 'beta'
+TAG, TITLE, ASSET = 'v' + VERSION, 'uncharted-android %s (%s)' % (VERSION, STAGE), 'uncharted-android-%s.apk' % VERSION
 DESCRIPTION = ('Uncharted: The Nathan Drake Collection (PS4) on Android with Adreno GPUs: '
                'uncharted_pc on FEXCore and Turnip. No game files included.')
 
@@ -86,7 +89,8 @@ elif cmd == 'release':
         sys.exit('the APK should be named %s (android/VERSION is %s)' % (ASSET, VERSION))
     code, r, _ = api('POST', '/repos/%s/%s/releases' % (OWNER, PUBLIC),
                      {'tag_name': TAG, 'target_commitish': 'main', 'name': TITLE,
-                      'body': open(notes, encoding='utf-8').read(), 'draft': False, 'prerelease': True})
+                      'body': open(notes, encoding='utf-8').read(), 'draft': False, 'prerelease': False,
+                      'make_latest': 'true'})
     if code != 201:
         sys.exit('release: %s %s' % (code, r))
     print('release:', r['html_url'], '| id', r['id'])
@@ -102,7 +106,7 @@ elif cmd == 'verify':
               '| parent', c['parents'][0]['sha'][:7])
     code, rel, _ = api('GET', '/repos/%s/%s/releases/tags/%s' % (OWNER, PUBLIC, TAG))
     if code == 200:
-        print('release:', rel['html_url'], '| prerelease', rel['prerelease'], '| assets',
+        print('release:', rel['html_url'], '|', rel['name'], '| prerelease', rel['prerelease'], '| assets',
               [(x['name'], x['size'], x['state']) for x in rel['assets']])
     else:
         print('release %s: not there yet' % TAG)

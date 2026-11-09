@@ -40,7 +40,7 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.11'
+VERSION = '0.3.14'
 RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
 RELEASES_PAGE = 'https://github.com/Supermedo/uncharted_pc/releases/latest'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'
@@ -98,6 +98,7 @@ AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')
 # Frames generated between two of the game's (BB_FRAME_GEN, BB_FRAME_GEN_MULTIPLIER).
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
                     ('dlss', 'NVIDIA DLSS Frame Generation (GeForce RTX 40/50)')]
+LOW_LATENCY = [('0', 'Off'), ('1', 'On'), ('2', 'On + boost (NVIDIA: GPU clocks stay up)')]
 BUTTON_PROMPTS = [('auto', 'Automatic (follows the device you used last)'),
                   ('keyboard', 'Keyboard and mouse keys'), ('xbox', 'Xbox buttons'),
                   ('0', "PlayStation buttons (the game's own)")]
@@ -175,6 +176,13 @@ FIXES = {
         'Copies small GPU results back every frame (fixes black weapons and stuck brightness). '
         'Automatic: on in Uncharted 2 and 3.',
         {'on': {'BB_READBACK_SMALL_BUFFERS': '1'}, 'off': {'BB_READBACK_SMALL_BUFFERS': '0'}}),
+    'fix_small_gate': (
+        'Sinking characters fix',
+        'Stops characters sinking into the ground, floating or twitching in Uncharted 3. '
+        'Automatic: on in Uncharted 3, without FPS cost. On also makes the game wait for these '
+        'results every frame: try it if characters still sink, it costs a lot of FPS in heavy scenes.',
+        {'on': {'BB_READBACK_SMALL_GATE': '1', 'BB_COPY64_EOP_READBACK': '1', 'BB_COPY64_EOP_GATE': '1'},
+         'off': {'BB_READBACK_SMALL_GATE': '0', 'BB_COPY64_EOP_READBACK': '0', 'BB_COPY64_EOP_GATE': '0'}}),
     'fix_vram': (
         'Small video memory mode',
         'Keeps 4-8 GB graphics cards inside their video memory. Automatic: on for cards up to 8 GB.',
@@ -196,9 +204,9 @@ RESERVED_KEYS = {'Insert': 'Insert opens the in-game settings menu.',
                  'Alt_L': 'Left Alt frees the mouse cursor while held.'}
 
 APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_u3': '', 'user_dir': '', 'start': 'u1', 'language': '1', 'ui_language': '', 'player_name': '',
-                'fullscreen': False, 'present_mode': 'Mailbox', 'frame_rate': '60', 'show_fps': False,
+                'fullscreen': False, 'present_mode': 'Mailbox', 'frame_rate': '60', 'show_fps': False, 'skip_friends_notice': True,
                 'window_size': '1920x1080', 'render_height': '1080', 'aspect': '16:9', 'speakers': 'auto', 'scaler': 'fsr1', 'sharpening': '500',
-                'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
+                'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off', 'low_latency': '0',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
                 'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {}, 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1', 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
@@ -338,7 +346,11 @@ def game_available(s, key):
         return False
     exe = next(e for k, _t, _s, e in GAMES if k == key)
     own = str(s.get(f'game_dir_{key}') or '').strip()
-    return (Path(folder) / exe).is_file() or bool(own and (Path(folder) / 'eboot.bin').is_file())
+    if (Path(folder) / exe).is_file():
+        return True
+    # In a collection folder eboot.bin is Uncharted 1, not this game (run.py locate).
+    from prepare import collection_folder
+    return bool(own and (Path(folder) / 'eboot.bin').is_file() and not collection_folder(folder))
 
 
 def mouse_sensitivity(s):
@@ -507,6 +519,8 @@ def game_environment(s, start=None):
     env['BB_LANGUAGE'] = s['language']
     if str(s['player_name']).strip():
         env['BB_USER_NAME'] = str(s['player_name']).strip()
+    if s.get('skip_friends_notice', True):
+        env['BB_OFFLINE_NPID'] = '1'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
     env['BB_VBLANK_HZ'] = str(s.get('frame_rate') or '60')
@@ -530,6 +544,7 @@ def game_environment(s, start=None):
     env['BB_FSR_SHARPNESS'] = str(s.get('aa_sharpness') or '0')
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
+    env['BB_LOW_LATENCY'] = str(s.get('low_latency') or '0')
     for key, (_title, _hint, choices) in FIXES.items():
         env.update(choices.get(str(s.get(key) or 'auto'), {}))
     env['BB_BUTTON_PROMPTS'] = str(s.get('button_prompts') or 'auto')
@@ -1357,6 +1372,10 @@ class Launcher:
                  _('The language the PS4 would be set to; the games use it for text and speech.'))
         name = self.ttk.Entry(f, textvariable=self.var('player_name'), width=30)
         self.row(f, _('Player name'), name, _('Shown where the game uses the PSN name.'))
+        self.check(f, 'skip_friends_notice', _("Skip the friends' stats notice"),
+                   _("Continue and New Game go straight into the game: the game gets a local player name "
+                     "instead of 'signed out' and does not stop on the notice that friends' stats are not "
+                     "available. Nothing goes online."))
 
     def build_display(self):
         f = self.page('display', _('Display'), _('How the game window is shown.'))
@@ -1404,6 +1423,11 @@ class Launcher:
         self.row(f, _('Multiplier'), self.choice(f, 'frame_gen_multiplier', FRAME_GEN_MULTIPLIERS, 34),
                  _('FSR 3 makes one frame (2×). DLSS makes up to three on a GeForce RTX 50 (4×), '
                    'one on an RTX 40.'))
+        self.row(f, _('Low latency'), self.choice(f, 'low_latency', LOW_LATENCY, 34),
+                 _('NVIDIA Reflex on GeForce cards, AMD Anti-Lag 2 on Radeon cards (with a recent driver). '
+                   'The game waits to read the controller until the GPU is ready for the next frame, so '
+                   'what you press shows sooner. It helps most when the GPU is the limit; the FPS '
+                   'counter shows it when it is on.'))
         self.check(f, 'show_fps', _('Show the FPS counter'))
         self.section(f, _('Audio'))
         self.row(f, _('Speakers'), self.choice(f, 'speakers', SPEAKERS, 34),

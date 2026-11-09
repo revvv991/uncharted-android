@@ -151,6 +151,11 @@ static void remember(GuestFiber *fiber) {
     if (at<FIBER_REGISTRY) __atomic_store_n(&registry[at],fiber,__ATOMIC_RELEASE);
 }
 
+const char *runtime_fiber_name_here(void) {
+    const GuestFiber *f=this_thread()->current;
+    return f ? f->name : NULL;
+}
+
 static void fatal(const char *what,const GuestFiber *fiber) {
     fprintf(stderr,"STOP: fiber '%s': %s\n",fiber ? fiber->name : "?",what);
     runtime_report();

@@ -25,6 +25,22 @@ Outputs, screenshots and the phone's adb address (`device.txt`) go to `out/np3/`
 - `np3_rec.sh <tag> [KEY=VALUE ...]`: screen recordings while Drake runs, FSR on and then off at
   run time (`BB_TOGGLE_FILE` bit 24).
 - `np3_frames.sh` (WSL, the ffmpeg of `~/venv-ff`): a contact sheet of frames from a recording.
+- `dumps.py <bb-probe.log> [name regex]`: the `DUMP:` sections (`BB_DUMP_REQUEST`, below) per
+  thread - the name, the guest's host call, the host frames as library+offset; `offsets.txt` for
+  `llvm-symbolizer`.
+- `atrace_timeline.py <atrace.txt>`: a 50 ms timeline of wake-ups of the KGSL threads
+  (`gmu_f2h`, `kgsl_hwsched`, `kgsl-events`) and the port's GPU-side threads from
+  `adb shell atrace -b 32000 -t 4 gfx sched freq`, who woke whom, the userspace trace marks.
+
+Diagnostics without root, with the owner's game running on (2026-11-10, findings "The Nothing
+Phone 3 on main"): `adb shell touch <files>/dump-request` makes the port dump every thread's stack
+and the fibers into `bb-probe.log` within 2 s (`BB_DUMP_REQUEST`, the launcher's default); the
+offsets symbolize as ELF virtual addresses - the file offset plus the text segment's
+`p_vaddr - p_offset` (0x4000 in our builds; `llvm-readelf -l`) - against the unstripped libraries of
+the same build (`~/src/dev-work/build/libbbgpu*.so`, `libmain.so`, the Turnip build tree). `atrace`
+shows the GPU's side through the kernel threads (a GMU interrupt wakes `gmu_f2h` -> `kgsl_hwsched`
+-> `kgsl-events` -> the waiting threads); KGSL's own tracepoints and `/sys/kernel/gpu` are closed to
+`traced_probes` and the shell on this build.
 
 Rules: the owner's game is not closed without their word; `backup` before runs that load a save
 and `restore` after (it puts back their bbport.ini too: check `object_motion`, which the launcher's

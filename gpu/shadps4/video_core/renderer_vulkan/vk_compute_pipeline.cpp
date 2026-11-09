@@ -21,12 +21,18 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     info = &info_;
     const auto debug_str = GetDebugString();
 
+    // 64 lanes where the device has them, else the device's own size where the driver could pick another one (Intel).
+    const u32 subgroup_size =
+        instance.IsSubgroupSize64Supported() ? 64 : instance.FixedComputeSubgroupSize();
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
+        .requiredSubgroupSize = subgroup_size,
     };
     const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = instance.IsSubgroupSize64Supported() && NeedsWave64(stages) ? &subgroup_size_ci
-                                                                             : nullptr,
+        // g2-arm64: wave64 only for the shaders that need it where 64 is supported (the wave64
+        // emulation bug on Adreno, findings 2026-10-21); bbport: the device's fixed size elsewhere.
+        .pNext = instance.IsSubgroupSize64Supported()
+                     ? (NeedsWave64(stages) ? &subgroup_size_ci : nullptr)
+                     : (subgroup_size ? &subgroup_size_ci : nullptr),
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
         .pName = "main",
