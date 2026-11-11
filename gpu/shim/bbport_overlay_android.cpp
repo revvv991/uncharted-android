@@ -15,6 +15,7 @@
 #include "imgui.h"
 
 #include "bbport_overlay_android.h"
+#include "bbport_padmap.h"
 #include "bbport_settings.h"
 #include "core/emulator_settings.h"
 
@@ -34,6 +35,10 @@ std::atomic<float> pending_scroll{0.0f};  // a finger's travel inside the panel,
 // (BbSettings::Save on every tap would rewrite the file while a slider is dragged).
 bool dirty = false;
 double last_change = 0.0;
+
+// Quit game asks once more in place (a stray tap loses nothing); Cancel gets the controller's focus.
+bool confirm_quit = false;
+bool focus_cancel = false;
 
 void Changed() {
     dirty = true;
@@ -137,6 +142,9 @@ void AndroidMenu(float base_scale, float frame_ms, bool& keep_open) {
                                    ImGuiWindowFlags_NoSavedSettings;
     ImGui::GetIO().MouseDrawCursor = false;
     if (ImGui::Begin("##android_menu", nullptr, flags)) {
+        if (ImGui::IsWindowAppearing()) {
+            confirm_quit = false;
+        }
         if (const float travel = pending_scroll.exchange(0.0f); travel != 0.0f) {
             ImGui::SetScrollY(ImGui::GetScrollY() - travel * viewport->WorkSize.y);
         }
@@ -255,6 +263,16 @@ void AndroidMenu(float base_scale, float frame_ms, bool& keep_open) {
         Slider("##touch_look", s.touch_pad_look, 0.25f, 4.0f);
         ImGui::EndDisabled();
 
+        // g2-arm64 (issue #16): the app's controller setup window (ControllerSetup.java) over the
+        // game; SDL pauses while it is open (presenting and the sound stop, the game runs on).
+        Section("Controllers");
+        if (ImGui::Button("Controller setup", ImVec2(-FLT_MIN, 0.0f))) {
+            BbPadMap::RequestSetup();
+            keep_open = false;
+        }
+        Note("A controller's buttons set to the PlayStation ones (also in the launcher). The game "
+             "runs on meanwhile: pause it first.");
+
         ImGui::Spacing();
         if (ImGui::CollapsingHeader("Advanced")) {
             ImGui::TextDisabled("Output size");
@@ -292,6 +310,39 @@ void AndroidMenu(float base_scale, float frame_ms, bool& keep_open) {
         ImGui::Spacing();
         if (ImGui::Button("Close##bottom", ImVec2(-FLT_MIN, 0.0f))) {
             keep_open = false;
+        }
+        // g2-arm64: Quit game (issue #29: the PS4 games have no exit of their own, and swiping the
+        // app away in Recents was the only way out). The PC menu's exit: a save in progress is
+        // finished first (at most 5 s), then the process ends and the game's task leaves Recents.
+        if (QuitRequested()) {
+            ImGui::BeginDisabled();
+            ImGui::Button("Quitting...", ImVec2(-FLT_MIN, 0.0f));
+            ImGui::EndDisabled();
+        } else if (!confirm_quit) {
+            if (ImGui::Button("Quit game", ImVec2(-FLT_MIN, 0.0f))) {
+                confirm_quit = focus_cancel = true;
+            }
+        } else {
+            Note("Quit the game? Progress since the last save is lost; a save in progress is "
+                 "finished first.");
+            const float half =
+                (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            if (ImGui::Button("Quit", ImVec2(half, 0.0f))) {
+                if (dirty) {
+                    BbSettings::Save();
+                    dirty = false;
+                }
+                RequestQuit();
+                confirm_quit = false;
+            }
+            ImGui::SameLine();
+            if (focus_cancel) {
+                ImGui::SetKeyboardFocusHere();
+                focus_cancel = false;
+            }
+            if (ImGui::Button("Cancel##quit", ImVec2(half, 0.0f))) {
+                confirm_quit = false;
+            }
         }
         ImGui::TextDisabled("Swipe in from the right edge or L3+R3 to open");
     }

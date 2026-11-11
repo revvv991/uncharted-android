@@ -22,6 +22,7 @@
 #ifdef __ANDROID__
 #include "bbport_overlay_android.h" // g2-arm64: the touch menu
 #include "bbport_touchpad.h"          // g2-arm64: the on-screen gamepad
+#include "bbport_padmap.h"            // g2-arm64: the notice about a controller not set up
 #endif
 #include "bbport_settings.h"
 #include "bbport_submit_stats.h"
@@ -683,7 +684,9 @@ void TrophyToast() {
         toast_queue.pop_front();
         toast_on = true;
         toast_start = now;
-        SetToastIcon(toast_now.png);
+        if (toast_now.grade > 0) {
+            SetToastIcon(toast_now.png);
+        }
         toast_now.png = {};
     }
     const float t = std::chrono::duration<float>(now - toast_start).count();
@@ -700,6 +703,9 @@ void TrophyToast() {
     static const char* const names[] = {"Platinum trophy earned", "Gold trophy earned",
                                         "Silver trophy earned", "Bronze trophy earned"};
     const int grade = std::clamp(toast_now.grade, 1, 4) - 1;
+    // g2-arm64: a notice (NotifyText, grade 0): its title in `game`, its text in `name`, no icon.
+    const bool notice = toast_now.grade == 0;
+    const ImVec4 color = notice ? ImVec4(0.55f, 0.78f, 1.0f, 1.0f) : colors[grade];
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(
@@ -712,25 +718,32 @@ void TrophyToast() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * s);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f * s);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_Border, colors[grade]);
+    ImGui::PushStyleColor(ImGuiCol_Border, color);
     ImGui::Begin("##trophy_toast", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
-    if (toast_icon) {
-        ImGui::Image(toast_icon->GetTexRef(), ImVec2(64.0f * s, 64.0f * s), ImVec2(0.0f, 0.0f),
-                     toast_icon_uv);
-        ImGui::SameLine(0.0f, 12.0f * s);
+    if (notice) {
+        ImGui::PushTextWrapPos(560.0f * s);
+        ImGui::TextColored(color, "%s", toast_now.game.c_str());
+        ImGui::TextWrapped("%s", toast_now.name.c_str());
+        ImGui::PopTextWrapPos();
+    } else {
+        if (toast_icon) {
+            ImGui::Image(toast_icon->GetTexRef(), ImVec2(64.0f * s, 64.0f * s),
+                         ImVec2(0.0f, 0.0f), toast_icon_uv);
+            ImGui::SameLine(0.0f, 12.0f * s);
+        }
+        ImGui::BeginGroup();
+        ImGui::TextColored(color, "%s", names[grade]);
+        ImGui::SetWindowFontScale(1.2f);
+        ImGui::TextUnformatted(toast_now.name.c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        if (!toast_now.game.empty()) {
+            ImGui::TextDisabled("%s", toast_now.game.c_str());
+        }
+        ImGui::EndGroup();
     }
-    ImGui::BeginGroup();
-    ImGui::TextColored(colors[grade], "%s", names[grade]);
-    ImGui::SetWindowFontScale(1.2f);
-    ImGui::TextUnformatted(toast_now.name.c_str());
-    ImGui::SetWindowFontScale(1.0f);
-    if (!toast_now.game.empty()) {
-        ImGui::TextDisabled("%s", toast_now.game.c_str());
-    }
-    ImGui::EndGroup();
     ImGui::End();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(4);
@@ -910,6 +923,17 @@ bool HandleEvent(const SDL_Event& event) {
         io.AddMouseWheelEvent(event.wheel.x, event.wheel.y);
         return true;
 #ifdef __ANDROID__
+    case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+    case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+    case SDL_EVENT_JOYSTICK_BUTTON_UP:
+    case SDL_EVENT_JOYSTICK_HAT_MOTION: {
+        // g2-arm64 (issue #16): a press on a controller no one has set up brings the notice back
+        // (bbport_padmap.cpp).
+        if (std::string notice = BbPadMap::Event(event); !notice.empty()) {
+            NotifyText("Controller not set up", std::move(notice));
+        }
+        return false;
+    }
     case SDL_EVENT_FINGER_DOWN:
     case SDL_EVENT_FINGER_MOTION:
     case SDL_EVENT_FINGER_UP:
@@ -955,8 +979,21 @@ void NotifyTrophy(int grade, std::string game, std::string name, std::vector<uns
     }
 }
 
+void NotifyText(std::string title, std::string text) {
+    NotifyTrophy(0, std::move(title), std::move(text), {});
+}
+
 bool CapturesInput() {
     return menu_open || text_entry_active;
+}
+
+// g2-arm64: the Android panel's Quit game (bbport_overlay_android.h) is the menu's exit above.
+void RequestQuit() {
+    Quit();
+}
+
+bool QuitRequested() {
+    return quitting;
 }
 
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {

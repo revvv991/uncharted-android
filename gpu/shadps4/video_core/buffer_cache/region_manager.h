@@ -152,6 +152,23 @@ public:
         return latest;
     }
 
+    /// g2-arm64: the GPU-modified pages of the range take the current write tick: the GPU copies
+    /// their data into another arena (BufferCache::MigrateBackedArenas), and a read back from
+    /// mapped memory must wait for that copy.
+    void RenoteGpuWrites(VAddr addr, u64 size) {
+        const size_t offset = addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page = std::min<size_t>(
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE),
+            NUM_PAGES_PER_REGION);
+        const u64 tick = g_gpu_write_done_tick ? g_gpu_write_done_tick() : 0;
+        for (size_t page = start_page; page < end_page; ++page) {
+            if (gpu.Get(page)) {
+                gpu_tick[page] = tick;
+            }
+        }
+    }
+
     /// bbport: after a guest write fault, also unprotects the other pages of the window that
     /// are protected for CPU writes and hold no GPU-modified data (see MarkFaultWindow).
     void ExtendWriteFault(VAddr window_addr, u64 size) {

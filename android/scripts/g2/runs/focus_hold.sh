@@ -4,7 +4,9 @@
 # aiming blur of 2026-10-31 was found this way: start, then `step 'l2' 3` (aim for 3 s, a
 # screenshot, the autofocus distance the game got from BB_TINY_READBACK_LOG), `step 'l2 rx=0' 1`,
 # ... and stop, which puts the owner's files, saves and settings back. GAME=u1|u2|u3 (u2),
-# START = the owner's last game (g2.sh), EXTRA="KEY=VALUE KEY=VALUE" more variables.
+# START = the owner's last game (g2.sh), EXTRA="KEY=VALUE KEY=VALUE" more variables, TOUCH=0|1|auto
+# the on-screen gamepad (in bbport.ini: the launcher's touch_pad extra loses to the ini's value;
+# `adb shell input motionevent` drives the pad, issue #34).
 # The run carries BB_TINY_READBACK=1 BB_TINY_READBACK_LOG=1 BB_READBACK_SMALL_BUFFERS=1 (the
 # launcher's U2/U3 defaults since 0.2.11, named here so the log has the focus line).
 set -uo pipefail
@@ -24,7 +26,7 @@ start)
     $ADB shell am force-stop $P; sleep 1
     $ADB shell "echo > $G/pad.txt; input keyevent KEYCODE_WAKEUP; [ -f $G/bbport.ini.c-bak ] || cp $G/bbport.ini $G/bbport.ini.c-bak"
     $ADB shell am start -n $P/dev.unchartedg2.game.Launcher --es resolution ${SIZE:-1280x720} --es fps_limit ${LIMIT:-30} --es touch_pad 0 --es extra_env "$env" > /dev/null; sleep 6
-    $ADB shell "am force-stop $P; sed -i -e 's/^fps_limit=.*/fps_limit=${LIMIT:-30}/' -e 's/^upscaler=.*/upscaler=off/' -e 's/^frame_gen=.*/frame_gen=off/' $G/bbport.ini"
+    $ADB shell "am force-stop $P; sed -i -e 's/^fps_limit=.*/fps_limit=${LIMIT:-30}/' -e 's/^upscaler=.*/upscaler=off/' -e 's/^frame_gen=.*/frame_gen=off/' ${TOUCH:+-e 's/^touch_pad=.*/touch_pad=$TOUCH/'} $G/bbport.ini"
     $ADB shell am start -n $P/dev.unchartedg2.game.Launcher --ez play true > /dev/null
     sleep 50; press cross                   # the collection's title
     sleep 10                                # the menu stands on the owner's last game: START

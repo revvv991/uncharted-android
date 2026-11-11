@@ -33,6 +33,10 @@ enum class MemoryType : u8 {
     HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,       ///< Requests device local host visible buffer, falling back host memory.
     Sparse,       ///< Requires an unbacked sparse resident buffer.
+    /// g2-arm64: a plain buffer that owns one dedicated VkDeviceMemory of its full size, allocated
+    /// and bound at creation: the buffer cache's arenas where the driver has no sparse buffers
+    /// (issue #36; Bloodborne-Android's MemoryType::Backed).
+    Backed,
 };
 
 constexpr vk::BufferUsageFlags ReadFlags =
@@ -55,7 +59,10 @@ struct UniqueBuffer {
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          vram_bytes{std::exchange(other.vram_bytes, 0)} {}
+          vram_bytes{std::exchange(other.vram_bytes, 0)},
+          memory{std::exchange(other.memory, VK_NULL_HANDLE)},
+          memory_size{std::exchange(other.memory_size, 0)},
+          memory_type{std::exchange(other.memory_type, 0)} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -66,6 +73,9 @@ struct UniqueBuffer {
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
             vram_bytes = std::exchange(other.vram_bytes, 0);
+            memory = std::exchange(other.memory, VK_NULL_HANDLE);
+            memory_size = std::exchange(other.memory_size, 0);
+            memory_type = std::exchange(other.memory_type, 0);
         }
         return *this;
     }
@@ -81,6 +91,10 @@ struct UniqueBuffer {
     VmaAllocator allocator;
     VmaAllocation allocation{};
     u64 vram_bytes{}; ///< bbport: device-local bytes counted for this buffer
+    /// g2-arm64 MemoryType::Backed: the buffer's own memory (freed with it), its size and type.
+    vk::DeviceMemory memory{};
+    u64 memory_size{};
+    u32 memory_type{};
 };
 
 struct Buffer {
@@ -111,6 +125,16 @@ struct Buffer {
 
     vk::Buffer Handle() const noexcept {
         return buffer.buffer;
+    }
+
+    /// g2-arm64 MemoryType::Backed: the memory the whole buffer is bound to (at offset 0).
+    vk::DeviceMemory BackingMemory() const noexcept {
+        return buffer.memory;
+    }
+
+    /// g2-arm64 MemoryType::Backed: the memory type of BackingMemory().
+    u32 BackingMemoryType() const noexcept {
+        return buffer.memory_type;
     }
 
     vk::DeviceAddress BufferDeviceAddress() const noexcept {

@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Beta (version 0.3.1): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
+> **Beta (version 0.3.2): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -76,7 +76,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.3.1.apk` from
+1. Install the APK (`uncharted-android-0.3.2.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
@@ -110,10 +110,17 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
    at; off: the game's own; the port scales the picture to the screen), sharpening, frame
    generation, the frame rate limit, the FPS counter, and the output size and finer options
    under Advanced; changes apply at once and are kept in the app's `bbport.ini`. A tap outside
-   the panel, B or Close closes it.
+   the panel, B or Close closes it; **Quit game** at its bottom ends the game (a save in progress
+   is finished first; progress since the last save is lost). **Controller setup** (also a
+   button in the launcher's Controls) opens a window drawing the on-screen gamepad: tap a
+   control, then press the controller's button for it (Set up all asks for each in turn). That
+   is how a controller the game does not read (a pad in a PC or DirectInput mode; a notice says
+   so) or one with another layout is set up; the setup is kept for that controller. The game
+   reads the controller used last, so an external pad and a handheld's own controls both play.
 7. **On a phone, without a gamepad**: the on-screen gamepad is drawn over the game (Auto, or On
    in the settings): a finger on the left half of the screen is the left stick (it appears under
-   the finger), a drag on the right half turns the camera (the right stick), the face buttons
+   the finger; three quarters of its ring is a full push, where Nate runs), a drag on the right
+   half turns the camera (the right stick), the face buttons
    are at the bottom right, L1/L2 and R1/R2 in the top corners, the D-pad on the left, L3/R3 at
    the bottom middle, the touch pad button and Options at the top. Several fingers at once.
    Opacity, size and the camera drag's sensitivity are in the panel.

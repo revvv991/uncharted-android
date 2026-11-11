@@ -82,6 +82,14 @@ public:
         return latest;
     }
 
+    /// g2-arm64: see RegionManager::RenoteGpuWrites.
+    void RenoteGpuWrites(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages<false>(cpu_addr, size, [](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            manager->RenoteGpuWrites(manager->GetCpuAddr() + offset, size);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,

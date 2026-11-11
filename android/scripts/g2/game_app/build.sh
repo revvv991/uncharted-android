@@ -42,7 +42,8 @@ cd "$W"
 # the previous classes).
 javac_log=$W/javac.log
 if ! javac -nowarn -source 11 -target 11 -classpath "$JAR" -d classes \
-        $(find "$SDLJAVA" -name '*.java') "$HERE/GameActivity.java" "$HERE/Launcher.java" "$HERE/Updater.java" > "$javac_log" 2>&1; then
+        $(find "$SDLJAVA" -name '*.java') "$HERE/GameActivity.java" "$HERE/Launcher.java" "$HERE/Updater.java" \
+        "$HERE/ControllerSetup.java" "$HERE/PadMapping.java" "$HERE/BbSdlJoystick.java" > "$javac_log" 2>&1; then
     grep -v "^warning\|^Note:" "$javac_log" >&2 || true
     echo "javac failed" >&2
     exit 1

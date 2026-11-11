@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.libsdl.app.SDLActivity;
 
 /** SDLActivity running uncharted_pc's loader (libmain.so). Arguments: files/args.txt, one per line
@@ -217,6 +219,30 @@ public class GameActivity extends SDLActivity {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         i.putExtra("pid", Process.myPid());
         startActivity(i);
+    }
+
+    /** Called by the port (its window thread, through JNI) when the game ends itself - Quit game
+     *  in the in-game panel (issue #29) - just before the process exits: the game's task leaves
+     *  Recents, as when it is swiped away there. Waits up to a second for the UI thread. */
+    public void finishTask() {
+        final CountDownLatch done = new CountDownLatch(1);
+        runOnUiThread(() -> {
+            finishAndRemoveTask();
+            done.countDown();
+        });
+        try {
+            done.await(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // the process ends anyway
+        }
+    }
+
+    /** Called by the port (its window thread, through JNI) for the in-game panel's Controller
+     *  setup (issue #16): the launcher's controller setup window over the game. While it has the
+     *  focus SDL is paused (the game's lifecycle path for the background); the port applies the
+     *  setup when the focus comes back (gpu/shim/bbport_padmap.cpp). */
+    public void openControllerSetup() {
+        runOnUiThread(() -> ControllerSetup.show(this));
     }
 
     /** Starts GameActivity again once the old game process has ended (its GPU device and memory

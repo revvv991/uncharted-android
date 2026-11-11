@@ -55,7 +55,9 @@ class BufferCache {
     // Windows driver: 2 GiB); an arena spans up to two pages, so they shrink to half the limit.
     static constexpr u64 MAX_ARENA_PAGE_BITS = 32;
     static constexpr u64 MIN_ARENA_PAGE_BITS = 30;
-    static constexpr u64 MAX_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - MIN_ARENA_PAGE_BITS);
+    /// g2-arm64: arenas that own their memory (no sparse binding) commit their pages when they
+    /// are made, so their pages are smaller: 2 MiB and up (BB_NONSPARSE_ARENA_MB, 16 by default).
+    static constexpr u64 MIN_BACKED_PAGE_BITS = 21;
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
 
 public:
@@ -293,7 +295,9 @@ private:
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
 
-    std::array<const Buffer*, MAX_ARENA_PAGES> address_space{};
+    /// g2-arm64: num_arena_pages entries (up to 128 Ki with the 2 MiB pages of arenas that own
+    /// their memory).
+    std::vector<const Buffer*> address_space;
     u64 arena_page_bits{MAX_ARENA_PAGE_BITS};
     u64 arena_page_size{u64{1} << MAX_ARENA_PAGE_BITS};
     u64 num_arena_pages{u64{1} << (ADDRESS_SPACE_BITS - MAX_ARENA_PAGE_BITS)};
@@ -310,13 +314,18 @@ private:
     Vulkan::Semaphore memory_semaphore;
 
     struct Backing : public Interval {
-        vk::DeviceMemory memory;
-        u64 offset;
+        vk::DeviceMemory memory{};
+        u64 offset{}; ///< g2-arm64: bytes into memory (start and end count blocks)
+        /// g2-arm64: block_shift, for the byte offset of a sub-range (arenas that own their
+        /// memory: a merge re-adds ranges over existing ones). 0 for sparse arenas: their ranges
+        /// stay apart as before (the old test added blocks to bytes and never matched).
+        u32 shift{};
         constexpr bool CanMergeWith(const Backing& other) const noexcept {
-            return memory == other.memory && offset + (end - start) == other.offset;
+            return shift != 0 && memory == other.memory &&
+                   offset + ((end - start) << shift) == other.offset;
         }
         constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
+            return {{a, b}, memory, offset + ((a - start) << shift), shift};
         }
     };
     IntervalList<Backing> resident_ranges;
@@ -330,6 +339,25 @@ private:
     };
     std::vector<ArenaChunk> arena_chunks;
     bool host_arena_active{};
+    /// g2-arm64 (issue #36): the arenas own their memory (MemoryType::Backed): the driver has no
+    /// sparse buffers, or BB_NONSPARSE_ARENAS=1.
+    bool non_sparse_arenas{};
+    u64 backed_arena_bytes{};
+    /// g2-arm64: a new arena that owns its memory: mapped for read backs, counted, logged.
+    void NoteBackedArena(const Buffer* arena, bool merged);
+    /// g2-arm64: copies the resident blocks of the arenas a merged one replaces into it.
+    void MigrateBackedArenas(const Buffer* merged, u64 base_block, u64 end_block);
+    /// g2-arm64: GetArena for arenas that own their memory: as many pages as a request needs.
+    const Buffer* GetBackedArena(u64 first_block, u64 last_block);
+    u64 max_backed_arena_bytes{};
+    /// g2-arm64: the arenas a merge replaced, released once the GPU is past the tick given
+    /// (ReleaseRetiredArenas, before every submission).
+    struct RetiredArena {
+        u64 tick;
+        const Buffer* arena;
+    };
+    std::deque<RetiredArena> retired_arenas;
+    void ReleaseRetiredArenas();
     u64 AllocateArenaMemory(u64 size, vk::DeviceMemory& memory);
 
     u32 arena_memory_type_index{};

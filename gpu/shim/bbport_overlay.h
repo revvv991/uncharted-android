@@ -41,6 +41,8 @@ void NotePresent();
 /// Any thread: queues the notice of an earned trophy (grade 1 platinum .. 4 bronze, `png` the
 /// trophy's icon file or empty). Notices are shown at the top of the screen one after the other.
 void NotifyTrophy(int grade, std::string game, std::string name, std::vector<unsigned char> png);
+/// g2-arm64: any thread: a notice shown the same way, a title and a line of text (no icon).
+void NotifyText(std::string title, std::string text);
 
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();

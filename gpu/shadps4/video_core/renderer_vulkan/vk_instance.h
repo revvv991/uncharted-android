@@ -59,6 +59,18 @@ public:
         return vk13_props.maxBufferSize;
     }
 
+    /// g2-arm64: the largest single memory allocation (buffer cache arenas without sparse binding).
+    u64 GetMaxMemoryAllocationSize() const {
+        return vk11_props.maxMemoryAllocationSize;
+    }
+
+    /// g2-arm64: sparse buffers, which the buffer cache's arenas need unless they own their
+    /// memory. Turnip on KGSL offers them only where the kernel has virtual BOs (issue #36: an
+    /// Adreno 650 on Android 13 has none, and the first sparse bind lost the device).
+    bool HasSparseBuffers() const {
+        return features.sparseBinding && features.sparseResidencyBuffer;
+    }
+
     vk::PhysicalDevice GetPhysicalDevice() const {
         return physical_device;
     }

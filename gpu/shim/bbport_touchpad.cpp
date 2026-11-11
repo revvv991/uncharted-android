@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 #include "imgui.h"
@@ -155,6 +156,40 @@ Finger* Free() {
     return nullptr;
 }
 
+// g2-arm64 (issue #34): the full push comes at this share of the ring's radius. With the full
+// push at the ring itself, a thumb that stopped short of it kept Nate walking in Uncharted 2 and
+// 3: U2 runs from about 85% of a full push (80% walks, 90% runs: the G2, 2026-11-10), U1 earlier.
+// At 0.75 a run starts at about two thirds of the ring. BB_TOUCH_STICK_FULL=<0.5..1> (1: at the
+// ring, as in 0.3.1).
+float StickFullShare() {
+    static const float share = [] {
+        const char* env = std::getenv("BB_TOUCH_STICK_FULL");
+        const float v = env && *env ? float(std::atof(env)) : 0.75f;
+        return std::clamp(v, 0.5f, 1.0f);
+    }();
+    return share;
+}
+
+/// A stick finger's deflection: its travel from where it landed over the full push's distance,
+/// inside the unit circle.
+void StickDeflection(const Finger& f, float scale, float& dx, float& dy) {
+    const float full = StickRadius * Height * scale * StickFullShare();
+    dx = (f.x - f.x0) * Width / full;
+    dy = (f.y - f.y0) * Height / full;
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (len > 1.0f) {
+        dx /= len;
+        dy /= len;
+    }
+}
+
+/// A deflection (-1..1) as the pad's byte: 128 + d * 128 within 0..255, as runtime_pad.c's axis()
+/// makes a physical stick's (a full push up or left is 0, as on a DualShock; 128 + d * 127
+/// stopped at 1).
+int StickByte(float d) {
+    return std::clamp(int(std::lround(128.0f + d * 128.0f)), 0, 255);
+}
+
 /// The pad state of this frame to the runtime (fingers_mutex held).
 void Push(bool neutral) {
     uint32_t buttons = 0;
@@ -181,12 +216,10 @@ void Push(bool neutral) {
                 buttons |= DpadBits(f.x * Width, f.y * Height, scale);
                 break;
             case Kind::Stick: {
-                const float r = StickRadius * Height * scale;
-                float dx = (f.x - f.x0) * Width / r, dy = (f.y - f.y0) * Height / r;
-                const float len = std::sqrt(dx * dx + dy * dy);
-                if (len > 1.0f) { dx /= len; dy /= len; }
-                sticks[0] = int(std::lround(128.0f + dx * 127.0f));
-                sticks[1] = int(std::lround(128.0f + dy * 127.0f));
+                float dx, dy;
+                StickDeflection(f, scale, dx, dy);
+                sticks[0] = StickByte(dx);
+                sticks[1] = StickByte(dy);
                 break;
             }
             case Kind::Look: {
@@ -198,8 +231,8 @@ void Push(bool neutral) {
                 const float dx = std::clamp(f.look_vx, -1.0f, 1.0f);
                 const float dy = std::clamp(f.look_vy, -1.0f, 1.0f);
                 f.look_dx = f.look_dy = 0.0f;
-                sticks[2] = int(std::lround(128.0f + dx * 127.0f));
-                sticks[3] = int(std::lround(128.0f + dy * 127.0f));
+                sticks[2] = StickByte(dx);
+                sticks[3] = StickByte(dy);
                 break;
             }
             case Kind::None:
@@ -260,11 +293,11 @@ void Draw(float alpha, float scale) {
             if (f.kind == Kind::Stick) {
                 stick_down = true;
                 stick_base = ImVec2(f.x0 * Width, f.y0 * H);
+                // the knob shows the deflection: on the ring at a full push
+                float dx, dy;
+                StickDeflection(f, scale, dx, dy);
                 const float r = StickRadius * H * scale;
-                float dx = f.x * Width - stick_base.x, dy = f.y * H - stick_base.y;
-                const float len = std::sqrt(dx * dx + dy * dy);
-                if (len > r) { dx *= r / len; dy *= r / len; }
-                stick_knob = ImVec2(stick_base.x + dx, stick_base.y + dy);
+                stick_knob = ImVec2(stick_base.x + dx * r, stick_base.y + dy * r);
             }
         }
     }

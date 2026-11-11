@@ -271,8 +271,10 @@ target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
 if(ANDROID)
-    # g2-arm64: the touch menu (a panel on the right edge) instead of the PC window.
-    target_sources(bbgpu PRIVATE shim/bbport_overlay_android.cpp shim/bbport_touchpad.cpp)
+    # g2-arm64: the touch menu (a panel on the right edge) instead of the PC window, and its
+    # controller setup (issue #16).
+    target_sources(bbgpu PRIVATE shim/bbport_overlay_android.cpp shim/bbport_touchpad.cpp
+                   shim/bbport_padmap.cpp)
 endif()
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)

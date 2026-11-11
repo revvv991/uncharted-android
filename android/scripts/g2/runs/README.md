@@ -61,7 +61,16 @@ and the pitfalls: `.claude/skills/g2-runs/SKILL.md`.
 - `ab_pairs.sh <tag> <game> <pairs> <secs> '<A>' '<B>'`: interleaved A/B with cool-downs (`COOL`),
   medians and per-pair signs; 4 pairs.
 - `owner_session.sh start|status|stop`: the owner plays, the GPU faults and frame rate watched.
-- `focus_hold.sh start|step|value|stop`: hold an input, screenshot, the autofocus distance.
+- `focus_hold.sh start|step|value|stop`: hold an input, screenshot, the autofocus distance
+  (`TOUCH=1`: the on-screen gamepad on).
+- `stick_probe.sh <label> '<pad tokens>' [secs]`, `touch_probe.sh <label> x y dx dy [secs]`: during a
+  hold, an input (pad bytes, or a finger on the on-screen gamepad) under a screen recording, its
+  frames tiled (`tile.sh`); `RELOAD=u2` reloads U2's checkpoint first (issue #34's walk/run test).
+- `vpad.sh start|press|push|axis|stop`: a virtual pad in a PC / DirectInput mode ("Test DInput
+  Pad", Android's `uinput` tool: sixteen generic buttons, two sticks, BRAKE and GAS, a hat), for
+  the controller setup window (issue #16); the G2's firmware normalizes the first external
+  joystick, so a decoy is made first. With 13 buttons or more SDL maps it uselessly (its face
+  buttons are ones the pad lacks); with 12 or fewer, not at all.
 - `restore_owner.sh [stamp]`: the owner's files and settings back after a run that died.
 - `queue_after.sh <marker file> <regex> <log> -- <command>`: chain series without attention.
 - `symbolize.sh <addr...>`: names for `libbbgpu.so+0x...` offsets (the last test build).

@@ -9,6 +9,9 @@
 #include "common/logging/log.h"
 #include "sdl_window.h"
 #include "bbport_overlay.h"
+#ifdef __ANDROID__
+#include "bbport_padmap.h" // g2-arm64: the app's controller setups (issue #16)
+#endif
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 extern "C" void runtime_audio_background(int background); // g2-arm64: src/runtime_audio.c
@@ -93,6 +96,9 @@ namespace Frontend {
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
+#ifdef __ANDROID__
+    BbPadMap::Init(); // g2-arm64 (issue #16): the app's controller setups, applied as joysticks come
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
@@ -241,6 +247,9 @@ bool WindowSDL::PollEvents() {
             mouse_buttons = 0;
         }
     }
+#ifdef __ANDROID__
+    BbPadMap::Poll(); // g2-arm64 (issue #16): the panel's Controller setup; the setups' file changed
+#endif
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
@@ -326,6 +335,45 @@ bool WindowSDL::PollEvents() {
             height = h;
             break;
         }
+        case SDL_EVENT_JOYSTICK_ADDED: {
+            // g2-arm64 (issue #16: a pad that works in emulators did nothing here): every device SDL
+            // opens as a joystick, and whether the port reads it. Only gamepads are read
+            // (runtime_pad.c, SDL_GetGamepads): a joystick SDL has no mapping for is not.
+            const SDL_JoystickID id = event.jdevice.which;
+#ifdef __ANDROID__
+            // Its setup from the app's Controller setup first; one the game still cannot read is
+            // opened to hear it, and a notice says where to set it up.
+            const std::string notice = BbPadMap::Added(id);
+#endif
+            char guid[33];
+            SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), guid, int(sizeof(guid)));
+            const char* name = SDL_GetJoystickNameForID(id);
+            const bool gamepad = SDL_IsGamepad(id);
+            std::printf("Input: joystick added: \"%s\" %04x:%04x, guid %s, %s\n", name ? name : "?",
+                        unsigned(SDL_GetJoystickVendorForID(id)),
+                        unsigned(SDL_GetJoystickProductForID(id)), guid,
+                        gamepad ? "a gamepad (read)"
+                                : "no gamepad mapping (not read until set up: Controller setup)");
+            if (gamepad) {
+                char* mapping = SDL_GetGamepadMappingForID(id);
+                std::printf("Input: its mapping: %s\n", mapping ? mapping : "?");
+                SDL_free(mapping);
+            }
+            std::fflush(stdout);
+#ifdef __ANDROID__
+            if (!notice.empty()) {
+                BbOverlay::NotifyText("Controller not set up", notice);
+            }
+#endif
+            break;
+        }
+        case SDL_EVENT_JOYSTICK_REMOVED:
+            std::printf("Input: joystick removed (%u)\n", unsigned(event.jdevice.which));
+            std::fflush(stdout);
+#ifdef __ANDROID__
+            BbPadMap::Removed(event.jdevice.which);
+#endif
+            break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             is_open = false;

@@ -17,4 +17,10 @@ enum class TouchAction { None, Open, Close };
 /// it. Mouse events SDL makes from the same touches still reach ImGui for the panel itself.
 TouchAction AndroidTouch(const SDL_Event& event, bool open);
 
+/// Quit game (bbport_overlay.cpp, the PC menu's exit): a save in progress is finished first (at
+/// most 5 s), then the window thread ends the process, on Android after taking the game's task
+/// out of Recents (bbgpu.cpp). QuitRequested is true from the request on.
+void RequestQuit();
+bool QuitRequested();
+
 } // namespace BbOverlay

@@ -22,7 +22,7 @@ P=dev.unchartedandroid
 G=/sdcard/Android/data/$P/files
 OUT=${OUT:-$REPO/out/g2}
 FILES="args-u1.txt args-u2.txt args-u3.txt args.txt bbport.ini env-u1.txt env-u2.txt env-u3.txt env.txt guest-argv.txt loadexec-last.txt"
-LAUNCHER_KEYS='^(#|$|BB_FULLSCREEN=|BB_FPS_LOG=|BB_MIDFRAME_FLUSH=|BB_DEFERRED_SUBMIT=|BB_SKIN_BATCH=|BB_CS_SPLIT=|BB_OBJECT_MOTION=|BB_THREAD_NICE=|BB_MAX_FRAMES_AHEAD=|BB_DUMP_REQUEST=|BB_RENDER_CPUS=|BB_VK_DRIVER=|BB_VK_DRIVER_DIR=|BB_VBLANK_HZ=|BB_SHOW_FPS=)'
+LAUNCHER_KEYS='^(#|$|BB_FULLSCREEN=|BB_FPS_LOG=|BB_MIDFRAME_FLUSH=|BB_DEFERRED_SUBMIT=|BB_SKIN_BATCH=|BB_CS_SPLIT=|BB_OBJECT_MOTION=|BB_THREAD_NICE=|BB_MAX_FRAMES_AHEAD=|BB_DUMP_REQUEST=|BB_RENDER_CPUS=|BB_VK_DRIVER=|BB_VK_DRIVER_DIR=|BB_VBLANK_HZ=|BB_SHOW_FPS=|BB_OFFLINE_NPID=)'
 
 game_running() {
     local rss
@@ -49,10 +49,14 @@ back_up() {
 # environment), the app closed. Prints DIFFERS lines when a file did not come back.
 put_back() {
     local stamp=$1 oenv=$2
-    [ -z "$oenv" ] && oenv="' '"
+    # The callers join the lines with newlines or with \n (one backslash or two); the launcher's
+    # extra takes \n between them, which the device shell keeps only inside quotes (unquoted, it
+    # ate the backslash: the owner's More environment became one line "...=1nBB_...", 2026-11-11).
+    oenv=$(printf '%s' "$oenv" | sed -e 's/\\\\n/\n/g' -e 's/\\n/\n/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+    [ -z "$oenv" ] && oenv=' '
     $ADB shell am force-stop $P
     $ADB shell "echo > $G/pad.txt; [ -f $G/bbport.ini.c-bak ] && mv $G/bbport.ini.c-bak $G/bbport.ini"
-    $ADB shell am start -n $P/dev.unchartedg2.game.Launcher --es resolution ${OWNER_SIZE:-1280x720} --es fps_limit 30 --es touch_pad auto --es driver turnip --es extra_env "$oenv" > /dev/null; sleep 5
+    $ADB shell "am start -n $P/dev.unchartedg2.game.Launcher --es resolution ${OWNER_SIZE:-1280x720} --es fps_limit 30 --es touch_pad auto --es driver turnip --es extra_env '$oenv'" > /dev/null; sleep 5
     $ADB shell am force-stop $P
     $ADB shell "cd $G && cp cfg-backup-$stamp/* . && cp -a user-backup-$stamp/. user/ && for f in $FILES; do cmp -s \$f cfg-backup-$stamp/\$f || echo \"\$f DIFFERS\"; done; diff -r user user-backup-$stamp > /dev/null && echo user-restored || echo USER-DIFFERS; pidof $P || echo not-running"
 }

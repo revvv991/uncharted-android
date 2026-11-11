@@ -73,7 +73,7 @@ import org.json.JSONObject;
  *  adb automation: am start -n <app>/dev.unchartedg2.game.Launcher --es game_dir <path> [--ez backup_saves true]
  *  [--es driver turnip|system|pkg:<name>] [--es driver_zip <path>: install and select that package]
  *  [--es extra_env "KEY=VALUE\\nKEY=VALUE": the extra environment field]
- *  [--ez prepare true] [--ez play true]. */
+ *  [--ez prepare true] [--ez play true] [--ez controller_setup true: the controller setup]. */
 public class Launcher extends Activity {
     static {
         System.loadLibrary("bbprepare");
@@ -196,6 +196,7 @@ public class Launcher extends Activity {
             String done = backupSaves();
             status(done != null ? "Saves copied to " + done : "Backing up failed.");
         }
+        if (intent.getBooleanExtra("controller_setup", false)) ControllerSetup.show(this);
         if (intent.getBooleanExtra("prepare", false)) prepare(intent.getBooleanExtra("play", false));
         else if (intent.getBooleanExtra("play", false) && prepared()) play();
     }
@@ -660,6 +661,10 @@ public class Launcher extends Activity {
         padHint = note(controls, "Auto: shown while no gamepad is connected. Left half of the screen: a stick under the "
                                + "finger; right half: drag to look around; the buttons at the edges.");
         padHint.setVisibility(pad.equals("0") ? View.GONE : View.VISIBLE);
+        // g2-arm64 (issue #16): a controller's buttons set to the PlayStation ones (ControllerSetup.java).
+        button(controls, "Controller setup", v -> ControllerSetup.show(this));
+        note(controls, "Set a controller's buttons to the PlayStation ones: a pad in a PC or DirectInput mode (the "
+                     + "game does not read it otherwise), or another layout. Also in the game's panel.");
         note(controls, "In the game, swipe in from the right edge (or press L3+R3) for the settings panel: upscaling, "
                      + "sharpening, effects, the pad's size and opacity.");
 

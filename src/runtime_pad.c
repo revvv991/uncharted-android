@@ -84,19 +84,80 @@ static void touch_click(PadData *d, int right) {
     d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
 }
 
-/* Opens the first gamepad SDL knows about; called under lock. */
+/* g2-arm64: every gamepad SDL lists is open and the game reads the one used last, so a
+ * handheld's built-in controls and an external pad both play (the first one listed, the built-in
+ * controls, was the only one read: issue #16's pad set up on such a device stayed unread).
+ * BB_PAD_LAST_USED=0: the first one only, as before. */
+#define MAX_GAMEPADS 8
+static SDL_Gamepad *gamepads[MAX_GAMEPADS];
+static int gamepad_count;
+static uint64_t gamepads_listed_us;
+static int read_last_used(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("BB_PAD_LAST_USED"); on=!(e && e[0]=='0'); }
+    return on;
+}
+/* A gamepad in use: a button held, a stick or trigger past half way. */
+static int gamepad_in_use(SDL_Gamepad *g) {
+    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT;++b) if (SDL_GetGamepadButton(g,(SDL_GamepadButton)b)) return 1;
+    for (int a=0;a<SDL_GAMEPAD_AXIS_COUNT;++a) {
+        const int v=SDL_GetGamepadAxis(g,(SDL_GamepadAxis)a);
+        if (v>16384 || v<-16384) return 1;
+    }
+    return 0;
+}
+/* The gamepad the game reads (the first SDL knows about, or the one used last); called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
-    if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
-    if (!gamepad) {
+    if (!read_last_used()) {
+        if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
+        if (!gamepad) {
+            int count=0;
+            SDL_JoystickID *ids=SDL_GetGamepads(&count);
+            if (ids && count>0) {
+                gamepad=SDL_OpenGamepad(ids[0]);
+                if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+            }
+            SDL_free(ids);
+        }
+        __atomic_store_n(&gamepad_present,gamepad!=NULL,__ATOMIC_RELAXED); /* g2-arm64: runtime_gamepad_connected */
+        return gamepad;
+    }
+    for (int i=0;i<gamepad_count;) {
+        if (SDL_GamepadConnected(gamepads[i])) { ++i; continue; }
+        if (gamepads[i]==gamepad) gamepad=NULL;
+        SDL_CloseGamepad(gamepads[i]);
+        gamepads[i]=gamepads[--gamepad_count];
+    }
+    /* New ones a few times a second (SDL_GetGamepads allocates; the game reads at every frame). */
+    const uint64_t now=now_us();
+    if (!gamepad_count || now-gamepads_listed_us>=250000) {
+        gamepads_listed_us=now;
         int count=0;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
-        if (ids && count>0) {
-            gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+        for (int i=0;ids && i<count && gamepad_count<MAX_GAMEPADS;++i) {
+            int open=0;
+            for (int j=0;j<gamepad_count && !open;++j) open=SDL_GetGamepadID(gamepads[j])==ids[i];
+            if (open) continue;
+            SDL_Gamepad *g=SDL_OpenGamepad(ids[i]);
+            if (g) gamepads[gamepad_count++]=g;
         }
         SDL_free(ids);
+    }
+    /* Another one in use while the one read is not: that one plays now. */
+    if (gamepad && gamepad_count>1 && !gamepad_in_use(gamepad)) {
+        for (int i=0;i<gamepad_count;++i) {
+            if (gamepads[i]==gamepad || !gamepad_in_use(gamepads[i])) continue;
+            gamepad=gamepads[i];
+            printf("Runtime: reading %s (the gamepad used last)\n",SDL_GetGamepadName(gamepad));
+            break;
+        }
+    }
+    if (!gamepad && gamepad_count) {
+        gamepad=gamepads[0];
+        ++connected_count;
+        printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad));
     }
     __atomic_store_n(&gamepad_present,gamepad!=NULL,__ATOMIC_RELAXED); /* g2-arm64: runtime_gamepad_connected */
     return gamepad;

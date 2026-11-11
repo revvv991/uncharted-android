@@ -24,6 +24,9 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "../bbgpu.h"
+#ifdef __ANDROID__
+#include <jni.h>
+#endif
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
@@ -181,6 +184,28 @@ s32 PS4_SYSV_ABI sceKernelUsleep(u32 microseconds) {
 } // namespace Libraries::Kernel
 
 namespace {
+#ifdef __ANDROID__
+// g2-arm64: the game ending itself (Quit game in the in-game panel, issue #29) takes its task out
+// of Recents before the process exits (GameActivity.finishTask: finishAndRemoveTask on the UI
+// thread), so the ended game leaves no card there.
+static void AndroidFinishTask() {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!env || !activity) {
+        return;
+    }
+    jclass cls = env->GetObjectClass(activity);
+    jmethodID finish = cls ? env->GetMethodID(cls, "finishTask", "()V") : nullptr;
+    if (finish) {
+        env->CallVoidMethod(activity, finish);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+#endif
+
 // SDL video must be driven from one thread: the window lives on its own host thread.
 std::thread g_window_thread;
 std::mutex g_window_mutex;
@@ -270,6 +295,9 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::printf("Window closed (close button, Alt+F4 or system quit request)\n");
         std::fflush(stdout);
         Vulkan::FlushPipelineCacheForExit();
+#ifdef __ANDROID__
+        AndroidFinishTask();
+#endif
         std::_Exit(0);
     });
     g_window_thread.detach();
