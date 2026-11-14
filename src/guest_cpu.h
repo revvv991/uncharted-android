@@ -28,6 +28,17 @@ void guest_set_gs_base(uint64_t base);
 void guest_set_stack(void *stack_top);
 /* First look at a fault signal (siginfo_t *, ucontext_t *): 1 when the backend handled it. */
 int guest_cpu_signal(int sig, void *info, void *context);
+/* g2-arm64: FEX's code cache for the game image (on unless BB_FEX_CODE_CACHE=0) and the JIT's
+ * compile stats (BB_JIT_STATS), guest_cpu_fex.cpp: called once the image's code is final, before
+ * guest code runs. `code`: the executable segments, (offset from `image`, size); `varying`: offsets
+ * of 8-byte values in them that differ from run to run (left out of the cache's key, never cached
+ * as code); `stable`: 0 when a thunk the code jumps to was placed where the next run may not place
+ * it (no cache from or for such a run). */
+void guest_cpu_code_cache(const char *image_path, const void *image, uint64_t size, const uint64_t (*code)[2], size_t count,
+                          const uint64_t *varying, size_t nvarying, int stable);
+/* A fatal signal is ending the process (the fault handler): with a cache in use it is recorded, the
+ * next run drops that cache (guest_cpu_fex.cpp, CacheGuard). */
+void guest_cpu_code_cache_crashed(int sig, void *context);
 
 /* Guest registers (x86 order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15). Emulating backends only:
  * inside a host function the guest called, get returns the caller's state as it will resume

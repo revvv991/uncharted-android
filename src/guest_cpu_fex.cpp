@@ -25,12 +25,26 @@ int runtime_fiber_describe(char* out, size_t size, uint64_t rsp);
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#include <FEXCore/Core/CodeCache.h>
+#include <FEXCore/HLE/SourcecodeResolver.h>
+#include <FEXCore/Utils/TypeDefines.h>
+#include <FEXCore/fextl/memory.h>
 
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/auxv.h>
+#include <sys/resource.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <link.h>
+#include <sched.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -50,6 +64,10 @@ int runtime_fiber_describe(char* out, size_t size, uint64_t rsp);
 #include <string>
 #include <thread>
 #include <vector>
+#include <cctype>
+#include <set>
+#include <span>
+#include <utility>
 
 namespace {
 
@@ -237,6 +255,178 @@ FEXCore::HostFeatures g_features {};
 uintptr_t g_exit_hlt = 0;        // hlt: the outermost guest_call returns here
 uintptr_t g_callback_return = 0; // FEX CALLBACKRET: nested calls return here
 
+// ---- g2-arm64: FEX's code cache for the game image (on by default, BB_FEX_CODE_CACHE=0: off) -----
+// FEX compiles a guest block the first time it runs. On the G2 (BB_JIT_STATS, findings 2026-11-12)
+// U3's process compiles ~12,500 blocks of its image, 1.4 s of compile time over its threads: 0.66 s
+// in its first 5 s (0.13 s on the main thread), 0.46 s in the Continue load's heaviest 5 s (0.38 s
+// on one job worker); the collection menu's process ~5,900 blocks, 0.55 s. FEXCore can keep
+// compiled code across runs (EnableCodeCachingWIP), keyed by an executable file; here the one
+// "file" is the game image probe.c builds, named after its path and identified by a hash of its
+// executable segments after every patch (FileId), the run-time values in them left out (probe.c's
+// note_varying; FEX gets them as Skip relocations and caches no block that holds one); the cache
+// file's name also carries the FEX options from the environment, the CPU's features and this
+// library's build id (FEX's version string does not cover our FEX patches). The blocks compiled
+// while playing are recorded (<image>.<pid>.seen, every 10 s); a second FEXCore context compiles
+// the recorded blocks for a cache file on an idle-priority thread (BB_FEX_CACHE_GEN_DELAY: seconds
+// after the image load, "30,180" by default: the boot's blocks, then a level's - the later passes
+// only for 256 new blocks or more, fewer wait for the next start), and the next run
+// maps the file and finalizes the pages of cached code on their first execution (a fault on the
+// cache's code buffer, guest_cpu_signal: the page and its neighbours, BB_FEX_CACHE_CHUNK pages at
+// most, 16). A warm U3 run compiles no block of its image (10 ms in all: veneers, thunks).
+// On by default since port 0185, so a bad cache must not cost a player the game (FEX's SaveData
+// checks none of its writes and LoadCache trusts the file):
+//  - the file is whole or absent: FEX writes it into memory (a memfd), it goes to disk with every
+//    write checked, a trailer (CacheTrailer) and an fsync before the rename; a file without the
+//    trailer of this image and build is removed, not mapped;
+//  - a crash while a cache is mapped is recorded (<image>.guard, guest_cpu_code_cache_crashed):
+//    the next run drops the file, runs on the JIT and compiles a new one; the same crash again
+//    within three runs of a mapped cache turns the cache off for this image until another build,
+//    and so does a crash on the thread that compiles the cache (it would come back 30 s into
+//    every run);
+//  - no cache is compiled when the image's code is not what the key says any more (code written
+//    after the load), when its hash is not the last run's under the same build (a value that
+//    changes from run to run would make every run write 50 MB for nothing: such a run only
+//    records), when a thunk was placed by search (its address is not the next run's), or when the
+//    disk or the memory is short;
+//  - it needs mremap's MREMAP_DONTUNMAP (Linux 5.7) and 4 KiB pages: off with a note otherwise.
+// BB_FEX_CACHE_LOAD=0 / BB_FEX_CACHE_GEN=0 leave out the load or the compile (A/Bs on one fixed
+// cache); BB_FEX_CACHE_CLEAR=1 drops this image's files (its guard record too). Files:
+// $HOME/.cache/fex/<image>.<pid>.seen, <image>.blocks (the folded records), <image>.guard,
+// <image>-<FileId>-<config>.fexcache. The safety net's tests: BB_FEX_CACHE_TEST (CacheTest below).
+
+// The last bytes of a cache file, after FEX's data: a file that has them is whole.
+struct CacheTrailer {
+  char magic[8];      // kTrailerMagic
+  uint64_t payload;   // FEX's data before the trailer, bytes
+  uint64_t file_id;   // the image's code
+  uint64_t config_id; // the options, CPU and build it was compiled for
+};
+constexpr char kTrailerMagic[8] = {'B', 'B', 'F', 'X', 'E', 'N', 'D', '1'};
+
+// <image>.guard: what the last runs of this image did with its cache.
+struct CacheGuard {
+  char magic[8];      // kGuardMagic
+  uint64_t file_id;   // the last run's image code
+  uint64_t config_id; // and its options, CPU and build
+  uint32_t state;     // kGuardClean, kGuardSuspect, kGuardOff
+  uint32_t runs;      // runs that mapped a cache since the crash below
+  uint64_t crash;     // the last crash with a cache mapped or being compiled: the signal and the
+                      // guest rip (or the host library offset), hashed; 0: none
+};
+constexpr char kGuardMagic[8] = {'B', 'B', 'F', 'X', 'G', 'R', 'D', '1'};
+enum : uint32_t {
+  kGuardClean = 0,
+  kGuardSuspect = 1, // a run crashed with the cache mapped: the next run drops the file
+  kGuardOff = 2,     // the same crash again, or a crash of the compile: no cache for this image
+                     // and build
+};
+
+struct ImageCode {
+  bool on = false, load = false, generate = false;
+  bool record = false;                             // this run's blocks go to its .seen file
+  uintptr_t base = 0, end = 0;                     // the image, [base, end)
+  std::vector<std::pair<uint64_t, uint64_t>> code; // its executable segments: offset, size
+  std::vector<uint64_t> slots;                     // the run-time values in them: offsets, sorted
+  uint64_t config_id = 0;
+  FEXCore::ExecutableFileInfo info;                // FileId: the hash of the image's code
+  std::string dir, name, map_path, blocks_path, cache_path;
+  fextl::unique_ptr<FEXCore::MappedCodeCacheFile> mapped;
+  std::mutex finalize;
+  CacheGuard guard {};                             // <image>.guard as this run wrote it
+  int guard_fd = -1;
+  std::atomic<bool> armed {false};                 // a cache is mapped: a crash is recorded
+  std::atomic<bool> crash_noted {false};           // once
+};
+// Never destroyed: guest threads may still run cached code while the process exits.
+ImageCode& g_image = *new ImageCode;
+
+bool EnvOn(const char* name) {
+  const char* e = std::getenv(name);
+  return e && e[0] == '1';
+}
+bool EnvOff(const char* name) {
+  const char* e = std::getenv(name);
+  return e && e[0] == '0';
+}
+
+uint64_t HashMix(uint64_t h, uint64_t v) {
+  h ^= v * 0x9E3779B97F4A7C15ull;
+  h = (h << 27 | h >> 37) * 0xC2B2AE3D27D4EB4Full;
+  return h ^ (h >> 31);
+}
+// 64-bit hash, four lanes (~10 ms for U3's 22 MiB of code)
+uint64_t HashBytes(const void* data, size_t size, uint64_t seed) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  uint64_t lane[4] = {seed, seed + 1, seed + 2, seed + 3};
+  size_t i = 0;
+  for (; i + 32 <= size; i += 32) {
+    for (int k = 0; k < 4; ++k) {
+      uint64_t v;
+      std::memcpy(&v, p + i + 8 * k, 8);
+      lane[k] = HashMix(lane[k], v);
+    }
+  }
+  uint64_t h = HashMix(size, lane[0]);
+  for (int k = 1; k < 4; ++k) h = HashMix(h, lane[k]);
+  for (; i < size; ++i) h = HashMix(h, p[i]);
+  return h;
+}
+
+// The JIT's compile time (BB_JIT_STATS=1: a line every 5 s). FEX calls PreCompile when it starts
+// a block and, with a code map writer set, LookupExecutableFileSection once the block is in (the
+// writer records it there): the time between the two, per thread.
+bool g_jit_stats = false;
+thread_local uint64_t t_compile_start = 0;
+thread_local bool t_cache_generator = false; // the code cache's compile thread: not counted
+constexpr size_t kJitThreads = 64;
+struct JitThread {
+  std::atomic<uint64_t> ns {0};
+  char name[16] {};
+};
+JitThread g_jit_threads[kJitThreads];
+std::atomic<size_t> g_jit_nthreads {0};
+thread_local size_t t_jit_slot = ~size_t(0);
+std::atomic<uint64_t> g_jit_blocks {0}, g_jit_outside {0}, g_jit_ns {0}, g_jit_max_ns {0}, g_jit_over2 {0}, g_jit_over10 {0};
+std::atomic<uint64_t> g_cache_pages {0}; // code cache pages finalized (their first use)
+std::atomic<uint64_t> g_cache_page_ns {0}; // and the time the faulting threads spent on that
+std::atomic<uint64_t> g_cache_page_faults {0}; // in that many faults
+size_t g_cache_chunk = 16;                 // pages finalized at a fault, at most (BB_FEX_CACHE_CHUNK)
+
+void NoteCompile(uint64_t ns, bool in_image) {
+  g_jit_blocks.fetch_add(1, std::memory_order_relaxed);
+  if (!in_image) g_jit_outside.fetch_add(1, std::memory_order_relaxed);
+  g_jit_ns.fetch_add(ns, std::memory_order_relaxed);
+  uint64_t longest = g_jit_max_ns.load(std::memory_order_relaxed);
+  while (ns > longest && !g_jit_max_ns.compare_exchange_weak(longest, ns, std::memory_order_relaxed)) {
+  }
+  if (ns >= 2000000) g_jit_over2.fetch_add(1, std::memory_order_relaxed);
+  if (ns >= 10000000) g_jit_over10.fetch_add(1, std::memory_order_relaxed);
+  if (t_jit_slot == ~size_t(0)) {
+    t_jit_slot = g_jit_nthreads.fetch_add(1, std::memory_order_relaxed);
+    if (t_jit_slot < kJitThreads) pthread_getname_np(pthread_self(), g_jit_threads[t_jit_slot].name, sizeof(g_jit_threads[0].name));
+  }
+  if (t_jit_slot < kJitThreads) g_jit_threads[t_jit_slot].ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+// FEX's code map writer stays closed: it is set only so that FEX looks up each compiled block's
+// file section at the end of the compile, where the blocks are recorded below. Its own file took
+// the blocks 4 KiB at a time, and a killed run lost the tail: ~265 blocks of a warm U3 run (its
+// level start's) were compiled again in every run.
+class CodeMapFile final : public FEXCore::CodeMapOpener {
+public:
+  int OpenCodeMapFile() override {
+    return -1;
+  }
+};
+CodeMapFile g_code_map_file;
+
+// The blocks compiled in this run (offsets from the image base): appended to <image>.<pid>.seen
+// every 10 s ("BBFXSEEN", the image's FileId, then uint32 offsets), so a killed run loses at most
+// its last 10 s.
+std::mutex g_seen_mutex;
+std::vector<uint32_t> g_seen_new;
+std::mutex g_seen_file_mutex;
+
 class Syscalls final : public FEXCore::HLE::SyscallHandler {
 public:
   Syscalls() { OSABI = FEXCore::HLE::SyscallOSABI::OS_GENERIC; }
@@ -319,9 +509,24 @@ public:
     // The whole address space: the image, veneers, hooks. Self-modifying code is not expected.
     return {0, std::numeric_limits<uint64_t>::max(), true};
   }
+  // g2-arm64: the game image is FEX's one executable "file" (its code map and code cache,
+  // guest_cpu_code_cache); the JIT stats time each compile up to the lookup at its end.
+  void PreCompile() override {
+    if (g_jit_stats && !t_cache_generator) t_compile_start = MonotonicNs();
+  }
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*,
-                                                                                uint64_t) override {
-    return std::nullopt;
+                                                                                uint64_t address) override {
+    const bool in_image = address - g_image.base < g_image.end - g_image.base;
+    if (t_compile_start) {
+      NoteCompile(MonotonicNs() - t_compile_start, in_image);
+      t_compile_start = 0;
+    }
+    if (!in_image) return std::nullopt;
+    if (g_image.record && !t_cache_generator) {
+      std::lock_guard lock {g_seen_mutex};
+      g_seen_new.push_back(static_cast<uint32_t>(address - g_image.base));
+    }
+    return FEXCore::ExecutableFileSectionInfo {g_image.info, g_image.base, g_image.base, g_image.end};
   }
 };
 
@@ -332,6 +537,596 @@ public:
 
 Syscalls* g_syscalls = nullptr;
 Signals* g_signals = nullptr;
+
+// ---- g2-arm64: the code cache's files, load and compile (see ImageCode above) --------------------
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+#ifndef NT_GNU_BUILD_ID
+#define NT_GNU_BUILD_ID 3
+#endif
+// FEX finalizes cache pages with mremap(MREMAP_DONTUNMAP), Linux 5.7 and later.
+bool KernelHasDontUnmap() {
+  void* from = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* to = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  bool ok = false;
+  if (from != MAP_FAILED && to != MAP_FAILED)
+    ok = mremap(from, 4096, 4096, MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP, to) != MAP_FAILED;
+  if (from != MAP_FAILED) munmap(from, 4096);
+  if (to != MAP_FAILED) munmap(to, 4096);
+  return ok;
+}
+
+// This library's GNU build id, hashed (0 without one): the FEX it was built with, our patches in.
+uint64_t OwnBuildId() {
+  struct Find {
+    uintptr_t address;
+    uint64_t id;
+  } find {reinterpret_cast<uintptr_t>(&OwnBuildId), 0};
+  dl_iterate_phdr(
+    [](dl_phdr_info* info, size_t, void* data) -> int {
+      auto* f = static_cast<Find*>(data);
+      bool inside = false;
+      for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const auto& ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD && f->address - (info->dlpi_addr + ph.p_vaddr) < ph.p_memsz) inside = true;
+      }
+      if (!inside) return 0;
+      for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const auto& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_NOTE) continue;
+        const auto* p = reinterpret_cast<const uint8_t*>(info->dlpi_addr + ph.p_vaddr);
+        const auto* end = p + ph.p_memsz;
+        while (p + sizeof(ElfW(Nhdr)) <= end) {
+          const auto* note = reinterpret_cast<const ElfW(Nhdr)*>(p);
+          const uint8_t* name = p + sizeof(*note);
+          const uint8_t* desc = name + ((note->n_namesz + 3) & ~3u);
+          if (note->n_type == NT_GNU_BUILD_ID && note->n_namesz == 4 && !std::memcmp(name, "GNU", 4)) {
+            f->id = HashBytes(desc, note->n_descsz, 0x6275696c64ull);
+            return 1;
+          }
+          p = desc + ((note->n_descsz + 3) & ~3u);
+        }
+      }
+      return 1;
+    },
+    &find);
+  return find.id;
+}
+
+// The FEX options from the environment (FEX_<OPTION>=..., BB_TSC_SCALE), the CPU's features (the
+// JIT's code depends on them: a cache copied to another device with the app's files is not used
+// there) and this build; kCacheFormat counts the changes of the cache files' own layout.
+constexpr uint64_t kCacheFormat = 2; // 2: the trailer (port 0185)
+uint64_t CodeCacheConfigId() {
+  std::vector<std::string> options;
+  for (char** e = environ; e && *e; ++e)
+    if (std::strncmp(*e, "FEX_", 4) == 0) options.emplace_back(*e);
+  std::sort(options.begin(), options.end());
+  uint64_t id = HashMix(OwnBuildId(), kCacheFormat);
+  for (const auto& o : options) id = HashBytes(o.data(), o.size(), id);
+  const char* scale = std::getenv("BB_TSC_SCALE");
+  const std::string s = scale ? scale : "";
+  id = HashBytes(s.data(), s.size(), id);
+  const uint64_t cpu[2] = {getauxval(AT_HWCAP), getauxval(AT_HWCAP2)};
+  return HashBytes(cpu, sizeof(cpu), id);
+}
+
+// $HOME/.cache/fex/ (on Android HOME is the app's files/home)
+std::string CodeCacheDir() {
+  const char* home = std::getenv("HOME");
+  std::string dir = std::string(home && *home ? home : ".") + "/.cache";
+  mkdir(dir.c_str(), 0755);
+  dir += "/fex";
+  mkdir(dir.c_str(), 0755);
+  return dir + "/";
+}
+
+// ".../u3/boot-linked.bin" -> "u3-boot-linked"
+std::string ImageName(const char* path) {
+  const std::string p = path && *path ? path : "image";
+  const size_t slash = p.find_last_of('/');
+  std::string file = slash == std::string::npos ? p : p.substr(slash + 1), parent;
+  if (slash != std::string::npos && slash > 0) {
+    const size_t before = p.find_last_of('/', slash - 1);
+    const size_t from = before == std::string::npos ? 0 : before + 1;
+    parent = p.substr(from, slash - from);
+  }
+  if (const size_t dot = file.find_last_of('.'); dot != std::string::npos && dot > 0) file.resize(dot);
+  std::string name = parent.empty() ? file : parent + "-" + file;
+  for (char& c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') c = '_';
+  return name;
+}
+
+const char* Basename(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  return path.c_str() + (slash == std::string::npos ? 0 : slash + 1);
+}
+
+bool InImageCode(uint64_t offset) {
+  for (const auto& [start, size] : g_image.code)
+    if (offset - start < size) return true;
+  return false;
+}
+
+// The image's files in the cache directory: <prefix>...<suffix>
+std::vector<std::string> ImageFiles(const std::string& prefix, const char* suffix) {
+  std::vector<std::string> files;
+  DIR* d = opendir(g_image.dir.c_str());
+  if (!d) return files;
+  const size_t n = std::strlen(suffix);
+  while (const dirent* e = readdir(d)) {
+    const std::string name = e->d_name;
+    if (name.size() > prefix.size() + n && name.compare(0, prefix.size(), prefix) == 0 &&
+        name.compare(name.size() - n, n, suffix) == 0 && e->d_type != DT_DIR)
+      files.push_back(g_image.dir + name);
+  }
+  closedir(d);
+  return files;
+}
+
+// A run's block record (<image>.<pid>.seen): blocks of this image's code only (a partial last
+// offset of a run killed mid-write is ignored).
+void ReadSeen(const std::string& path, std::set<uint32_t>& blocks) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return;
+  char magic[8];
+  uint64_t id = 0;
+  if (std::fread(magic, 1, 8, f) == 8 && !std::memcmp(magic, "BBFXSEEN", 8) && std::fread(&id, 8, 1, f) == 1 &&
+      id == g_image.info.FileId) {
+    uint32_t chunk[1024];
+    size_t n;
+    while ((n = std::fread(chunk, 4, 1024, f)) > 0)
+      for (size_t i = 0; i < n; ++i)
+        if (InImageCode(chunk[i])) blocks.insert(chunk[i]);
+  }
+  std::fclose(f);
+}
+
+// This run's new blocks to its .seen file.
+void FlushSeen() {
+  std::lock_guard file_lock {g_seen_file_mutex};
+  std::vector<uint32_t> fresh;
+  {
+    std::lock_guard lock {g_seen_mutex};
+    fresh.swap(g_seen_new);
+  }
+  if (fresh.empty()) return;
+  struct stat st {};
+  const bool new_file = stat(g_image.map_path.c_str(), &st) != 0;
+  FILE* f = std::fopen(g_image.map_path.c_str(), "ab");
+  if (!f) return;
+  if (new_file) {
+    std::fwrite("BBFXSEEN", 1, 8, f);
+    std::fwrite(&g_image.info.FileId, 8, 1, f);
+  }
+  std::fwrite(fresh.data(), 4, fresh.size(), f);
+  std::fclose(f);
+}
+
+// The folded code maps: "BBFXBLK1", the image's FileId, the count, the offsets (uint32, sorted).
+std::set<uint32_t> ReadBlockList() {
+  std::set<uint32_t> blocks;
+  FILE* f = std::fopen(g_image.blocks_path.c_str(), "rb");
+  if (!f) return blocks;
+  char magic[8];
+  uint64_t id = 0, count = 0;
+  if (std::fread(magic, 1, 8, f) == 8 && !std::memcmp(magic, "BBFXBLK1", 8) && std::fread(&id, 8, 1, f) == 1 &&
+      std::fread(&count, 8, 1, f) == 1 && id == g_image.info.FileId && count < (1u << 24)) {
+    std::vector<uint32_t> v(count);
+    if (std::fread(v.data(), 4, count, f) == count)
+      for (const uint32_t offset : v)
+        if (InImageCode(offset)) blocks.insert(offset);
+  }
+  std::fclose(f);
+  return blocks;
+}
+
+bool WriteBlockList(const std::set<uint32_t>& blocks) {
+  const std::string tmp = g_image.blocks_path + ".new";
+  FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (!f) return false;
+  const uint64_t count = blocks.size();
+  const std::vector<uint32_t> v(blocks.begin(), blocks.end());
+  bool ok = std::fwrite("BBFXBLK1", 1, 8, f) == 8 && std::fwrite(&g_image.info.FileId, 8, 1, f) == 1 &&
+            std::fwrite(&count, 8, 1, f) == 1 && std::fwrite(v.data(), 4, v.size(), f) == v.size();
+  ok = std::fclose(f) == 0 && ok;
+  return ok && std::rename(tmp.c_str(), g_image.blocks_path.c_str()) == 0;
+}
+
+// The image's code as the cache keys it: the executable segments' bytes, the run-time values in
+// them (g_image.slots) left out. ~10 ms for U3's 22 MiB.
+uint64_t ImageCodeId() {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(g_image.base);
+  const uint64_t size = g_image.end - g_image.base;
+  uint64_t id = HashBytes(&size, sizeof(size), g_image.base);
+  for (const auto& [start, length] : g_image.code) {
+    const uint64_t segment[2] = {start, length}, end = start + length;
+    id = HashBytes(segment, sizeof(segment), id);
+    uint64_t at = start;
+    for (auto it = std::lower_bound(g_image.slots.begin(), g_image.slots.end(), start); it != g_image.slots.end() && *it < end; ++it) {
+      if (*it < at) continue;
+      id = HashBytes(bytes + at, *it - at, id);
+      id = HashMix(id, *it ^ 0x76617279ull);
+      at = std::min(*it + 8, end);
+    }
+    id = HashBytes(bytes + at, end - at, id);
+  }
+  return id;
+}
+
+// The guard record to its open file (async-signal-safe: the crash record writes it).
+bool WriteGuard() {
+  return g_image.guard_fd >= 0 &&
+         pwrite(g_image.guard_fd, &g_image.guard, sizeof(g_image.guard), 0) == static_cast<ssize_t>(sizeof(g_image.guard));
+}
+
+// The guard record at the start of a run: what the last runs say this one may do.
+void OpenGuard() {
+  const std::string path = g_image.dir + g_image.name + ".guard";
+  CacheGuard last {};
+  if (const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {
+    if (read(fd, &last, sizeof(last)) != static_cast<ssize_t>(sizeof(last))) last = {};
+    close(fd);
+  }
+  const bool known = !std::memcmp(last.magic, kGuardMagic, 8) && last.config_id == g_image.config_id;
+  CacheGuard now {};
+  std::memcpy(now.magic, kGuardMagic, 8);
+  now.file_id = g_image.info.FileId;
+  now.config_id = g_image.config_id;
+  if (known && last.file_id == g_image.info.FileId) {
+    now.state = last.state;
+    now.runs = last.runs;
+    now.crash = last.crash;
+    if (last.state == kGuardSuspect) {
+      unlink(g_image.cache_path.c_str());
+      now.state = kGuardClean;
+      now.runs = 0;
+      g_image.load = false;
+      std::printf("FEX code cache: the last run crashed with the cache in use (crash %016llx): its file is dropped, this run "
+                  "compiles a new one\n", (unsigned long long)last.crash);
+    } else if (last.state == kGuardOff) {
+      unlink(g_image.cache_path.c_str());
+      g_image.load = g_image.generate = g_image.record = false;
+      std::printf("FEX code cache: off for this image until another version of the app (the same crash twice with the cache "
+                  "in use, or a crash while compiling it: %016llx)\n", (unsigned long long)last.crash);
+    }
+  } else if (known) {
+    g_image.generate = false;
+    std::printf("FEX code cache: the image's code is not the last run's (%016llx then): this run only records its blocks, a "
+                "cache is compiled once two runs in a row have the same code\n", (unsigned long long)last.file_id);
+  }
+  g_image.guard = now;
+  g_image.guard_fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (!WriteGuard()) {
+    g_image.load = g_image.generate = g_image.record = false;
+    std::printf("FEX code cache: off in this run (cannot write %s)\n", Basename(path));
+  }
+}
+
+// Files no run can use: this image's caches of another key (another build, CPU or image code), the
+// files a killed run left half-written, FEX's own code maps (the first test builds), its block
+// records of another image code; and any image's cache of another build, CPU or options (that
+// game may not be started again).
+void RemoveStaleFiles() {
+  size_t removed = 0;
+  const auto drop = [&](const std::string& path) {
+    if (unlink(path.c_str()) == 0) ++removed;
+  };
+  {
+    char config[40];
+    std::snprintf(config, sizeof(config), "-%016llx.fexcache", (unsigned long long)g_image.config_id);
+    const size_t n = std::strlen(config);
+    std::vector<std::string> others;
+    if (DIR* d = opendir(g_image.dir.c_str())) {
+      while (const dirent* e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.size() > n && name.compare(name.size() - 9, 9, ".fexcache") == 0 && name.compare(name.size() - n, n, config) != 0)
+          others.push_back(g_image.dir + name);
+      }
+      closedir(d);
+    }
+    for (const auto& path : others) drop(path);
+  }
+  for (const auto& path : ImageFiles(g_image.name + "-", ".fexcache"))
+    if (path != g_image.cache_path) drop(path);
+  for (const auto& path : ImageFiles(g_image.name + "-", ".fexcache.new")) drop(path);
+  for (const auto& path : ImageFiles(g_image.name + ".", ".codemap")) drop(path);
+  for (const auto& path : ImageFiles(g_image.name + ".", "blocks.new")) drop(path);
+  for (const auto& path : ImageFiles(g_image.name + ".", ".seen")) {
+    uint64_t header[2] = {};
+    FILE* f = std::fopen(path.c_str(), "rb");
+    const bool ours = f && std::fread(header, 8, 2, f) == 2 && !std::memcmp(header, "BBFXSEEN", 8) && header[1] == g_image.info.FileId;
+    if (f) std::fclose(f);
+    if (!ours) drop(path);
+  }
+  if (removed) std::printf("FEX code cache: %zu files that no run can use removed\n", removed);
+}
+
+// Free space where the cache lives and the memory the system can still give, MiB (~0: unknown).
+uint64_t FreeDiskMiB(const std::string& dir) {
+  struct statvfs v {};
+  if (statvfs(dir.c_str(), &v) != 0) return ~0ull;
+  return (static_cast<uint64_t>(v.f_bavail) * v.f_frsize) >> 20;
+}
+uint64_t AvailableMemoryMiB() {
+  FILE* f = std::fopen("/proc/meminfo", "r");
+  if (!f) return ~0ull;
+  char line[128];
+  unsigned long long kb = 0;
+  bool found = false;
+  while (!found && std::fgets(line, sizeof(line), f)) found = std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1;
+  std::fclose(f);
+  return found ? kb >> 10 : ~0ull;
+}
+constexpr uint64_t kMinDiskMiB = 512, kMinMemoryMiB = 256;
+
+bool WriteAll(int fd, const void* data, size_t size) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  while (size) {
+    const ssize_t n = write(fd, p, size);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return false;
+    p += n;
+    size -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+// The compiled cache from memory to <cache>.new with every write checked, the trailer, an fsync,
+// then the rename: a file under the cache's name is whole. Returns what failed, or null.
+const char* WriteCacheFile(int mem, size_t payload) {
+  void* data = mmap(nullptr, payload, PROT_READ, MAP_SHARED, mem, 0);
+  if (data == MAP_FAILED) return "cannot map the compiled data";
+  const std::string tmp = g_image.cache_path + ".new";
+  const int fd = open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+  CacheTrailer trailer {};
+  std::memcpy(trailer.magic, kTrailerMagic, 8);
+  trailer.payload = payload;
+  trailer.file_id = g_image.info.FileId;
+  trailer.config_id = g_image.config_id;
+  const char* error = nullptr;
+  if (fd < 0) error = "cannot create the file";
+  else if (!WriteAll(fd, data, payload) || !WriteAll(fd, &trailer, sizeof(trailer))) error = "a write failed";
+  else if (fsync(fd) != 0) error = "fsync failed";
+  if (fd >= 0 && close(fd) != 0 && !error) error = "close failed";
+  munmap(data, payload);
+  if (!error && std::rename(tmp.c_str(), g_image.cache_path.c_str()) != 0) error = "the rename failed";
+  if (error) unlink(tmp.c_str());
+  return error;
+}
+
+// The safety net's tests, BB_FEX_CACHE_TEST=<test>[@<part of the image's name>]: "cut" (the cache
+// file loses its last page before the load: it must be refused and removed), "crash:<seconds>" (a
+// fatal signal on a host thread that long after the image load: the guard must record it, the next
+// run drop the file, the same crash again turn the cache off), "gencrash" (a fatal signal on the
+// compile thread: the cache must be off from the next run on).
+bool CacheTest(const char* test, double* argument = nullptr) {
+  const char* e = std::getenv("BB_FEX_CACHE_TEST");
+  if (!e) return false;
+  const std::string s = e;
+  const size_t at = s.find('@');
+  if (at != std::string::npos && g_image.name.find(s.substr(at + 1)) == std::string::npos) return false;
+  const std::string what = s.substr(0, at);
+  const size_t n = std::strlen(test);
+  if (what.compare(0, n, test) != 0) return false;
+  if (what.size() == n) return true;
+  if (what[n] != ':') return false;
+  if (argument) *argument = std::atof(what.c_str() + n + 1);
+  return true;
+}
+
+void LoadImageCache() {
+  if (struct stat cut {}; CacheTest("cut") && stat(g_image.cache_path.c_str(), &cut) == 0 && cut.st_size > 4096) {
+    const int result = truncate(g_image.cache_path.c_str(), cut.st_size - 4096);
+    std::printf("FEX code cache: BB_FEX_CACHE_TEST=cut, the file's last page cut off (%d)\n", result);
+  }
+  const int fd = open(g_image.cache_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    std::printf("FEX code cache: none for this image yet (%s)\n", Basename(g_image.cache_path));
+    return;
+  }
+  struct stat st {};
+  void* file = MAP_FAILED;
+  if (fstat(fd, &st) == 0 && st.st_size >= static_cast<off_t>(4096 + sizeof(CacheTrailer)))
+    file = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  // Whole, and of this image and build: FEX's LoadCache checks no bounds.
+  CacheTrailer trailer {};
+  bool whole = false;
+  if (file != MAP_FAILED) {
+    std::memcpy(&trailer, static_cast<const uint8_t*>(file) + st.st_size - sizeof(trailer), sizeof(trailer));
+    whole = !std::memcmp(trailer.magic, kTrailerMagic, 8) && trailer.payload == static_cast<uint64_t>(st.st_size) - sizeof(trailer) &&
+            trailer.file_id == g_image.info.FileId && trailer.config_id == g_image.config_id;
+  }
+  if (!whole) {
+    if (file != MAP_FAILED) munmap(file, st.st_size);
+    unlink(g_image.cache_path.c_str());
+    std::printf("FEX code cache: %s is not a whole cache of this image: removed\n", Basename(g_image.cache_path));
+    return;
+  }
+  // Read ahead: nearly all of the file is used in a run (24 of U3's 27 MiB of code), and it is
+  // rarely still in the page cache from the last run.
+  madvise(file, st.st_size, MADV_WILLNEED);
+  // The guard record first: a crash from here on is this cache's until shown otherwise.
+  if (g_image.guard.crash && g_image.guard.runs < 1000) ++g_image.guard.runs;
+  if (!WriteGuard()) {
+    munmap(file, st.st_size);
+    std::printf("FEX code cache: not mapped (its guard record cannot be written)\n");
+    return;
+  }
+  const uint64_t t0 = MonotonicNs();
+  auto& cache = g_context->GetCodeCache();
+  auto mapped = cache.LoadCache(std::span {static_cast<std::byte*>(file), static_cast<size_t>(trailer.payload)}, g_image.info, g_image.base);
+  if (!mapped) {
+    munmap(file, st.st_size);
+    unlink(g_image.cache_path.c_str());
+    std::printf("FEX code cache: %s rejected by FEX: removed\n", Basename(g_image.cache_path));
+    return;
+  }
+  cache.RegisterMappedCodeBuffer(*mapped);
+  const FEXCore::ExecutableFileSectionInfo section {g_image.info, g_image.base, g_image.base, g_image.end};
+  cache.EnableLoadedSection(nullptr, *mapped, section);
+  std::printf("FEX code cache: %u blocks, %.1f MiB of code from %s, mapped in %.1f ms\n", mapped->NumBlocks,
+              mapped->CodeBuffer.size_bytes() / 1048576.0, Basename(g_image.cache_path), (MonotonicNs() - t0) / 1e6);
+  g_image.mapped = std::move(mapped);
+  g_image.armed.store(true, std::memory_order_relaxed);
+}
+
+// One compile of the cache from the folded records and every block record of this image: a second
+// FEXCore context with the same options, compiling for a cache file (relocatable code), on this
+// thread. FEX's SaveData checks none of its writes: it writes into memory (a memfd), and
+// WriteCacheFile takes that to disk. `min_new`: with a cache there, fewer new blocks than that wait
+// for the next start (a pass compiles all the blocks again: for one or two new ones 180 s into a
+// run that was 3 s of work during play - U3's roof, that second at 25 FPS instead of 28).
+constexpr size_t kLaterPassBlocks = 256;
+void CompileImageCache(size_t min_new) {
+  if (!g_image.generate) return;
+  const uint64_t t0 = MonotonicNs();
+  FlushSeen();
+  std::set<uint32_t> blocks = ReadBlockList();
+  const size_t listed = blocks.size();
+  const auto maps = ImageFiles(g_image.name + ".", ".seen");
+  for (const auto& path : maps) ReadSeen(path, blocks);
+  struct stat st {};
+  const bool have_cache = stat(g_image.cache_path.c_str(), &st) == 0;
+  if (blocks.empty() || (have_cache && blocks.size() == listed)) {
+    // the other runs' records add nothing to the list: done with them
+    if (!blocks.empty())
+      for (const auto& path : maps)
+        if (path != g_image.map_path) unlink(path.c_str());
+    std::printf("FEX code cache: up to date (%zu blocks)\n", blocks.size());
+    return;
+  }
+  if (have_cache && blocks.size() - listed < min_new) {
+    std::printf("FEX code cache: %zu new blocks wait for the next start's compile\n", blocks.size() - listed);
+    return;
+  }
+  // Code written after the load (nothing does that now) would be compiled as it is at this moment
+  // under a key that names the code as it was at the load.
+  if (ImageCodeId() != g_image.info.FileId) {
+    g_image.generate = false;
+    std::printf("FEX code cache: the image's code was written after its load: no cache from this run\n");
+    return;
+  }
+  const uint64_t disk = FreeDiskMiB(g_image.dir), memory = AvailableMemoryMiB();
+  if (disk < kMinDiskMiB || memory < kMinMemoryMiB) {
+    std::printf("FEX code cache: not compiled now (%llu MiB of disk free, %llu MiB of memory available)\n",
+                (unsigned long long)disk, (unsigned long long)memory);
+    return;
+  }
+  auto ctx = FEXCore::Context::Context::CreateNewContext(g_features);
+  ctx->GetCodeCache().InitiateCacheGeneration();
+  ctx->SetSignalDelegator(g_signals);
+  ctx->SetSyscallHandler(g_syscalls);
+  ctx->EnableExitOnHLT();
+  if (!ctx->InitCore()) {
+    std::printf("FEX code cache: cannot start a compile context\n");
+    return;
+  }
+  auto* thread = ctx->CreateThread(0, 0);
+  GuestSegments segments;
+  segments.Initialize(thread->CurrentFrame->State);
+  const uint64_t max_inst = FEXCore::Config::Get_MAXINST();
+  size_t compiled = 0, skipped = 0;
+  for (const uint32_t offset : blocks) {
+    const uint64_t rip = g_image.base + offset;
+    if (!ctx->CheckIfBlockIsCacheable(*thread, rip, max_inst)) {
+      ++skipped;
+      continue;
+    }
+    ctx->CompileRIP(thread, rip);
+    ++compiled;
+  }
+  if (CacheTest("gencrash")) {
+    volatile int* volatile nowhere = nullptr;
+    *nowhere = 1;
+  }
+  const int mem = static_cast<int>(syscall(__NR_memfd_create, "bbfx-cache", 1u /* MFD_CLOEXEC */));
+  const FEXCore::ExecutableFileSectionInfo section {g_image.info, g_image.base, g_image.base, g_image.end};
+  const bool saved = mem >= 0 && ctx->GetCodeCache().SaveData(*thread, mem, section, 0);
+  const off_t payload = saved ? lseek(mem, 0, SEEK_END) : 0;
+  ctx->DestroyThread(thread);
+  ctx.reset();
+  const char* error = !saved ? "FEX saved nothing" : payload < 4096 ? "FEX's data is too short" : WriteCacheFile(mem, static_cast<size_t>(payload));
+  if (mem >= 0) close(mem);
+  if (error) {
+    std::printf("FEX code cache: %s not written (%s)\n", Basename(g_image.cache_path), error);
+    return;
+  }
+  WriteBlockList(blocks);
+  for (const auto& path : maps)
+    if (path != g_image.map_path) unlink(path.c_str());
+  std::printf("FEX code cache: %zu blocks (%zu new) compiled in %.1f s at idle priority (%zu not cacheable), %.1f MiB -> %s "
+              "(%llu MiB of memory available)\n",
+              compiled, blocks.size() - listed, (MonotonicNs() - t0) / 1e9, skipped, payload / 1048576.0, Basename(g_image.cache_path),
+              (unsigned long long)(memory == ~0ull ? 0 : memory));
+  std::fflush(stdout);
+}
+
+// The block record's writer: every 10 s at normal priority (an idle-priority thread may not run
+// for minutes on a busy device).
+void SeenFlushThread() {
+  pthread_setname_np(pthread_self(), "FEXCacheSeen");
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    FlushSeen();
+  }
+}
+
+// The compile thread: idle priority (only cores the game leaves free), at the given seconds after
+// the image load.
+void CodeCacheThread(std::vector<double> at) {
+  t_cache_generator = true;
+  pthread_setname_np(pthread_self(), "FEXCacheGen");
+  sched_param idle {};
+  if (sched_setscheduler(0, SCHED_IDLE, &idle) != 0) setpriority(PRIO_PROCESS, 0, 19);
+  const auto start = std::chrono::steady_clock::now();
+  for (size_t i = 0; i < at.size(); ++i) {
+    std::this_thread::sleep_until(start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(at[i])));
+    CompileImageCache(i == 0 ? 0 : kLaterPassBlocks); // the first pass is in a game's boot
+  }
+}
+
+void JitStatsThread() {
+  pthread_setname_np(pthread_self(), "JitStats");
+  uint64_t seen[kJitThreads] = {};
+  const uint64_t start = MonotonicNs();
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    const uint64_t blocks = g_jit_blocks.exchange(0), outside = g_jit_outside.exchange(0), ns = g_jit_ns.exchange(0),
+                   longest = g_jit_max_ns.exchange(0), over2 = g_jit_over2.exchange(0), over10 = g_jit_over10.exchange(0),
+                   pages = g_cache_pages.exchange(0), page_ns = g_cache_page_ns.exchange(0),
+                   page_faults = g_cache_page_faults.exchange(0);
+    // the two threads that compiled longest in these 5 s
+    size_t top[2] = {0, 0};
+    uint64_t top_ns[2] = {0, 0};
+    const size_t n = std::min(g_jit_nthreads.load(std::memory_order_relaxed), kJitThreads);
+    for (size_t i = 0; i < n; ++i) {
+      const uint64_t now = g_jit_threads[i].ns.load(std::memory_order_relaxed), d = now - seen[i];
+      seen[i] = now;
+      if (d > top_ns[0]) {
+        top[1] = top[0], top_ns[1] = top_ns[0], top[0] = i, top_ns[0] = d;
+      } else if (d > top_ns[1]) {
+        top[1] = i, top_ns[1] = d;
+      }
+    }
+    if (!blocks && !pages) continue;
+    char most[96] = "";
+    if (top_ns[0]) std::snprintf(most, sizeof(most), "; most on %s %.1f ms", g_jit_threads[top[0]].name, top_ns[0] / 1e6);
+    if (top_ns[1]) {
+      const size_t l = std::strlen(most);
+      std::snprintf(most + l, sizeof(most) - l, ", %s %.1f ms", g_jit_threads[top[1]].name, top_ns[1] / 1e6);
+    }
+    std::printf("JIT stats at %.0f s over 5.0 s: %llu blocks compiled (%llu outside the image), %.1f ms, the longest %.2f ms, "
+                "%llu over 2 ms, %llu over 10 ms%s; code cache pages loaded %llu in %.1f ms (%llu faults)\n",
+                (MonotonicNs() - start) / 1e9, (unsigned long long)blocks, (unsigned long long)outside, ns / 1e6, longest / 1e6,
+                (unsigned long long)over2, (unsigned long long)over10, most, (unsigned long long)pages, page_ns / 1e6,
+                (unsigned long long)page_faults);
+    std::fflush(stdout);
+  }
+}
 
 constexpr size_t kTempStack = 1 << 20;
 
@@ -683,6 +1478,25 @@ int guest_cpu_init(void) {
     const char* scale = std::getenv("BB_TSC_SCALE");
     FEXCore::Config::Set(FEXCore::Config::CONFIG_SMALLTSCSCALE, scale && scale[0] == '1' ? "1" : "0");
   }
+  // g2-arm64: FEX's code cache (on unless BB_FEX_CODE_CACHE=0, guest_cpu_code_cache) and the JIT
+  // stats. FEXCore reads these when the context is made: a 128 MiB code buffer from the start
+  // (growing it would drop the cached blocks), cache pages finalized on their first use.
+  g_jit_stats = EnvOn("BB_JIT_STATS");
+  if (EnvOff("BB_FEX_CODE_CACHE")) {
+    std::printf("FEX code cache: off (BB_FEX_CODE_CACHE=0)\n");
+  } else if (sysconf(_SC_PAGESIZE) != 4096) {
+    std::printf("FEX code cache: off (this kernel's pages are %ld bytes, FEX's code pages 4096)\n", sysconf(_SC_PAGESIZE));
+  } else if (!KernelHasDontUnmap()) {
+    std::printf("FEX code cache: off (this kernel has no MREMAP_DONTUNMAP: Linux 5.7 and later)\n");
+  } else {
+    g_image.on = true;
+    g_image.load = !EnvOff("BB_FEX_CACHE_LOAD");
+    g_image.generate = !EnvOff("BB_FEX_CACHE_GEN");
+    g_image.config_id = CodeCacheConfigId();
+    if (const char* chunk = std::getenv("BB_FEX_CACHE_CHUNK")) g_cache_chunk = std::clamp(std::atoi(chunk), 1, 256);
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHINGWIP, "1");
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLELAZYCODECACHINGWIP, "1");
+  }
   g_features = FEX::FetchHostFeatures();
   g_context = FEXCore::Context::Context::CreateNewContext(g_features).release();
   if (!g_context) return -1;
@@ -713,6 +1527,119 @@ int guest_cpu_init(void) {
   ProfStart();
   HleTraceStart();
   return 0;
+}
+
+void guest_cpu_code_cache(const char* image_path, const void* image, uint64_t size, const uint64_t (*code)[2], size_t count,
+                          const uint64_t* varying, size_t nvarying, int stable) {
+  if (!g_context || (!g_image.on && !g_jit_stats)) return;
+  g_image.base = reinterpret_cast<uintptr_t>(image);
+  g_image.end = g_image.base + size;
+  // The run-time values in the code (probe.c's note_varying: imports, host addresses in patches):
+  // left out of the hash, and FEX caches no block that reads one as an immediate (a Skip
+  // relocation at its first byte, and at the upper half for a 4-byte immediate).
+  g_image.slots.assign(varying, varying + nvarying);
+  std::sort(g_image.slots.begin(), g_image.slots.end());
+  g_image.slots.erase(std::unique(g_image.slots.begin(), g_image.slots.end()), g_image.slots.end());
+  for (const uint64_t s : g_image.slots) {
+    if (s + 8 > size || s + 4 > 0xffffffffull) continue;
+    g_image.info.Relocations[static_cast<uint32_t>(s)] = FEXCore::GuestRelocationType::Skip;
+    g_image.info.Relocations[static_cast<uint32_t>(s + 4)] = FEXCore::GuestRelocationType::Skip;
+  }
+  for (size_t i = 0; i < count; ++i) g_image.code.emplace_back(code[i][0], code[i][1]);
+  const uint64_t id = ImageCodeId();
+  g_image.info.FileId = id;
+  g_image.name = ImageName(image_path);
+  g_image.info.Filename = g_image.name.c_str();
+  if (g_image.on) {
+    g_image.record = true;
+    g_image.dir = CodeCacheDir();
+    char suffix[64];
+    std::snprintf(suffix, sizeof(suffix), "-%016llx-%016llx.fexcache", (unsigned long long)id, (unsigned long long)g_image.config_id);
+    g_image.cache_path = g_image.dir + g_image.name + suffix;
+    g_image.map_path = g_image.dir + g_image.name + "." + std::to_string(getpid()) + ".seen";
+    g_image.blocks_path = g_image.dir + g_image.name + ".blocks";
+    // BB_FEX_CACHE_CLEAR=1: this image's files go (the other images' stay: the menu's run before)
+    if (EnvOn("BB_FEX_CACHE_CLEAR")) {
+      size_t removed = 0;
+      for (const char* prefix : {".", "-"})
+        for (const auto& path : ImageFiles(g_image.name + prefix, ""))
+          if (unlink(path.c_str()) == 0) ++removed;
+      std::printf("FEX code cache: BB_FEX_CACHE_CLEAR, %zu files of this image removed\n", removed);
+    }
+    std::printf("FEX code cache: image %s, code %016llx (%zu run-time values in it left out), options %016llx (load %d, compile %d)\n",
+                g_image.name.c_str(), (unsigned long long)id, g_image.slots.size(), (unsigned long long)g_image.config_id, g_image.load,
+                g_image.generate);
+    if (!stable) {
+      // probe.c placed a thunk by search (its arena was taken or full): the rel32 jumps to it in
+      // the image's code, and so this hash, are not the next run's. The files stay as they are.
+      g_image.load = g_image.generate = g_image.record = false;
+      std::printf("FEX code cache: off in this run (a thunk outside the arena: this image's code is not the next run's)\n");
+    } else {
+      RemoveStaleFiles();
+      OpenGuard();
+      if (const uint64_t disk = FreeDiskMiB(g_image.dir); g_image.record && disk < kMinDiskMiB) {
+        g_image.generate = g_image.record = false;
+        std::printf("FEX code cache: nothing recorded or compiled in this run (%llu MiB of disk free)\n", (unsigned long long)disk);
+      }
+      if (g_image.load) LoadImageCache();
+    }
+  }
+  // FEX records each compiled block through the code map writer (the JIT stats time them there).
+  g_context->SetCodeMapWriter(fextl::make_unique<FEXCore::CodeMapWriter>(g_code_map_file));
+  if (g_image.record) std::thread(SeenFlushThread).detach();
+  if (g_image.on && g_image.generate) {
+    std::vector<double> at;
+    const char* list = std::getenv("BB_FEX_CACHE_GEN_DELAY");
+    for (const char* p = list && *list ? list : "30,180"; *p;) {
+      char* next = nullptr;
+      const double s = std::strtod(p, &next);
+      if (next == p) break;
+      if (s >= 0) at.push_back(s);
+      p = *next == ',' ? next + 1 : next;
+    }
+    std::sort(at.begin(), at.end());
+    std::thread(CodeCacheThread, std::move(at)).detach();
+  }
+  if (g_jit_stats) std::thread(JitStatsThread).detach();
+  if (double seconds = 0; g_image.on && CacheTest("crash", &seconds)) {
+    std::printf("FEX code cache: BB_FEX_CACHE_TEST=crash, a fatal signal in %.0f s\n", seconds);
+    std::thread([seconds] {
+      pthread_setname_np(pthread_self(), "FEXCacheTest");
+      std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+      volatile int* volatile nowhere = nullptr;
+      *nowhere = 1;
+    }).detach();
+  }
+  std::fflush(stdout);
+}
+
+// g2-arm64: a fatal signal (probe.c's fault handler, the process is ending) while a cache is
+// mapped, or on the thread that compiles one: recorded for the next run (CacheGuard). Atomics,
+// pwrite and dladdr only.
+void guest_cpu_code_cache_crashed(int sig, void* context) {
+  const bool compiling = t_cache_generator;
+  if (g_image.guard_fd < 0 || (!compiling && !g_image.armed.load(std::memory_order_relaxed))) return;
+  if (g_image.crash_noted.exchange(true, std::memory_order_relaxed)) return;
+  uint64_t where = 0;
+  if (context) {
+    const auto pc = static_cast<uint64_t>(static_cast<const ucontext_t*>(context)->uc_mcontext.pc);
+    Dl_info module {};
+    if (t_host.fex && g_context->IsAddressInCodeBuffer(t_host.fex, pc)) where = g_context->RestoreRIPFromHostPC(t_host.fex, pc);
+    else if (dladdr(reinterpret_cast<void*>(pc), &module) && module.dli_fbase) where = pc - reinterpret_cast<uintptr_t>(module.dli_fbase);
+    else where = pc & 0xfff;
+  }
+  CacheGuard g = g_image.guard;
+  const uint64_t crash = HashMix(HashMix(0x6372617368ull, static_cast<uint64_t>(sig)), where) | 1;
+  if (compiling || (g.crash == crash && g.runs <= 3)) {
+    g.state = kGuardOff;
+    g.crash = crash;
+  } else {
+    g.state = kGuardSuspect;
+    g.crash = crash;
+    g.runs = 0;
+  }
+  g_image.guard = g;
+  WriteGuard();
 }
 
 uintptr_t guest_host_function(const void* fn, const char* name, GuestAbi abi) {
@@ -827,6 +1754,39 @@ int guest_cpu_signal(int sig, void* info_, void* context_) {
   auto* info = static_cast<siginfo_t*>(info_);
   auto* context = static_cast<ucontext_t*>(context_);
   HostThread& t = t_host;
+  // g2-arm64: a code cache page's first use (guest_cpu_code_cache): its code is copied from the file,
+  // relocated and made executable, as FEX's Linux frontend does in its fault handler.
+  if (sig == SIGSEGV && info && g_image.mapped) {
+    auto& code = *g_image.mapped;
+    const auto begin = reinterpret_cast<uintptr_t>(code.CodeBuffer.data());
+    const auto address = reinterpret_cast<uintptr_t>(info->si_addr);
+    if (address - begin < code.CodeBuffer.size_bytes()) {
+      const uint64_t t0 = MonotonicNs();
+      {
+        std::lock_guard lock {g_image.finalize};
+        const size_t page = (address - begin) / FEXCore::Utils::FEX_PAGE_SIZE;
+        // With the page its neighbours that are not in use yet, inside its chunk (16 pages): one
+        // fault, one remap and one TLB flush for them all. A page at a time took 51 us each: 314 ms
+        // over the threads of a warm U3 run (6,141 pages). Only pages not loaded are given: FEX
+        // finalizes a page once (it adds the pages a relocation crosses into, loaded together).
+        size_t first = page, last = page + 1;
+        if (!code.LoadedPages[page]) {
+          const size_t chunk = page - page % g_cache_chunk;
+          const size_t end = std::min(chunk + g_cache_chunk, code.CodeBuffer.size_bytes() / FEXCore::Utils::FEX_PAGE_SIZE);
+          while (first > chunk && !code.LoadedPages[first - 1]) --first;
+          while (last < end && !code.LoadedPages[last]) ++last;
+        }
+        const auto range = FEXCore::AbstractCodeCache::SelectCodeRangeToFinalize(code, first, last);
+        if (!range.empty()) {
+          g_context->GetCodeCache().FinalizeCodePages(code, range);
+          g_cache_pages.fetch_add(range.size_bytes() / FEXCore::Utils::FEX_PAGE_SIZE, std::memory_order_relaxed);
+        }
+      }
+      g_cache_page_ns.fetch_add(MonotonicNs() - t0, std::memory_order_relaxed);
+      g_cache_page_faults.fetch_add(1, std::memory_order_relaxed);
+      return 1;
+    }
+  }
   if (sig != SIGBUS || !info || !context || !t.fex || info->si_code != BUS_ADRALN) return 0;
   const auto pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
   if (!g_context->IsAddressInCodeBuffer(t.fex, pc)) return 0;

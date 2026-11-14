@@ -115,7 +115,7 @@ public class Launcher extends Activity {
     private EditText pathEdit, extraEnv;
     private Button accessButton, prepareButton, playButton;
     private RadioGroup resolution, fpsLimit, touchPad;
-    private CompoundButton showFps, uncapped, accurateGpu;
+    private CompoundButton showFps, uncapped, accurateGpu, codeCache;
     private LinearLayout driverList;
     private RadioGroup drivers;
     private volatile boolean busy;
@@ -673,6 +673,11 @@ public class Launcher extends Activity {
         note(advanced, "Uncharted 2 reads some GPU results back (grenades, vehicle damage, the convoy of chapter 21), and "
                      + "Uncharted 3 slows down over a session without it. Off: Uncharted 2 a few percent faster in busy "
                      + "scenes, and those break.");
+        // g2-arm64: FEX's code cache (port 0185) is the port's default; off here also removes its files.
+        codeCache = toggle(advanced, "Keep the games' translated code between runs", "code_cache", true);
+        note(advanced, "The games' code is translated for this device's processor while they run. Kept on disk (about "
+                     + "130 MB for the three games), the next start and each loading translate nothing. Off: translated "
+                     + "again in every run, and the kept files are removed.");
         label(advanced, "Extra environment for the port (KEY=VALUE per line)");
         extraEnv = new EditText(this);
         extraEnv.setText(prefs.getString("extra_env", ""));
@@ -1212,6 +1217,12 @@ public class Launcher extends Activity {
         }
         if (uncapped.isChecked()) e.append("BB_VBLANK_HZ=0\n");
         if (showFps.isChecked()) e.append("BB_SHOW_FPS=1\n");
+        // FEX's code cache is on in the port; off here turns it off (More environment overrides)
+        // and removes its files ($HOME/.cache/fex: HOME is files/home, GameActivity).
+        if (!codeCache.isChecked()) {
+            if (!envNames("BB_FEX_CODE_CACHE")) e.append("BB_FEX_CODE_CACHE=0\n");
+            deleteTree(new File(files, "home/.cache/fex"));
+        }
         e.append(extraEnv.getText().toString().trim()).append('\n');
         writeText(new File(files, "env.txt"), e.toString());
         for (int i = 0; i < GAMES.length; i++) writeText(new File(files, "env-" + GAMES[i][0] + ".txt"), env[i]);

@@ -1,0 +1,31 @@
+From 4043f816621f6447e50936aac888c6f77276e522 Mon Sep 17 00:00:00 2001
+From: revvv991 <345025393+revvv991@users.noreply.github.com>
+Subject: [PATCH] g2-android: code caching pads constants only where code is
+ compiled for a cache
+
+The NOP padding that keeps relocated constants in place is needed in a context that generates
+(or validates) a code cache; the running context's own JIT code is never relocated.
+---
+ FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 8856b44bf..2381a0dd0 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -425,7 +425,11 @@ void Arm64Emitter::LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, ui
+     NOPPad = false;
+   } else if (Pad == PadType::AUTOPAD) {
+     // Force NOP padding to ensure relocated constants always have enough encoding space available
+-    NOPPad = EnableCodeCaching;
++    // g2-android: only in a context that compiles code for a cache file or checks code against
++    // one: the code a running context compiles for itself is never relocated, and the padding
++    // would cost it up to three NOPs per constant.
++    NOPPad = EnableCodeCaching && EmitterCTX &&
++             (EmitterCTX->GetCodeCache().IsGeneratingCache || EmitterCTX->GetCodeCache().EnableCodeCacheValidation);
+   }
+ 
+   bool Is64Bit = s == ARMEmitter::Size::i64Bit;
+-- 
+2.43.0
+

@@ -533,6 +533,8 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    /* g2-arm64: with FEX's code cache in use the crash is recorded: the next run drops that cache. */
+    guest_cpu_code_cache_crashed(sig, context);
     /* g2-arm64: the guest state (FEX: the translated block's guest RIP) and the mappings around
      * the PC and the faulting address (JIT code has no module). */
     { char name[40]="  thread "; prctl(PR_GET_NAME,(unsigned long)(name+9),0,0,0); size_t l=strlen(name); name[l]=10;
@@ -850,6 +852,24 @@ static void *peek_on_request(void *arg) {
     }
     return NULL;
 }
+/* g2-arm64: image offsets of the 8-byte values in code that differ from run to run - import
+ * relocations into code segments (veneers, traps, host data) and the host addresses the code
+ * patches below write into the image's caves (movabs): FEX's code cache hashes the image's code
+ * without them and caches no block that holds one as an immediate (guest_cpu_code_cache). Writes
+ * into thunks (near_image_memory, outside the image) are left alone. */
+static size_t image_bytes;
+static uint64_t *varying_slots;
+static size_t varying_count, varying_cap;
+static void note_varying(const unsigned char *at) {
+    if (!image || at < image || (size_t)(at - image) + 8 > image_bytes) return;
+    if (varying_count == varying_cap) {
+        varying_cap = varying_cap ? 2 * varying_cap : 256;
+        uint64_t *grown = realloc(varying_slots, varying_cap * sizeof(*grown));
+        if (!grown) fail("allocation failed");
+        varying_slots = grown;
+    }
+    varying_slots[varying_count++] = (uint64_t)(at - image);
+}
 /* g2-arm64 (U1's job fiber crash, findings 2026-11-01): U1's game frame (0x49c5b0) reads the main
  * view's region table in 0x739b90 (per tracked entity the bitset of its region; the crash is its
  * movbe at 0x739ed2). The table and its bitsets live in the render frame arena (allocator 0x36):
@@ -894,7 +914,7 @@ static void install_u1_view_lock(uint64_t image_size) {
     const uint64_t state = (uint64_t)(uintptr_t)&u1_view_lock;
     const uint32_t tries = 20000; /* pause is wfe here (~100 us): a guard of ~2 s, never met */
 #define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
-#define STATE_R11() do { B(0x49, 0xbb); memcpy(t + k, &state, 8); k += 8; } while (0) /* movabs r11, state */
+#define STATE_R11() do { B(0x49, 0xbb); note_varying(t + k); memcpy(t + k, &state, 8); k += 8; } while (0) /* movabs r11, state */
     /* A, before the reader's loop: the moved lea, then the lock (reader_held when taken) */
     const uint64_t a = cave + k;
     B(0x4d, 0x8d, 0xb5, 0x60, 0x03, 0x00, 0x00);            /* lea r14, [r13+0x360] */
@@ -928,7 +948,7 @@ static void install_u1_view_lock(uint64_t image_size) {
      * 0x40_0000_0000) (r11 holds the loop's mask: rdx is the scratch here) */
     const uint64_t g = cave + k;
     B(0x48, 0x8b, 0x44, 0x10, 0x20);                        /* mov rax, [rax+rdx+0x20] */
-    B(0x48, 0xba); memcpy(t + k, &state, 8); k += 8;        /* movabs rdx, state */
+    B(0x48, 0xba); note_varying(t + k); memcpy(t + k, &state, 8); k += 8; /* movabs rdx, state */
     B(0x83, 0x7a, 0x08, 0x00);                              /* cmp dword [rdx+8], 0 */
     B(0x75); const size_t g_none = k; B(0x00);              /* jne none */
     B(0x48, 0x89, 0xc2);                                    /* mov rdx, rax */
@@ -1050,7 +1070,7 @@ static void install_u1_set_job_guard(uint64_t image_size) {
     B(0xe9);                                                /* jmp job + 6 */
     { const int32_t rel = (int32_t)((int64_t)(job + 6) - (int64_t)(cave + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
     t[skip] = (unsigned char)(k - (skip + 1));
-    B(0x48, 0xb8); memcpy(t + k, &skips, 8); k += 8;        /* skip: movabs rax, &skips */
+    B(0x48, 0xb8); note_varying(t + k); memcpy(t + k, &skips, 8); k += 8; /* skip: movabs rax, &skips */
     B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
     B(0xc3);                                                /* ret */
     /* The maker's store of the set, at +64 (rax is dead there: the next load overwrites it). */
@@ -1060,7 +1080,7 @@ static void install_u1_set_job_guard(uint64_t image_size) {
     B(0x49, 0x89, 0x5c, 0x24, 0x78);                        /* mov [r12+0x78], rbx: the set */
     B(0x48, 0x85, 0xdb);                                    /* test rbx, rbx */
     B(0x75); const size_t made = k; B(0x00);                /* jne made */
-    B(0x48, 0xb8); memcpy(t + k, &nulls, 8); k += 8;        /* movabs rax, &nulls */
+    B(0x48, 0xb8); note_varying(t + k); memcpy(t + k, &nulls, 8); k += 8; /* movabs rax, &nulls */
     B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
     t[made] = (unsigned char)(k - (made + 1));
     B(0xc3);                                                /* made: ret */
@@ -1215,7 +1235,7 @@ static void install_u3_particle_job_guard(uint64_t image_size) {
     B(0xe9);                                                /* jmp job + 6 */
     { const int32_t rel = (int32_t)((int64_t)(uintptr_t)(entry + 6) - (int64_t)(uintptr_t)(t + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
     t[skip] = (unsigned char)(k - (skip + 1));
-    B(0x48, 0xb8); memcpy(t + k, &skips, 8); k += 8;        /* skip: movabs rax, &skips */
+    B(0x48, 0xb8); note_varying(t + k); memcpy(t + k, &skips, 8); k += 8; /* skip: movabs rax, &skips */
     B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
     B(0xc3);                                                /* ret */
 #undef B
@@ -1580,8 +1600,41 @@ static void install_guest_hooks(Segment *segments, uint64_t ns) {
  * the expected bytes calls a host function first, with rdi, rsi, the image base and r14 (Microsoft
  * x64 convention on every host). The thunk keeps the guest's registers and flags, so it also
  * works inside a function. */
+/* g2-arm64: a thunk placed by search (the arena below taken or full): its address is not the next
+ * run's, so this run neither uses nor compiles a code cache (guest_cpu_code_cache). */
+static int thunk_placed_by_search;
+#ifndef _WIN32
+/* g2-arm64: the thunks near the image come from one region reserved right after the image is
+ * mapped, before the GPU starts (reserve_thunk_arena): their addresses, and so the rel32 jumps the
+ * code patches write into the image, are the same in every run - FEX's code cache keys on a hash
+ * of the image's code (guest_cpu_code_cache). Searched for the first free range after the image,
+ * they moved from run to run in the collection menu's image: the GPU driver maps its buffers below
+ * 4 GiB (mesa-0017) and had taken that range in some runs. */
+static unsigned char *thunk_arena;
+static size_t thunk_arena_size, thunk_arena_used;
+static void reserve_thunk_arena(size_t image_size) {
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    enum { ARENA=16u<<20 };
+    const uint64_t base=((uint64_t)(uintptr_t)image+round_page(image_size)+(32u<<20)+0xffff)&~(uint64_t)0xffff;
+    void *want=(void *)(uintptr_t)base;
+    void *got=mmap(want,ARENA,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+    if (got==MAP_FAILED) { printf("Thunk arena: %p taken, thunks placed by search\n",want); return; }
+    if (got!=want) { munmap(got,ARENA); printf("Thunk arena: %p taken, thunks placed by search\n",want); return; }
+    thunk_arena=got; thunk_arena_size=ARENA;
+}
+#endif
 static unsigned char *near_image_memory(size_t size) {
     unsigned char *memory=NULL;
+#ifndef _WIN32
+    if (thunk_arena && thunk_arena_used+round_page(size)<=thunk_arena_size) {
+        memory=thunk_arena+thunk_arena_used;
+        thunk_arena_used+=round_page(size);
+        return memory;
+    }
+    thunk_placed_by_search=1;
+#endif
 #ifdef _WIN32
     /* rel32 jumps: within 2 GiB of the image. */
     uint64_t end_of_image=round_page(guest_image_size ? guest_image_size : 1);
@@ -1940,7 +1993,7 @@ static void install_counter_log(uint64_t image_size) {
 #define APPEND(skip_positive)                                                                      \
     do {                                                                                           \
         if (skip_positive) { B(0x48, 0x85, 0xf6); B(0x7f); jg_at = k; B(0x00); } /* test rsi; jg */ \
-        B(0x48, 0xb8); memcpy(t + k, &log_base, 8); k += 8;      /* movabs rax, ring */           \
+        B(0x48, 0xb8); note_varying(t + k); memcpy(t + k, &log_base, 8); k += 8; /* movabs rax, ring */ \
         B(0x48, 0x83, 0x78, 0x08, 0x00); B(0x75); jne_at = k; B(0x00); /* frozen? */             \
         B(0xb9, 0x01, 0x00, 0x00, 0x00);                        /* mov ecx, 1 */                  \
         B(0xf0, 0x48, 0x0f, 0xc1, 0x08);                        /* lock xadd [rax], rcx */        \
@@ -2083,7 +2136,7 @@ static void install_counter_quarantine(uint64_t image_size) {
     const uint64_t state = (uint64_t)(uintptr_t)&counter_quarantine;
     const uint32_t mask = size - 1;
 #define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
-    B(0x48, 0xb8); memcpy(t + k, &state, 8); k += 8;       /* movabs rax, state */
+    B(0x48, 0xb8); note_varying(t + k); memcpy(t + k, &state, 8); k += 8; /* movabs rax, state */
     B(0x31, 0xc9);                                          /* xor ecx, ecx */
     const size_t loop = k;
     B(0x48, 0x39, 0x7c, 0xc8, 0x08);                        /* cmp [rax+rcx*8+8], rdi */
@@ -2973,6 +3026,10 @@ int main(int argc, char **argv) {
     }
     image = runtime_image_map(round_page(size), PROT_READ | PROT_WRITE);
     if (!image) image = allocate(round_page(size));
+    image_bytes = round_page(size);
+#ifndef _WIN32
+    reserve_thunk_arena(size); /* g2-arm64: before bbgpu_init (near_image_memory) */
+#endif
 #ifdef _WIN32
     red_zone_reserve(image, round_page(size)); /* before bbgpu_init: the driver's allocations may fill its reach */
 #endif
@@ -3026,6 +3083,9 @@ int main(int argc, char **argv) {
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
+        if (relocs[i].kind) /* g2-arm64: a run-time value; in a code segment it is noted (note_varying) */
+            for (uint64_t s=0;s<ns;++s)
+                if ((segments[s].flags&1) && relocs[i].target-segments[s].address<segments[s].size) { note_varying(image+relocs[i].target); break; }
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     install_guest_hooks(segments, ns);
@@ -3082,6 +3142,16 @@ int main(int argc, char **argv) {
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
     printf("Guest image at %p\n", (void *)image);
+    /* g2-arm64: FEX's code cache for this image (on unless BB_FEX_CODE_CACHE=0) and the JIT stats (BB_JIT_STATS;
+     * guest_cpu_fex.cpp): the code is final here, and no guest code has run yet. */
+    {
+        uint64_t code[64][2];
+        size_t n=0;
+        for (uint64_t s=0;s<ns && n<64;++s)
+            if (segments[s].flags&1) { code[n][0]=segments[s].address; code[n][1]=segments[s].size; ++n; }
+        guest_cpu_code_cache(argv[1], image, round_page(size), (const uint64_t (*)[2])code, n, varying_slots, varying_count,
+                             !thunk_placed_by_search);
+    }
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
             int init_executable=0;

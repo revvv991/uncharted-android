@@ -33,6 +33,11 @@ uint64_t guest_call_on_stack(uintptr_t entry, const uint64_t *args, unsigned cou
 void guest_set_gs_base(uint64_t base) { (void)base; }
 void guest_set_stack(void *stack_top) { (void)stack_top; }
 int guest_cpu_signal(int sig, void *info, void *context) { (void)sig; (void)info; (void)context; return 0; }
+void guest_cpu_code_cache(const char *image_path, const void *image, uint64_t size, const uint64_t (*code)[2], size_t count,
+                          const uint64_t *varying, size_t nvarying, int stable) {
+    (void)image_path; (void)image; (void)size; (void)code; (void)count; (void)varying; (void)nvarying; (void)stable;
+}
+void guest_cpu_code_cache_crashed(int sig, void *context) { (void)sig; (void)context; }
 int guest_context_get(GuestContext *out) { (void)out; return 0; }
 int guest_context_set(const GuestContext *in) { (void)in; return 0; }
 int guest_cpu_describe_thread(char *out, size_t size) { (void)out; (void)size; return 0; }

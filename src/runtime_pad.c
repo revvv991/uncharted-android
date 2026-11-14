@@ -17,6 +17,7 @@
  * Options, Tab touchpad, arrow keys and the wheel the d-pad, IJKL the right stick. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -729,7 +730,6 @@ static void __attribute__((ms_abi)) ndgi_end(uint64_t rdi, uint64_t rsi, uint64_
  * give it (when the set has a gun); once. Continue (mode 2), checkpoint restarts and jumps to a
  * checkpoint do not arm it. Chapters it changes: 6-10, 13, 14, 18, 20, 23, 24, 26.
  * BB_CHAPTER_WEAPONS=0: off. */
-typedef void (__attribute__((sysv_abi)) *U2ApplySettings)(uint32_t set);
 static _Atomic int u2_chapter_start; /* armed by a group's PlayTask(mode 1) */
 static int u2_chapter_weapons_on(void) {
     static int on=-1;
@@ -762,12 +762,15 @@ static void u2_chapter_activate(uint64_t task, uint64_t image, uint64_t apply, c
      * where the Defender is better than nothing (chapter 12, war-escape-watertower-fight). The set: five
      * slots {name, weapon id +8, ammo +0x10} of 0x18 bytes; guns in the first three, f114b39d = none.
      * The lookup is the one the settings function calls (EU: (id, 0) -> set; 1.02: (id) -> &set). */
+    /* g2-arm64 (issue #37): the game's functions go through guest_call. On ARM64 guest code runs
+     * on FEXCore, and the direct calls here ran x86 bytes on the ARM CPU: signal 4 at guest offset
+     * 0xa15300 (1.02; 0x40e410 EU) once a chapter with such a start had loaded. */
     const unsigned char *found=NULL;
     if (apply==0x43b7e0) {
-        found=((const unsigned char *(__attribute__((sysv_abi)) *)(uint32_t, int))(uintptr_t)(image+0x40e410))(set,0);
+        found=(const unsigned char *)(uintptr_t)guest_call((uintptr_t)(image+0x40e410),(const uint64_t[]){set,0},2);
     } else {
         const unsigned char *const *p=
-            ((const unsigned char *const *(__attribute__((sysv_abi)) *)(uint32_t))(uintptr_t)(image+0xa15300))(set);
+            (const unsigned char *const *)(uintptr_t)guest_call((uintptr_t)(image+0xa15300),(const uint64_t[]){set},1);
         found=p ? *p : NULL;
     }
     int gun=0;
@@ -783,7 +786,7 @@ static void u2_chapter_activate(uint64_t task, uint64_t image, uint64_t apply, c
     printf("Chapter weapons: Chapter Select start at task %08x: its weapon set %08x applied (the game "
            "leaves the default .45 Defender there)\n",*(const uint32_t *)(t+8),set);
     fflush(stdout);
-    ((U2ApplySettings)(uintptr_t)(image+apply))(set);
+    guest_call((uintptr_t)(image+apply),(const uint64_t[]){set},1);
 }
 static void __attribute__((ms_abi)) u2_chapter_play_hook(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
                                                        const RuntimeGuestRegs *regs) {

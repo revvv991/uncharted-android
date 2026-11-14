@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Beta (version 0.3.2): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
+> **Beta (version 0.3.3): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -33,6 +33,8 @@ driver runs the three games since 0.3.0 and holds Uncharted 3's Cartagena market
 
 - The game's x86-64 code runs through [FEXCore](https://github.com/FEX-Emu/FEX), which translates it
   to ARM64 inside an ordinary Android app (no Linux userland, Wine or Box64).
+  The translated code is kept on the device between runs (FEXCore's code cache, about 130 MB), so
+  only the first start after an update translates it.
 - The rest of the port is native ARM64: the replacements for the PS4 system libraries and the
   renderer derived from [shadPS4](https://github.com/shadps4-emu/shadPS4), which translates PS4 GPU
   commands and shaders to Vulkan.
@@ -76,7 +78,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.3.2.apk` from
+1. Install the APK (`uncharted-android-0.3.3.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
