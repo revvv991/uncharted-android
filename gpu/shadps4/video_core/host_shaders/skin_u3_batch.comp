@@ -19,6 +19,13 @@
 //   4  bone matrices, 3x4 rows
 //   5  out: position float3, 20-byte vertices
 //   6  out: normal half4, 20-byte vertices (the same vertices, 12 bytes in)
+//
+// g2-arm64 (issue #35): the game binds this shader in more than one layout, and the translated
+// shader is compiled for each (a V#'s stride and format): the first one, above, and from U3's
+// chapter 16 on, for the meshes with cloth or morph targets, float32 normals (float3)
+// in and out - 24-byte output vertices. Without SKIN_ANY_LAYOUT this is the shader of the first
+// layout (vk_skin_batch.cpp gives it no other); with it the per-vertex buffers' strides and
+// the normal's format come from the job.
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -37,10 +44,11 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Dword {
 struct Job {
     uint64_t address[12]; // guest buffers 0..6 (0: none); the job layout of skin_batch.comp
     uint size[12];        // their bound bytes
+    uint stride[12];      // g2-arm64 (issue #35): the per-vertex buffers' strides in dwords
     uint count;           // vertices: min(the guest's vertex count, its invocations)
     uint first_group;     // the job's first workgroup in this dispatch
     uint scale;           // unused here
-    uint pad;
+    uint floats;          // bit i: buffer i's normal or tangent is 32-bit floats, not half4
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer JobTable {
@@ -75,8 +83,13 @@ float LoadF(uint64_t base, uint size, uint dword) {
     return uintBitsToFloat(Load(base, size, dword));
 }
 
-// The workgroup's output vertices, 5 dwords each, for the row stores.
+// The workgroup's output vertices for the row stores: 5 dwords each in the first layout, 6 with
+// float normals.
+#ifdef SKIN_ANY_LAYOUT
+shared uint rows_out[64 * 6];
+#else
 shared uint rows_out[64 * 5];
+#endif
 
 void main() {
     const uint group = gl_WorkGroupID.x;
@@ -95,12 +108,45 @@ void main() {
     // The two output V#s interleave (the normal at +12, the same size): a vertex's outputs are 5
     // consecutive dwords of buffer 5, stored as whole rows through shared memory (skin_batch.comp
     // explains the path; every lane takes part, a lane past the count stores nothing).
+#ifdef SKIN_ANY_LAYOUT
+    // g2-arm64 (issue #35): the layout from the job - the per-vertex buffers' strides (dwords)
+    // and whether the normal is float3 or half4, in and out. Rows as above when the normal's V#
+    // starts where the position ends, with one stride of exactly the two.
+    const uint d0 = job.stride[0], d1 = job.stride[1], d2 = job.stride[2];
+    const uint d5 = job.stride[5], d6 = job.stride[6];
+    const bool f2 = (job.floats & (1u << 2u)) != 0u, f6 = (job.floats & (1u << 6u)) != 0u;
+    const uint row = f6 ? 6u : 5u;
+    const bool rows = d5 == row && d6 == row && a6 == a5 + 12ul && s6 == s5;
+#else
     const bool rows = a6 == a5 + 12ul && s6 == s5;
+#endif
     if (!rows && !(job.count > vertex)) {
         return;
     }
     const uint gid = rows ? min(vertex, job.count - 1u) : vertex;
 
+#ifdef SKIN_ANY_LAYOUT
+    const uint i0 = gid * d0;
+    const uint influences = Load(a0, s0, i0);
+    const uint first_offset = Load(a0, s0, i0 + 1u);
+    const uint i1 = gid * d1;
+    const float px = LoadF(a1, s1, i1);
+    const float py = LoadF(a1, s1, i1 + 1u);
+    const float pz = LoadF(a1, s1, i1 + 2u);
+    const uint in2 = gid * d2;
+    float nx, ny, nz;
+    if (f2) {
+        nx = LoadF(a2, s2, in2);
+        ny = LoadF(a2, s2, in2 + 1u);
+        nz = LoadF(a2, s2, in2 + 2u);
+    } else {
+        const vec2 n01 = unpackHalf2x16(Load(a2, s2, in2));
+        const vec2 n23 = unpackHalf2x16(Load(a2, s2, in2 + 1u));
+        nx = n01.x;
+        ny = n01.y;
+        nz = n23.x;
+    }
+#else
     const uint i2 = gid * 2u;
     const uint influences = Load(a0, s0, i2);
     const uint first_offset = Load(a0, s0, i2 + 1u);
@@ -111,6 +157,7 @@ void main() {
     const vec2 n01 = unpackHalf2x16(Load(a2, s2, i2));
     const vec2 n23 = unpackHalf2x16(Load(a2, s2, i2 + 1u));
     const float nx = n01.x, ny = n01.y, nz = n23.x;
+#endif
 
     // The first influence's matrix: the position it gives is the base the others add to.
     const uint first = Load(a3, s3, first_offset >> 2u);
@@ -163,6 +210,45 @@ void main() {
     const float nnx = inv * anx, nny = inv * any_, nnz = inv * anz;
     const float ox = dpx + p0x, oy = dpy + p0y, oz = dpz + p0z;
 
+#ifdef SKIN_ANY_LAYOUT
+    if (rows) {
+        const uint w = local * row;
+        rows_out[w] = floatBitsToUint(ox);
+        rows_out[w + 1u] = floatBitsToUint(oy);
+        rows_out[w + 2u] = floatBitsToUint(oz);
+        if (f6) {
+            rows_out[w + 3u] = floatBitsToUint(nnx);
+            rows_out[w + 4u] = floatBitsToUint(nny);
+            rows_out[w + 5u] = floatBitsToUint(nnz);
+        } else {
+            rows_out[w + 3u] = packHalf2x16(vec2(nnx, nny));
+            rows_out[w + 4u] = packHalf2x16(vec2(nnz, 0.0));
+        }
+        memoryBarrierShared();
+        barrier();
+        const uint first_dword = (group - job.first_group) * (64u * row);
+        const uint end = min(job.count * row, s5 >> 2u);
+        for (uint k = 0u; k < row; ++k) {
+            const uint i = local + k * 64u;
+            if (first_dword + i < end) {
+                Dword(a5 + uint64_t(first_dword + i) * 4ul).value = rows_out[i];
+            }
+        }
+        return;
+    }
+    const uint o5 = gid * d5, o6 = gid * d6;
+    Store(a5, s5, o5, floatBitsToUint(ox));
+    Store(a5, s5, o5 + 1u, floatBitsToUint(oy));
+    Store(a5, s5, o5 + 2u, floatBitsToUint(oz));
+    if (f6) {
+        Store(a6, s6, o6, floatBitsToUint(nnx));
+        Store(a6, s6, o6 + 1u, floatBitsToUint(nny));
+        Store(a6, s6, o6 + 2u, floatBitsToUint(nnz));
+    } else {
+        Store(a6, s6, o6, packHalf2x16(vec2(nnx, nny)));
+        Store(a6, s6, o6 + 1u, packHalf2x16(vec2(nnz, 0.0)));
+    }
+#else
     const uint o = gid * 5u;
     if (rows) {
         const uint w = local * 5u;
@@ -188,4 +274,5 @@ void main() {
     Store(a5, s5, o + 2u, floatBitsToUint(oz));
     Store(a6, s6, o, packHalf2x16(vec2(nnx, nny)));
     Store(a6, s6, o + 1u, packHalf2x16(vec2(nnz, 0.0)));
+#endif
 }

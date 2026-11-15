@@ -9,6 +9,10 @@
 #           draws/dispatches line of BB_FRAME_STATS: U3's museum has ~620 dispatches a frame).
 #   LIMIT   the frame limit (30; 0 = off), SIZE (1280x720), LOAD (120 s to the gameplay), TITLE (45)
 #   DRIVER  a driver package folder under files/drivers (the bundled Turnip by default)
+#   SAVES   a folder with another save of <game> (a reporter's: SAVEDATA0n0, SAVEDATA0nP and their
+#           .sce_sys): pushed over the owner's for the run, so Continue is that save's place (an
+#           issue's scene measured: #35's chapters 16 and 20 of U3). The owner's come back with
+#           the rest at the end. See save_session.sh for looking around by hand.
 #   SF_PACING=1  SurfaceFlinger's present times of the game's frames during the turning
 #           (sf_pacing.sh into <tag>.sf; the summary line gets ../sf_pacing.py's screen cadence)
 #   SF_STATS=1  SurfaceFlinger's TimeStats over the turning (per layer: frames, dropped frames,
@@ -32,6 +36,17 @@ stamp=$(date +%Y%m%d-%H%M%S)
 back_up "$stamp" || exit 1
 owner_env=$(owner_extra_env)
 echo "owner's extra environment: [${owner_env}]"
+if [ -n "${SAVES:-}" ]; then
+    case "$game" in u1) n=1;; u2) n=2;; u3) n=3;; esac
+    title=$($ADB shell "ls $G/user/savedata/1/" | tr -d '\r' | head -1)
+    for d in SAVEDATA0${n}0 SAVEDATA0${n}0.sce_sys SAVEDATA0${n}P SAVEDATA0${n}P.sce_sys; do
+        if [ -z "$title" ] || ! $ADB push "$(cygpath -w "$SAVES/$d")" "$G/user/savedata/1/$title/" > /dev/null; then
+            echo "$tag ($extra): the save's $d did not go to the device - skipped"
+            put_back "$stamp" "$(printf '%s' "$owner_env" | sed ':a;N;$!ba;s/\n/\\\\n/g')"
+            exit 1
+        fi
+    done
+fi
 
 env="BB_PAD_FILE=$G/pad.txt"
 [ -n "${DRIVER:-}" ] && env="$env\\\\nBB_VK_DRIVER_DIR=/data/user/0/$P/files/drivers/$DRIVER"

@@ -19,6 +19,23 @@
 // an earlier one in the batch writes (or writes what it reads) starts a new batch. The batch is
 // recorded before any other packet, when stage A drains the draw pipe, and before the recording
 // thread sleeps (DrawPipe::SetHeld).
+//
+// g2-arm64 (issue #35): the game binds one skinning shader in several layouts, and the translated
+// shader is compiled for each (the address of a vertex's element is the index times the V#'s
+// stride, and LowerBufferFormatToRaw reads and writes it by the V#'s format). U1, U2 and most of
+// U3 use one layout a shader (half4 normals and tangents; 28-, 36- and 20-byte output vertices);
+// from U3's chapter 16 on the meshes with cloth or morph targets (Drake's desert outfit, the
+// horses) come with float32 normals and tangents in and out: 40-, 48- and 24-byte output
+// vertices, the inputs of some interleaved 40 bytes apart. The batch shaders were written from
+// the first layout and stored those vertices at its strides and as halfs: Drake drawn as a burst
+// of stretched triangles (found by a reporter of the issue: BB_SKIN_BATCH=0 cured it). Now every
+// dispatch's V#s are read: the first layout goes to the shader written from it, the other
+// layouts the any-layout variants know (the same source with SKIN_ANY_LAYOUT: strides and the
+// normal's and tangent's formats from the job) to those, and a layout neither knows is
+// dispatched the ordinary way and named in the log once. BB_SKIN_BATCH_LAYOUTS=0: only the first
+// layouts are batched; =2: every job by the any-layout shaders (the A/B of the two on one work).
+// On the G2 at U3's chapter 16 checkpoint (720p, the 30 limit): 25.2 FPS with the broken batch,
+// 22.6 with BB_SKIN_BATCH=0.
 
 #include <dlfcn.h>
 #include <algorithm>
@@ -33,8 +50,11 @@
 #include "shader_recompiler/info.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/host_shaders/skin_batch_any_comp.h"
 #include "video_core/host_shaders/skin_batch_comp.h"
+#include "video_core/host_shaders/skin_mv_batch_any_comp.h"
 #include "video_core/host_shaders/skin_mv_batch_comp.h"
+#include "video_core/host_shaders/skin_u3_batch_any_comp.h"
 #include "video_core/host_shaders/skin_u3_batch_comp.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -56,28 +76,109 @@ constexpr u32 MaxBuffers = 12;
 constexpr u32 MaxJobs = 512;
 constexpr u32 MaxGroups = 65535;
 
-/// The batched guest shaders. Their V#s are the inputs, then the outputs: fields of one
-/// interleaved output vertex.
+/// g2-arm64 (issue #35): what a buffer is to a batched shader. The per-vertex ones are read and
+/// written at the vertex's index times the V#'s stride, the normals and tangents as the V#'s
+/// format says (half4, or float3 and float4); the tables are read at byte offsets the shader
+/// computes.
+enum class Role : u8 {
+    Table,       ///< influences, matrices: all of it may be read
+    Header,      ///< per vertex: the influence count and the offset of the first, two raw dwords
+    Position,    ///< per vertex: float3
+    Normal,      ///< per vertex: half4 (w unused) or float3
+    Tangent,     ///< per vertex: half4 or float4 (w: the handedness)
+    OutPosition, ///< float3
+    OutNormal,   ///< half4 (w 0) or float3
+    OutTangent,  ///< half4 or float4
+    OutMotion,   ///< half4 (w 0)
+};
+
+/// The batched guest shaders. Their V#s are the inputs, then the outputs.
 struct SkinKind {
     u32 hash;
     u32 num_buffers;
     u32 first_output;
     u32 flat_count; ///< flattened user data word with the vertex count
     u32 flat_scale; ///< ... with the motion scale (0: none)
-    std::array<u32, MaxBuffers> read_bytes; ///< inputs: bytes per vertex (0: all of the buffer)
-    u32 vertex_bytes;                       ///< the output vertex
-    std::array<u32, 4> written_bytes;       ///< the outputs' fields
+    std::array<Role, MaxBuffers> roles;
+    /// The first layout, the one the shader without SKIN_ANY_LAYOUT is written from: the
+    /// per-vertex buffers' strides in bytes (halfs for the normals and tangents).
+    std::array<u8, MaxBuffers> first_stride;
     const char* label;
 };
 constexpr std::array<SkinKind, 3> Kinds{{
-    // U1: position, normal, tangent.
-    {0x8f067540, 9, 6, 52, 0, {8, 12, 8, 8, 0, 0}, 28, {12, 8, 8}, "skinning batch (cs 8f067540)"},
-    // U2: position, normal, tangent, motion.
-    {0x7d7e7206, 12, 8, 64, 65, {8, 12, 8, 8, 0, 0, 0, 0}, 36, {12, 8, 8, 8},
-     "skinning batch (cs 7d7e7206)"},
-    // U3: position, normal (g2-arm64, 2026-11-09).
-    {0x0c936dd6, 7, 5, 44, 0, {8, 12, 8, 0, 0}, 20, {12, 8}, "skinning batch (cs 0c936dd6)"},
+    // U1: position, normal, tangent; 28-byte output vertices.
+    {0x8f067540, 9, 6, 52, 0,
+     {Role::Header, Role::Position, Role::Normal, Role::Tangent, Role::Table, Role::Table,
+      Role::OutPosition, Role::OutNormal, Role::OutTangent},
+     {8, 12, 8, 8, 0, 0, 28, 28, 28}, "skinning batch (cs 8f067540)"},
+    // U2: position, normal, tangent, motion; 36-byte output vertices.
+    {0x7d7e7206, 12, 8, 64, 65,
+     {Role::Header, Role::Position, Role::Normal, Role::Tangent, Role::Table, Role::Table,
+      Role::Table, Role::Table, Role::OutPosition, Role::OutNormal, Role::OutTangent,
+      Role::OutMotion},
+     {8, 12, 8, 8, 0, 0, 0, 0, 36, 36, 36, 36}, "skinning batch (cs 7d7e7206)"},
+    // U3: position, normal (g2-arm64, 2026-11-09); 20-byte output vertices.
+    {0x0c936dd6, 7, 5, 44, 0,
+     {Role::Header, Role::Position, Role::Normal, Role::Table, Role::Table, Role::OutPosition,
+      Role::OutNormal},
+     {8, 12, 8, 0, 0, 20, 20}, "skinning batch (cs 0c936dd6)"},
 }};
+
+/// g2-arm64 (issue #35): the batch shader of a kind: the one written from the first layout, or
+/// its any-layout variant.
+enum Variant : u32 { FirstLayout, AnyLayout, NumVariants };
+
+/// A per-vertex buffer as a dispatch binds it.
+struct Element {
+    u32 bytes;   ///< of a vertex's element
+    bool floats; ///< 32-bit floats where the first layout has halfs
+    bool absent; ///< an invalid format: the translated shader reads zero and stores nothing
+    bool known;  ///< a batch shader reads or writes it as the translated shader does
+};
+
+Element ElementOf(Role role, const Shader::BufferResource& desc, const AmdGpu::Buffer& sharp) {
+    using AmdGpu::CompSwizzle;
+    using AmdGpu::DataFormat;
+    const bool plain = !sharp.swizzle_enable && !sharp.add_tid_enable && sharp.GetStride() != 0 &&
+                       sharp.GetStride() % 4 == 0;
+    if (role == Role::Header) {
+        return {8, false, false, plain && !desc.is_formatted};
+    }
+    if (!desc.is_formatted) {
+        return {0, false, false, false};
+    }
+    const DataFormat format = sharp.GetDataFmt();
+    if (format == DataFormat::FormatInvalid) {
+        return {0, false, true, true};
+    }
+    const auto select = sharp.DstSelect();
+    const bool xyz = plain && sharp.GetNumberFmt() == AmdGpu::NumberFormat::Float &&
+                     sharp.GetNumberConversion() == AmdGpu::NumberConversion::None &&
+                     select.r == CompSwizzle::Red && select.g == CompSwizzle::Green &&
+                     select.b == CompSwizzle::Blue;
+    const bool xyzw = xyz && select.a == CompSwizzle::Alpha;
+    const bool half4 = format == DataFormat::Format16_16_16_16;
+    switch (role) {
+    case Role::Position:
+    case Role::OutPosition:
+        return {12, false, false, xyz && format == DataFormat::Format32_32_32};
+    case Role::Normal:
+        return half4 ? Element{8, false, false, xyz}
+                     : Element{12, true, false, xyz && format == DataFormat::Format32_32_32};
+    case Role::OutNormal:
+        return half4 ? Element{8, false, false, xyzw}
+                     : Element{12, true, false, xyz && format == DataFormat::Format32_32_32};
+    case Role::Tangent:
+    case Role::OutTangent:
+        return half4 ? Element{8, false, false, xyzw}
+                     : Element{16, true, false,
+                               xyzw && format == DataFormat::Format32_32_32_32};
+    case Role::OutMotion:
+        return {8, false, false, xyzw && half4};
+    default:
+        return {0, false, false, false};
+    }
+}
 
 /// g2-arm64: the kind of a compute shader, or Kinds.size() for any other.
 constexpr u32 KindIndex(u64 hash) {
@@ -93,12 +194,13 @@ constexpr u32 KindIndex(u64 hash) {
 struct SkinJob {
     u64 address[MaxBuffers];
     u32 size[MaxBuffers];
+    u32 stride[MaxBuffers]; ///< g2-arm64 (issue #35): the per-vertex buffers' strides in dwords
     u32 count;
     u32 first_group;
-    u32 scale; ///< the motion scale (float bits)
-    u32 pad;
+    u32 scale;  ///< the motion scale (float bits)
+    u32 floats; ///< bit i: buffer i's normal or tangent is 32-bit floats, not half4
 };
-static_assert(sizeof(SkinJob) == 160);
+static_assert(sizeof(SkinJob) == 208);
 
 struct SkinPush {
     u64 jobs;
@@ -188,6 +290,34 @@ bool SkinBatchStats() {
     return stats;
 }
 
+/// g2-arm64 (issue #35): BB_SKIN_BATCH_LAYOUTS: 0 - only the first layouts are batched (any
+/// other is dispatched the ordinary way); 1 (the default) - the other known layouts by the
+/// any-layout shaders; 2 - every job by the any-layout shaders.
+u32 SkinLayoutsMode() {
+    static const u32 mode = [] {
+        const char* env = std::getenv("BB_SKIN_BATCH_LAYOUTS");
+        return env && env[0] >= '0' && env[0] <= '2' ? static_cast<u32>(env[0] - '0') : 1u;
+    }();
+    return mode;
+}
+
+std::span<const u32> SkinCode(u32 kind, u32 variant) {
+    switch (kind * NumVariants + variant) {
+    case 0:
+        return SKIN_BATCH_COMP;
+    case 1:
+        return SKIN_BATCH_ANY_COMP;
+    case 2:
+        return SKIN_MV_BATCH_COMP;
+    case 3:
+        return SKIN_MV_BATCH_ANY_COMP;
+    case 4:
+        return SKIN_U3_BATCH_COMP;
+    default:
+        return SKIN_U3_BATCH_ANY_COMP;
+    }
+}
+
 struct SkinPipeline {
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline;
@@ -217,8 +347,9 @@ SkinPipeline CreateSkinPipeline(const Instance& instance, std::span<const u32> c
 } // namespace
 
 struct Rasterizer::SkinBatch {
-    std::array<std::vector<SkinJob>, Kinds.size()> jobs; ///< by kind
-    std::array<std::vector<u32>, Kinds.size()> job_of_group;
+    /// By kind and variant (g2-arm64, issue #35: the first layout's shader, the any-layout one).
+    std::array<std::vector<SkinJob>, Kinds.size() * NumVariants> jobs;
+    std::array<std::vector<u32>, Kinds.size() * NumVariants> job_of_group;
     std::vector<BoundBuffer> bound;
     RangeSet reads;
     RangeSet writes;
@@ -228,6 +359,10 @@ struct Rasterizer::SkinBatch {
     /// Statistics (BB_SKIN_BATCH_STATS=1): dispatches batched and why batches ended.
     enum Flush : u32 { Packet, Idle, Hazard, Full, Tick, Submit, NumFlush };
     u64 dispatches = 0, batches = 0, regular = 0;
+    u64 any_layout = 0; ///< of the dispatches: by the any-layout shaders
+    /// g2-arm64 (issue #35): the layouts met (a hash of the V#s' strides and formats), each
+    /// named in the log once.
+    std::vector<u64> layouts;
     std::array<u64, NumFlush> flushes{};
     std::unordered_map<u64, u64> causes; ///< packets that ended batches
     std::chrono::steady_clock::time_point window{};
@@ -240,8 +375,11 @@ void Rasterizer::InitSkinBatch() {
     skin_batch = std::make_shared<SkinBatch>();
     skin_batch->window = std::chrono::steady_clock::now();
     draw_pipe->SetIdleHandler(&FlushSkinBatchIdle);
-    std::printf("Skin batch: dispatches of cs %08x%s%s run in batches\n", Kinds[0].hash,
-                MvBatchWanted() ? ", cs 7d7e7206" : "", U3BatchWanted() ? ", cs 0c936dd6" : "");
+    std::printf("Skin batch: dispatches of cs %08x%s%s run in batches%s\n", Kinds[0].hash,
+                MvBatchWanted() ? ", cs 7d7e7206" : "", U3BatchWanted() ? ", cs 0c936dd6" : "",
+                SkinLayoutsMode() == 0   ? " (BB_SKIN_BATCH_LAYOUTS=0: their first layouts only)"
+                : SkinLayoutsMode() == 2 ? " (BB_SKIN_BATCH_LAYOUTS=2: all by the any-layout shaders)"
+                                         : "");
 }
 
 bool Rasterizer::IsSkinBatchShader(u64 hash) const noexcept {
@@ -288,37 +426,99 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
     for (u32 i = 0; fits && i < num_buffers; ++i) {
         fits = !cs.buffers[i].IsSpecial() && cs.buffers[i].is_written == (i >= kind.first_output);
     }
-    if (!fits) {
+    // g2-arm64 (issue #35): the layout of this dispatch - its per-vertex V#s' strides and
+    // formats - and the batch shader that knows it, if one does.
+    std::array<AmdGpu::Buffer, MaxBuffers> sharps{};
+    std::array<Element, MaxBuffers> elements{};
+    u32 floats = 0, absent = 0;
+    bool known = true, first_layout = true;
+    for (u32 i = 0; fits && i < num_buffers; ++i) {
+        sharps[i] = cs.buffers[i].GetSharp(cs);
+        if (kind.roles[i] == Role::Table) {
+            continue;
+        }
+        const Element element = ElementOf(kind.roles[i], cs.buffers[i], sharps[i]);
+        elements[i] = element;
+        known &= element.known;
+        floats |= u32(element.floats) << i;
+        absent |= u32(element.absent) << i;
+        first_layout &= element.absent ||
+                        (!element.floats && sharps[i].GetStride() == kind.first_stride[i]);
+    }
+    const u32 variant = first_layout && SkinLayoutsMode() != 2 ? FirstLayout : AnyLayout;
+    const bool batched = fits && known && (variant == FirstLayout || SkinLayoutsMode() != 0);
+    // Each layout is named in the log once: one the batch does not take always (a report's log
+    // shows it), the batched ones with the statistics.
+    u64 layout = 0xcbf29ce484222325ull ^ k;
+    const bool note = fits && (!batched || SkinBatchStats()) && batch.layouts.size() < 32;
+    for (u32 i = 0; note && i < num_buffers; ++i) {
+        if (kind.roles[i] == Role::Table) {
+            continue;
+        }
+        const auto& sharp = sharps[i];
+        const auto select = sharp.DstSelect();
+        for (const u64 value :
+             {u64(sharp.GetStride()), u64(sharp.data_format), u64(sharp.num_format),
+              u64(select.r) | u64(select.g) << 8 | u64(select.b) << 16 | u64(select.a) << 24,
+              u64(sharp.swizzle_enable) | u64(sharp.add_tid_enable) << 1 |
+                  u64(cs.buffers[i].is_formatted) << 2}) {
+            layout = (layout ^ value) * 0x100000001b3ull;
+        }
+    }
+    if (note &&
+        std::find(batch.layouts.begin(), batch.layouts.end(), layout) == batch.layouts.end()) {
+        batch.layouts.push_back(layout);
+        std::printf("Skin batch: cs %08x layout", kind.hash);
+        for (u32 i = 0; i < num_buffers; ++i) {
+            if (kind.roles[i] == Role::Table) {
+                continue;
+            }
+            const auto& sharp = sharps[i];
+            const auto select = sharp.DstSelect();
+            std::printf(" %u:%u/%u.%u%s%s%s", i, u32(sharp.GetStride()), u32(sharp.data_format),
+                        u32(sharp.num_format), cs.buffers[i].is_formatted ? "" : "r",
+                        select.r == AmdGpu::CompSwizzle::Red &&
+                                select.g == AmdGpu::CompSwizzle::Green &&
+                                select.b == AmdGpu::CompSwizzle::Blue
+                            ? (select.a == AmdGpu::CompSwizzle::Alpha ? "" : "a")
+                            : "s",
+                        sharp.swizzle_enable || sharp.add_tid_enable ? "t" : "");
+        }
+        std::printf(" (buffer:stride/data format.number format; r raw, a w not from the alpha, "
+                    "s swizzled, t swizzle or thread id addressing): %s\n",
+                    !known                 ? "a layout the batch does not know, dispatched one by one"
+                    : !batched             ? "dispatched one by one (BB_SKIN_BATCH_LAYOUTS=0)"
+                    : variant == AnyLayout ? "batched by the any-layout shader"
+                                           : "batched, the first layout");
+    }
+    if (!batched) {
         FlushSkinBatch(SkinBatch::Packet);
         ++batch.regular;
         return false;
     }
+    const u32 list = k * NumVariants + variant;
     const u32 count = static_cast<u32>(
         std::min<u64>(flat[kind.flat_count], u64(program.dim_x) * GuestGroupSize));
 
     // The guest memory the dispatch reads and writes (its buffers' V#s; the per-vertex inputs and
-    // the outputs exactly: fields of the interleaved output vertices).
+    // the outputs exactly: a vertex's element at its index times the V#'s stride).
     auto* memory = Core::Memory::Instance();
     std::array<VAddr, MaxBuffers> base{};
     std::array<u64, MaxBuffers> bytes{};
+    // Unused entries stay empty ranges: they neither overlap nor add.
+    std::array<std::pair<VAddr, VAddr>, MaxBuffers> reads{};
+    std::array<std::pair<VAddr, VAddr>, MaxBuffers> writes{};
     for (u32 i = 0; i < num_buffers; ++i) {
-        const auto sharp = cs.buffers[i].GetSharp(cs);
+        const auto& sharp = sharps[i];
         base[i] = sharp.base_address;
         bytes[i] = base[i] && sharp.GetSize() ? memory->ClampRangeSize(base[i], sharp.GetSize())
                                               : 0;
-    }
-    const auto used = [&](u32 i, u64 size) { return std::min<u64>(bytes[i], size); };
-    // Unused entries stay empty ranges: they neither overlap nor add.
-    std::array<std::pair<VAddr, VAddr>, MaxBuffers> reads{};
-    for (u32 i = 0; i < kind.first_output; ++i) {
-        const u64 size = kind.read_bytes[i] ? used(i, u64(count) * kind.read_bytes[i]) : bytes[i];
-        reads[i] = {base[i], base[i] + size};
-    }
-    std::array<std::pair<VAddr, VAddr>, 4> writes{};
-    for (u32 i = kind.first_output; i < num_buffers; ++i) {
-        const u32 field = kind.written_bytes[i - kind.first_output];
-        const u64 size = count ? u64(count - 1) * kind.vertex_bytes + field : 0;
-        writes[i - kind.first_output] = {base[i], base[i] + used(i, size)};
+        u64 size = bytes[i];
+        if (kind.roles[i] != Role::Table) {
+            const u64 last = count ? u64(count - 1) * sharp.GetStride() + elements[i].bytes : 0;
+            size = elements[i].absent ? 0 : std::min<u64>(size, last);
+        }
+        (i < kind.first_output ? reads : writes)[i] = {base[i], base[i] + size};
     }
     bool hazard = false;
     for (const auto& [begin, end] : reads) {
@@ -330,8 +530,8 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
     const u32 groups = (count + GroupSize - 1) / GroupSize;
     if (hazard) {
         FlushSkinBatch(SkinBatch::Hazard);
-    } else if (batch.jobs[k].size() >= MaxJobs ||
-               batch.job_of_group[k].size() + groups > MaxGroups) {
+    } else if (batch.jobs[list].size() >= MaxJobs ||
+               batch.job_of_group[list].size() + groups > MaxGroups) {
         FlushSkinBatch(SkinBatch::Full);
     } else if (!NoJobs(batch) && scheduler.CurrentTick() != batch.tick) {
         // Constant ring data is retired with the submission it was stamped in.
@@ -377,20 +577,34 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
     }
 
     const bool first_job = NoJobs(batch);
-    const u32 index = static_cast<u32>(batch.jobs[k].size());
+    const u32 index = static_cast<u32>(batch.jobs[list].size());
+    for (u32 i = 0; i < num_buffers; ++i) {
+        if (kind.roles[i] == Role::Table) {
+            continue;
+        }
+        if (absent >> i & 1) {
+            // g2-arm64 (issue #35): as the translated shader with an invalid format: nothing
+            // read (zeros), nothing stored.
+            job.address[i] = 0;
+            job.size[i] = 0;
+        }
+        job.stride[i] = sharps[i].GetStride() / 4;
+    }
+    job.floats = floats;
     job.count = count;
-    job.first_group = static_cast<u32>(batch.job_of_group[k].size());
+    job.first_group = static_cast<u32>(batch.job_of_group[list].size());
     job.scale = kind.flat_scale ? static_cast<u32>(flat[kind.flat_scale]) : 0;
-    batch.job_of_group[k].insert(batch.job_of_group[k].end(), groups, index);
-    batch.jobs[k].push_back(job);
+    batch.job_of_group[list].insert(batch.job_of_group[list].end(), groups, index);
+    batch.jobs[list].push_back(job);
     if (SkinBatchStats()) {
-        // The first jobs of each kind: are the outputs one interleaved buffer (the batch shaders'
-        // row stores)?
-        static std::array<u32, Kinds.size()> logged{};
-        if (logged[k] < 4) {
-            ++logged[k];
+        // The first jobs of each kind and variant: are the outputs one interleaved buffer (the
+        // batch shaders' row stores)?
+        static std::array<u32, Kinds.size() * NumVariants> logged{};
+        if (logged[list] < 4) {
+            ++logged[list];
             const u32 f = kind.first_output;
-            std::printf("Skin batch: cs %08x job, %u vertices, outputs", kind.hash, job.count);
+            std::printf("Skin batch: cs %08x job%s, %u vertices, outputs", kind.hash,
+                        variant == AnyLayout ? " (any layout)" : "", job.count);
             for (u32 i = f; i < num_buffers; ++i) {
                 std::printf(" +%lld/%u", static_cast<long long>(job.address[i] - job.address[f]),
                             job.size[i]);
@@ -398,6 +612,7 @@ bool Rasterizer::AddSkinJob(const ComputePipeline* pipeline,
             std::printf("\n");
         }
     }
+    batch.any_layout += variant == AnyLayout;
     batch.bound.insert(batch.bound.end(), bound_buffers.begin(), bound_buffers.end());
     batch.needs_barrier |= needs_barrier;
     for (const auto& [begin, end] : reads) {
@@ -428,23 +643,28 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
     if (reason == SkinBatch::Packet && SkinBatchStats()) {
         ++batch.causes[cause];
     }
-    static const std::array<SkinPipeline, Kinds.size()> pipes{
-        CreateSkinPipeline(instance, SKIN_BATCH_COMP),
-        CreateSkinPipeline(instance, SKIN_MV_BATCH_COMP),
-        CreateSkinPipeline(instance, SKIN_U3_BATCH_COMP),
-    };
+    // g2-arm64 (issue #35): made at a variant's first batch (the any-layout ones only where the
+    // game brings such a layout).
+    static std::array<SkinPipeline, Kinds.size() * NumVariants> pipes;
     if (batch.needs_barrier) {
         runtime.FlushBarriers();
     }
     scheduler.EndRendering();
-    // The kinds write different vertices (an overlap ends a batch): one dispatch each.
-    for (u32 k = 0; k < Kinds.size(); ++k) {
+    // The kinds and variants write different vertices (an overlap ends a batch): one dispatch
+    // each.
+    for (u32 k = 0; k < Kinds.size() * NumVariants; ++k) {
         const u32 num_groups = static_cast<u32>(batch.job_of_group[k].size());
         if (num_groups == 0) {
             continue;
         }
+        if (!pipes[k].pipeline) {
+            pipes[k] = CreateSkinPipeline(instance, SkinCode(k / NumVariants, k % NumVariants));
+        }
         if (auto* profiler = GpuProfiler::Get()) {
-            profiler->Mark(0x5C1Bull + k, [k] { return std::string{Kinds[k].label}; });
+            profiler->Mark(0x5C1Bull + k, [k] {
+                return std::string{Kinds[k / NumVariants].label} +
+                       (k % NumVariants == AnyLayout ? ", any layout" : "");
+            });
         }
         auto& stream = buffer_cache.GetStreamBuffer();
         const u64 jobs_offset =
@@ -474,10 +694,10 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
         const auto now = std::chrono::steady_clock::now();
         if (now - batch.window >= std::chrono::seconds(5)) {
             const double secs = std::chrono::duration<double>(now - batch.window).count();
-            std::printf("Skin batch: %.0f dispatches/s in %.0f batches/s (%.1f each), %.0f/s "
-                        "regular; batches ended by packet %llu, idle %llu, hazard %llu, full "
-                        "%llu, tick %llu, submission %llu\n",
-                        batch.dispatches / secs, batch.batches / secs,
+            std::printf("Skin batch: %.0f dispatches/s (%.0f/s by the any-layout shaders) in %.0f "
+                        "batches/s (%.1f each), %.0f/s regular; batches ended by packet %llu, idle "
+                        "%llu, hazard %llu, full %llu, tick %llu, submission %llu\n",
+                        batch.dispatches / secs, batch.any_layout / secs, batch.batches / secs,
                         double(batch.dispatches) / std::max<u64>(batch.batches, 1),
                         batch.regular / secs,
                         static_cast<unsigned long long>(batch.flushes[SkinBatch::Packet]),
@@ -509,11 +729,11 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
             std::printf("\n");
             batch.causes.clear();
             batch.window = now;
-            batch.dispatches = batch.batches = batch.regular = 0;
+            batch.dispatches = batch.batches = batch.regular = batch.any_layout = 0;
             batch.flushes = {};
         }
     }
-    for (u32 k = 0; k < Kinds.size(); ++k) {
+    for (u32 k = 0; k < Kinds.size() * NumVariants; ++k) {
         batch.jobs[k].clear();
         batch.job_of_group[k].clear();
     }
