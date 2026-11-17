@@ -1246,6 +1246,61 @@ static void install_u3_particle_job_guard(uint64_t image_size) {
     printf("Particle job guard: U3's particle draw registration job skips a null data+8 (%zu bytes of stub)\n", k);
 }
 
+/* g2-arm64 (issue #39, an Odin 3; the same fault on the G2 with BB_BAD_FILE, runtime_file.c):
+ * U3's init creates the HUD manager (0x16bdef0, its constructor 0x16c4420), which looks its
+ * effects up (`general/hud/bp-speedrun/bp-clock:default` first) in the data of the `hud` effect
+ * package - the handle at 0x1c05fa0, its data at +0x20 - without a check, and faults at 0x16c4917
+ * on the null when the package is not loaded. It is not when the effect packages' texture
+ * dictionary did not load: `texturedict1/ps4/chunk-41-tstrm.pak` or `chunk-41-tstrm-1.pak`
+ * missing, or not what the game expects at its start (the first 4 KiB zeroed here gave the
+ * reporter's log line for line; the file cut at 1 GB of its 1.4 still loads, the textures past
+ * the cut come later) - the game asks for the dictionary again for every effect package
+ * (misc-fx, decals, particle, particle-shrub, hud) and goes on. The call that
+ * creates the HUD manager goes through a check that stops with the reason instead of the fault.
+ * US 1.02 (CUSA02320, as CUSA02344). BB_U3_HUD_GUARD=0: off. */
+static void u3_hud_check(void) {
+    uint64_t data;
+    memcpy(&data, image + (0x1c05fa0 + 0x20 - 0x400000), sizeof(data));
+    if (data) return;
+    printf("STOP: Uncharted 3 cannot set up its HUD: the texture dictionary of its effect packages did not "
+           "load (u3data/build/main/texturedict1/ps4/chunk-41-tstrm.pak, chunk-41-tstrm-1.pak; "
+           "pak23/ps4/hud.pak) - a file of this copy of the game is missing, damaged or from another "
+           "version. Copy the game's files again.\n");
+    fflush(NULL);
+    runtime_quit(21);
+}
+static void install_u3_hud_guard(uint64_t image_size) {
+    const char *env = getenv("BB_U3_HUD_GUARD");
+    if (env && env[0] == '0') return;
+    const uint64_t base = 0x400000, site = 0x96b1ea, create = 0x16bdef0, read_at = 0x16c490f;
+    /* call 0x1018900; call 0x16bdef0; lea rdi, [0x1e4d910] */
+    static const unsigned char site_old[] = {0xe8, 0x11, 0xd7, 0x6a, 0x00, 0xe8, 0xfc, 0x2c, 0xd5, 0x00,
+                                             0x48, 0x8d, 0x3d, 0x15, 0x27, 0x4e, 0x01};
+    /* mov rcx, [r15+0x48]; mov rsi, [rcx+0x20]; movzx edx, word [rsi+2] */
+    static const unsigned char read_old[] = {0x49, 0x8b, 0x4f, 0x48, 0x48, 0x8b, 0x71, 0x20,
+                                             0x0f, 0xb7, 0x56, 0x02};
+    if (read_at - base + sizeof(read_old) > image_size ||
+        memcmp(image + site - base, site_old, sizeof(site_old)) ||
+        memcmp(image + read_at - base, read_old, sizeof(read_old)))
+        return; /* not U3 1.02 */
+    unsigned char *t = near_image_memory(64);
+    if (!t) { printf("HUD guard: no thunk memory, off\n"); return; }
+    const uintptr_t host = guest_host_function((const void *)u3_hud_check, "u3_hud_check", GUEST_ABI_SYSV);
+    size_t k = 0;
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+    B(0x48, 0x83, 0xec, 0x08);                              /* sub rsp, 8: the host call's alignment */
+    B(0x48, 0xb8); memcpy(t + k, &host, 8); k += 8;          /* movabs rax, u3_hud_check */
+    B(0xff, 0xd0);                                          /* call rax */
+    B(0x48, 0x83, 0xc4, 0x08);                              /* add rsp, 8 */
+    B(0xe9);                                                /* jmp the HUD manager's creation */
+    { const int32_t rel = (int32_t)((int64_t)(uintptr_t)(image + create - base) - (int64_t)(uintptr_t)(t + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
+#undef B
+    unsigned char *call = image + site + 5 - base;          /* the second call of the pair */
+    const int32_t rel = (int32_t)((int64_t)(uintptr_t)t - (int64_t)(uintptr_t)(call + 5));
+    memcpy(call + 1, &rel, 4);
+    printf("HUD guard: U3 stops with the reason when its HUD's effect package is not loaded (%zu bytes of stub)\n", k);
+}
+
 /* g2-arm64 diagnosis (U1's job fiber crash, 2026-11-01): BB_U1_VIEW_WATCH=1 watches the table
  * U1's 0x739b90 takes its bitsets from (the faulting movbe at 0x739ed2): the view manager at
  * 0x140b4c0, its level data ([+0x10]: the region count at +0x350, read under the rwlock at +0x360)
@@ -2679,7 +2734,7 @@ static void patch_job_sleep(uint64_t image_size) {
  * the jumps were made for (1.00 is compiled differently and is left alone). BB_JOB_GUARD=0: off. */
 static void patch_job_descriptor_guard(uint64_t image_size) {
     const char *env=getenv("BB_JOB_GUARD");
-    if (env && env[0]=='0') return;
+    const int off=env && env[0]=='0';
     static const struct {
         const char *game, *loads, *cave;
         unsigned char jump[27], stub[24];
@@ -2698,6 +2753,7 @@ static void patch_job_descriptor_guard(uint64_t image_size) {
     for (size_t b=0;b<sizeof(builds)/sizeof(*builds);++b) {
         const int64_t loads=find_unique_pattern(image_size,builds[b].loads);
         if (loads<0) continue;
+        if (off) return;
         const int64_t cave=find_unique_pattern(image_size,builds[b].cave);
         if (cave-loads!=builds[b].distance) {
             printf("Job descriptor guard: %s 1.02 loads found, its stub site not where expected; not patched\n",builds[b].game);
@@ -2709,6 +2765,13 @@ static void patch_job_descriptor_guard(uint64_t image_size) {
                builds[b].game,(uint64_t)loads,(uint64_t)cave);
         return;
     }
+    /* g2-arm64 (issue #36: a dump without the 1.02 update - 11 FPS at 1920x1080 and a stall in
+     * U1's job system, read out of four logs' missing lines): none of the three 1.02 executables,
+     * said in words once at the start. */
+    printf("Version: this executable is not version 1.02, the one this port is made for: the render sizes "
+           "below 1920x1080 and the port's fixes for the games' job system are off (a low frame rate and "
+           "stalls are likely). The game's update 1.02 goes next to the game folder as \"<game folder>-UPDATE\"; "
+           "then choose the folder again in the launcher and press Prepare.\n");
 }
 /* U2 chapter 21 (convoy): Elena's truck sinks 2-4 m into the snow for ~0.5 s after a bump. The bump
  * plays an animation on the truck by adding a node to its animation blend (US 0x399700, EU 0x102330:
@@ -3103,6 +3166,7 @@ int main(int argc, char **argv) {
         install_u1_set_job_guard(image_end);
         install_dt_smooth(image_end);
         install_u3_particle_job_guard(image_end);
+        install_u3_hud_guard(image_end);
 #endif
         patch_job_lock_wait(image_end);
         patch_u1_sticky(image_end);

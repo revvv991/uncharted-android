@@ -5988,20 +5988,75 @@ namespace Vulkan {
 
 void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
     auto* profiler = GpuProfiler::Get();
-    if (!profiler || !scheduler.WillBeginRendering(state)) {
+    if (!profiler) {
+        return;
+    }
+    // g2-arm64: BB_GPU_PROFILE=2: inside a pass too, a segment for each run of draws with one
+    // pixel shader and one depth and blend state (vk_gpu_profiler.h).
+    const bool by_shader = profiler->ByShader();
+    if (!by_shader && !scheduler.WillBeginRendering(state)) {
         return;
     }
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 6> parts{};
     parts[0] = state.width | u64(state.height) << 32;
-    parts[1] = vs.pgm_hash;
+    parts[1] = by_shader ? 0 : vs.pgm_hash;
     parts[2] = ps ? ps->pgm_hash : 0;
     parts[3] = db_desc.first ? u64(texture_cache.GetImage(db_desc.first).info.pixel_format) : 0;
     for (u32 cb = 0; cb < state.num_color_attachments && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         parts[4 + cb] = cb_descs[cb].first
                             ? u64(texture_cache.GetImage(cb_descs[cb].first).info.pixel_format) + 1
                             : 0;
+    }
+    if (by_shader) {
+        const auto& regs = Regs();
+        const auto depth = regs.depth_control;
+        const auto shader = regs.depth_shader_control;
+        const bool discards = ps && ps->has_discard;
+        const u32 mask = regs.color_target_mask.raw & 0xf;
+        const bool blends = regs.blend_control[0].enable;
+        parts[AmdGpu::NUM_COLOR_BUFFERS + 4] =
+            1 + (u64(depth.depth_enable) | u64(depth.depth_write_enable) << 1 |
+                 u64(u32(depth.depth_func)) << 2 | u64(depth.stencil_enable) << 5 |
+                 u64(blends) << 6 | u64(u32(shader.z_order)) << 7 | u64(shader.kill_enable) << 9 |
+                 u64(shader.depth_before_shader) << 10 | u64(shader.z_export_enable) << 11 |
+                 u64(discards) << 12 | u64(mask) << 13);
+        const u64 key = XXH3_64bits(parts.data(), sizeof(parts));
+        // (An indirect draw's indices are not known here: the register's last value counts.)
+        const u64 indices =
+            u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1u);
+        if (key != profiler->Current() || scheduler.WillBeginRendering(state)) {
+            profiler->Mark(key, [&] {
+                static constexpr std::array funcs{"never", "less",     "equal",  "lequal",
+                                                  "greater", "notequal", "gequal", "always"};
+                static constexpr std::array orders{"late", "early-late", "re-z", "early-re-z"};
+                std::string targets;
+                for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+                    targets += cb_descs[cb].first
+                                   ? vk::to_string(
+                                         texture_cache.GetImage(cb_descs[cb].first).info.pixel_format)
+                                   : std::string{"-"};
+                    targets += ' ';
+                }
+                return fmt::format(
+                    "pass {}x{} [{}] ps {:08x} (vs {:08x}) depth {} test {} write {} func {} "
+                    "stencil {} | z order {} kill {} before-shader {} z-export {} | discard {} | "
+                    "blend {} mask {:x}",
+                    state.width, state.height, targets, u32(ps ? ps->pgm_hash : 0),
+                    u32(vs.pgm_hash),
+                    db_desc.first
+                        ? vk::to_string(texture_cache.GetImage(db_desc.first).info.pixel_format)
+                        : std::string{"-"},
+                    u32(depth.depth_enable), u32(depth.depth_write_enable),
+                    funcs[u32(depth.depth_func) & 7], u32(depth.stencil_enable),
+                    orders[u32(shader.z_order) & 3], u32(shader.kill_enable),
+                    u32(shader.depth_before_shader), u32(shader.z_export_enable), u32(discards),
+                    u32(blends), mask);
+            });
+        }
+        profiler->CountDraw(indices);
+        return;
     }
     const u64 key = XXH3_64bits(parts.data(), sizeof(parts));
     profiler->Mark(key, [&] {

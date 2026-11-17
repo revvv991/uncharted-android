@@ -227,6 +227,8 @@ public:
         u32 tmp_dwords;
     };
     Common::SlotVector<AscQueueInfo> asc_queues{};
+    /// g2-arm64 (port 0195): the submissions of a compute queue (1-based) not finished yet.
+    size_t PendingAscSubmits(u32 gnm_vqid);
 
     std::thread::id GetGpuCommandProcessorThread() {
         return gpu_id;

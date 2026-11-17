@@ -884,6 +884,55 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
+/* g2-arm64: reads through the backing view (the bytes of a page the GPU tracks, whatever its
+ * protection); 0 when part of the range has no backing. */
+int runtime_memory_read_backing(uintptr_t address, void *out, uint64_t size) {
+    read_lock();
+    int ok=1;
+    for (uintptr_t at=address, end=address+size; at<end && ok;) {
+        size_t i=vma_index(at);
+        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
+        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+        memcpy((unsigned char *)out+(at-address),backing_base+vmas[i].phys+(at-vmas[i].start),n);
+        at+=n;
+    }
+    read_unlock();
+    return ok;
+}
+/* g2-arm64 (port 0196): GPU bytes that reach guest memory late - a copy made when the GPU wrote
+ * them, landed when that work is done - go only where the guest's bytes are still `before`, the
+ * ones the copy saw: the guest may have written the place since (U3 gave such memory to command
+ * buffers and descriptors, and a late (1.0, 0, 0, 0) broke them). A compare-and-swap per aligned
+ * word through the backing view, byte by byte at an unaligned head or tail: nothing the guest
+ * writes in between is lost. Returns the count of bytes not landed (the guest's kept), or -1 when
+ * part of the range has no backing (nothing landed there). */
+int64_t runtime_memory_land_backing(uintptr_t address, const void *before, const void *data, uint64_t size) {
+    read_lock();
+    int64_t kept=0;
+    for (uintptr_t at=address, end=address+size; at<end;) {
+        size_t i=vma_index(at);
+        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { kept=-1; break; }
+        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+        unsigned char *dst=backing_base+vmas[i].phys+(at-vmas[i].start);
+        const unsigned char *b=(const unsigned char *)before+(at-address);
+        const unsigned char *d=(const unsigned char *)data+(at-address);
+        for (uint64_t k=0; k<n;) {
+            if ((((uintptr_t)(dst+k))&3)==0 && k+4<=n) {
+                uint32_t expect, want;
+                memcpy(&expect,b+k,4); memcpy(&want,d+k,4);
+                if (!__atomic_compare_exchange_n((uint32_t *)(dst+k),&expect,want,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) kept+=4;
+                k+=4;
+            } else {
+                unsigned char expect=b[k];
+                if (!__atomic_compare_exchange_n(dst+k,&expect,d[k],0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) kept+=1;
+                k+=1;
+            }
+        }
+        at+=n;
+    }
+    read_unlock();
+    return kept;
+}
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;

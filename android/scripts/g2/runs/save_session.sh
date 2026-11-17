@@ -10,7 +10,7 @@
 # hold / release = an input kept down (walking, the camera), shot = a screenshot, log = lines of
 # the game's log. stop pulls the log and puts the owner's files, saves and settings back.
 # Refuses to start while the game runs.
-#   START  the game the OWNER played last (u1): the collection's menu stands there (the
+#   START  the game the OWNER played last (owner_game by default): the collection's menu stands there (the
 #          collection's own save is not replaced); see continue_run.sh
 #   LIMIT  the frame limit (30), SIZE (1280x720), TITLE (45 s from the choice to the title screen)
 # Outputs: $OUT/hold/<tag>-NN.png and <tag>-<HHMM>.log. A reporter's saves are their files: keep
@@ -35,6 +35,7 @@ start)
     case "$game" in u1) n=1;; u2) n=2;; u3) n=3;; *) echo "game: u1, u2 or u3"; exit 1;; esac
     [ -f "$STATE" ] && { echo "a session is open ($STATE): stop it first"; exit 1; }
     if game_running; then echo "the game is running: not started"; exit 1; fi
+    START=${START:-$(owner_game)}       # the owner's last game: where the menu stands
     if ! battery_ok; then echo "the battery is below ${BATTERY_MIN:-20}% and not charging: not started"; exit 1; fi
     screen_awake || { echo "the screen does not wake: not started"; exit 1; }
     for d in SAVEDATA0${n}0 SAVEDATA0${n}0.sce_sys SAVEDATA0${n}P SAVEDATA0${n}P.sce_sys; do

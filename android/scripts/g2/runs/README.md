@@ -71,6 +71,13 @@ and the pitfalls: `.claude/skills/g2-runs/SKILL.md`.
   the controller setup window (issue #16); the G2's firmware normalizes the first external
   joystick, so a decoy is made first. With 13 buttons or more SDL maps it uselessly (its face
   buttons are ones the pad lacks); with 12 or fewer, not at all.
+- `chapter_run.sh <tag> <game> <chapter> <secs> [KEY=VALUE ...]`: one run of a chapter from the
+  game's Chapter Select (`SAVES=<a finished game's save>` unlocks them all; `WAIT_MOVIES=1`,
+  `SHOTS=<secs>`); `chapter_sweep.sh <tag> <game> <first> <last> <secs>`: a range, one process each.
+- `kwatch.sh <prefix> [secs]`: the live record on its own - the kernel log, the temperatures and
+  the game's log streamed to the PC (`.klive`, `.temps`, `.glive`). `continue_run.sh` and
+  `chapter_run.sh` keep it for every run (g2.sh's `kwatch_start`): the G2 records nothing of its
+  own resets. `../kevents.py <run.dmesg ...>`: the kernel's GPU events of a series, run by run.
 - `restore_owner.sh [stamp]`: the owner's files and settings back after a run that died.
 - `queue_after.sh <marker file> <regex> <log> -- <command>`: chain series without attention.
 - `symbolize.sh <addr...>`: names for `libbbgpu.so+0x...` offsets (the last test build).

@@ -80,6 +80,25 @@ public class GameActivity extends SDLActivity {
         return out;
     }
 
+    /** The last three logs are kept - bb-probe.log, bb-probe-1.log (the run before it) and
+     *  bb-probe-2.log: every start of the game wrote bb-probe.log anew, and a start is also the
+     *  collection's menu handing over to a game, the game started again after a crash, or the
+     *  system bringing the activity back - the log of the run that crashed was the menu's of the
+     *  next start by the time it was copied (issue #39). Once per process, before the native code
+     *  opens its log. */
+    private static boolean logsRotated;
+
+    private static void rotateLogs(String d) {
+        if (logsRotated) return;
+        logsRotated = true;
+        File log = new File(d, "bb-probe.log");
+        if (!log.isFile() || log.length() == 0) return;
+        File one = new File(d, "bb-probe-1.log"), two = new File(d, "bb-probe-2.log");
+        two.delete();
+        one.renameTo(two);
+        log.renameTo(one);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         String d = dir().getAbsolutePath();
@@ -161,6 +180,7 @@ public class GameActivity extends SDLActivity {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+        rotateLogs(d);
         super.onCreate(savedInstanceState);
         // The middle of the right edge, where the swipe that opens the panel starts, is kept from
         // the system's back gesture (Android allows at most 200 dp of an edge).

@@ -134,6 +134,32 @@ static void fix_case(char *path,size_t root) {
 }
 #endif
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
+/* g2-arm64 diagnosis (issue #39: U3 on a copy whose effect texture dictionary did not load):
+ * BB_BAD_FILE=<part>:missing | <part>:short:<bytes> | <part>:zero:<bytes> - the file whose guest
+ * path contains <part> is not there (its host path gets a suffix no file has), ends after <bytes>
+ * (for stat and positioned reads), or begins with <bytes> of zeros: a damaged copy of the game on
+ * a device that has a good one. Returns 0 (not that file), 'm', 's' or 'z', the bytes in *bytes. */
+static int bad_file(const char *guest,int64_t *bytes) {
+    static char part[256];
+    static int mode=-1;
+    static int64_t count;
+    if (mode<0) {
+        mode=0;
+        const char *spec=getenv("BB_BAD_FILE");
+        const char *colon=spec ? strchr(spec,':') : NULL;
+        if (colon && colon>spec && (size_t)(colon-spec)<sizeof(part)) {
+            memcpy(part,spec,(size_t)(colon-spec));
+            if (!strcmp(colon+1,"missing")) mode='m';
+            else if (!strncmp(colon+1,"short:",6)) { mode='s'; count=strtoll(colon+7,NULL,10); }
+            else if (!strncmp(colon+1,"zero:",5)) { mode='z'; count=strtoll(colon+6,NULL,10); }
+            if (mode) printf("Runtime: BB_BAD_FILE: files with '%s' in their path are %s\n",part,
+                             mode=='m' ? "missing" : mode=='s' ? "short" : "zeroed at the start");
+        }
+    }
+    if (!mode || !guest || !strstr(guest,part)) return 0;
+    if (bytes) *bytes=count;
+    return mode;
+}
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
     char buffer[1024];
@@ -170,6 +196,10 @@ static int translate(const char *guest,char *out,size_t size) {
 #endif
             if (!host_stat(alt,&s) && !S_ISDIR(s.st_mode) && strlen(alt)<size) memcpy(out,alt,strlen(alt)+1);
         }
+    }
+    if (!result && bad_file(buffer,NULL)=='m') {
+        const size_t n=strlen(out);
+        if (n+11<=size) memcpy(out+n,".bb-hidden",11);
     }
     return result;
 }
@@ -334,6 +364,11 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     if (host<0) {
         e=errno;
         if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+        else {
+            /* g2-arm64: a file that is there and does not open (access, I/O) was silent. */
+            static int said;
+            if (said<40) { ++said; printf("Runtime: open(%s) -> %s (error %d)\n",guest,strerror(e),e); }
+        }
         return -e;
     }
     struct stat s;
@@ -443,10 +478,30 @@ static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
     return (ssize_t)done;
 }
 #endif
+/* g2-arm64 (issue #39): a read that fails is named in the log (the first 16) - an unreadable
+ * file of the copy, which the game answers with a crash somewhere else. (A read cut short by
+ * the file's end is no sign: the games read their packages in 512 KiB blocks to the end.) */
+static void note_read_error(int fd,uint64_t size,int64_t offset,int error) {
+    static int said;
+    if (said>=16) return;
+    ++said;
+    const File *f=get(fd);
+    printf("Runtime: read of %s failed (%llu bytes at offset %lld): %s\n",f ? f->path : "?",
+           (unsigned long long)size,(long long)offset,strerror(error));
+}
+/* BB_BAD_FILE's zeros over what a read returned from the start of the file. */
+static void bad_file_zeros(int fd,void *buffer,int64_t offset,ssize_t n) {
+    int64_t bytes=0;
+    const File *f=get(fd);
+    if (n<=0 || offset<0 || !f || bad_file(f->path,&bytes)!='z' || offset>=bytes) return;
+    memset(buffer,0,(size_t)(offset+n>bytes ? bytes-offset : n));
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=read_full(h,buffer,size,-1);
+    if (n<0) note_read_error(fd,size,-1,errno);
+    else if (h>=3) bad_file_zeros(fd,buffer,(int64_t)host_lseek(h,0,1)-(int64_t)n,n);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     trace_bank_read(fd,size,-1,n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -455,7 +510,15 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    {
+        int64_t limit=0;
+        const File *f=get(fd);
+        if (f && offset>=0 && bad_file(f->path,&limit)=='s' && (uint64_t)offset+size>(uint64_t)limit)
+            size=offset<limit ? (uint64_t)(limit-offset) : 0;
+    }
     ssize_t n=read_full(h,buffer,size,offset);
+    if (n<0) note_read_error(fd,size,offset,errno);
+    else bad_file_zeros(fd,buffer,offset,n);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     trace_bank_read(fd,size,offset,n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -503,6 +566,11 @@ static int64_t do_fstat(int fd,GuestStat *out) {
 #endif
     if (!out) return -EFAULT;
     if (host_fstat(h,&s)) return -errno;
+    {
+        int64_t limit=0;
+        const File *f=get(fd);
+        if (f && bad_file(f->path,&limit)=='s' && (int64_t)s.st_size>limit) s.st_size=limit;
+    }
     convert_stat(&s,out); return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
@@ -511,6 +579,10 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     if (e) return -e;
     if (!out) return -EFAULT;
     if (host_stat(path,&s)) return -errno;
+    {
+        int64_t limit=0;
+        if (bad_file(guest,&limit)=='s' && (int64_t)s.st_size>limit) s.st_size=limit;
+    }
     convert_stat(&s,out); return 0;
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {

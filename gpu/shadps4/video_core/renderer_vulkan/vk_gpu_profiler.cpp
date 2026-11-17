@@ -11,7 +11,7 @@ namespace Vulkan {
 
 void GpuProfiler::Init(const Instance& instance, Scheduler& scheduler) {
     const char* env = std::getenv("BB_GPU_PROFILE");
-    if (!env || env[0] != '1' || instance_ptr) {
+    if (!env || env[0] < '1' || env[0] > '3' || instance_ptr) {
         return;
     }
     instance_ptr = new GpuProfiler(instance, scheduler);
@@ -29,7 +29,22 @@ GpuProfiler::GpuProfiler(const Instance& instance, Scheduler& scheduler_)
     for (auto& k : keys) {
         k.reserve(SliceQueries);
     }
-    std::printf("GPU profile: on (timestamp period %.2f ns)\n", period_ns);
+    const char* env = std::getenv("BB_GPU_PROFILE");
+    by_shader = env && env[0] >= '2';
+    if (env && env[0] == '3' &&
+        instance.GetPhysicalDevice().getFeatures().pipelineStatisticsQuery) {
+        const vk::QueryPoolCreateInfo statistics_info = {
+            .queryType = vk::QueryType::ePipelineStatistics,
+            .queryCount = NumSlices * SliceQueries,
+            .pipelineStatistics = vk::QueryPipelineStatisticFlagBits::eFragmentShaderInvocations,
+        };
+        statistics_pool = Check<"create statistics query pool">(
+            device.createQueryPoolUnique(statistics_info));
+        device.resetQueryPool(*statistics_pool, 0, NumSlices * SliceQueries);
+    }
+    std::printf("GPU profile: on (timestamp period %.2f ns)%s%s\n", period_ns,
+                by_shader ? ", passes split by pixel shader and state" : "",
+                statistics_pool ? ", fragment shader invocations counted" : "");
 }
 
 void GpuProfiler::WriteTimestamp(u64 key) {
@@ -47,12 +62,28 @@ void GpuProfiler::WriteTimestamp(u64 key) {
 
 void GpuProfiler::Stamp(vk::CommandBuffer cmdbuf, u64 key) {
     std::scoped_lock lock{mutex};
+    CloseStatistics(cmdbuf);
     if (used[slice] + 1 >= SliceQueries) {
         return; // the frame's slice is full: the rest of the frame goes to the last label
     }
     const u32 query = slice * SliceQueries + used[slice]++;
     keys[slice].push_back(key);
     cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *pool, query);
+    // g2-arm64: the invocations from this timestamp to the next. Not over the wait between
+    // submissions: a query ends in the command buffer it began in, and that label is a
+    // command buffer's last.
+    if (statistics_pool && key != IdleKey) {
+        cmdbuf.beginQuery(*statistics_pool, query, {});
+        statistics_open = true;
+        statistics_query = query;
+    }
+}
+
+void GpuProfiler::CloseStatistics(vk::CommandBuffer cmdbuf) {
+    if (statistics_open) {
+        cmdbuf.endQuery(*statistics_pool, statistics_query);
+        statistics_open = false;
+    }
 }
 
 void GpuProfiler::BeginFrame() {
@@ -65,6 +96,7 @@ void GpuProfiler::BeginFrame() {
 void GpuProfiler::NextSlice(vk::CommandBuffer cmdbuf, u64 label) {
     std::scoped_lock lock{mutex};
     // Close the frame: one more timestamp without a label.
+    CloseStatistics(cmdbuf);
     if (used[slice] > 0 && used[slice] < SliceQueries) {
         const u32 query = slice * SliceQueries + used[slice]++;
         cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *pool, query);
@@ -77,6 +109,9 @@ void GpuProfiler::NextSlice(vk::CommandBuffer cmdbuf, u64 label) {
     }
     if (used[slice]) {
         device.resetQueryPool(*pool, slice * SliceQueries, used[slice]);
+        if (statistics_pool) {
+            device.resetQueryPool(*statistics_pool, slice * SliceQueries, used[slice]);
+        }
     }
     used[slice] = 0;
     keys[slice].clear();
@@ -99,6 +134,20 @@ void GpuProfiler::Collect(u32 which) {
         ++skipped;
         return;
     }
+    // g2-arm64: a value and its availability for each slot; the slots without a query (the
+    // waits between submissions, the frame's last timestamp) stay unavailable.
+    std::vector<u64> fragments;
+    if (statistics_pool) {
+        fragments.resize(size_t(count) * 2);
+        const auto statistics_result = device.getQueryPoolResults(
+            *statistics_pool, which * SliceQueries, count, fragments.size() * sizeof(u64),
+            fragments.data(), 2 * sizeof(u64),
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        if (statistics_result != vk::Result::eSuccess &&
+            statistics_result != vk::Result::eNotReady) {
+            fragments.clear();
+        }
+    }
     std::vector<Gap> gaps;
     for (u32 i = 0; i + 1 < count; ++i) {
         if (stamps[i + 1] < stamps[i]) {
@@ -109,6 +158,9 @@ void GpuProfiler::Collect(u32 which) {
         auto& total = totals[keys[which][i]];
         total.ms += ms;
         ++total.segments;
+        if (!fragments.empty() && fragments[size_t(i) * 2 + 1]) {
+            total.fragments += fragments[size_t(i) * 2];
+        }
         if (keys[which][i] == IdleKey) {
             const size_t bucket = std::ranges::upper_bound(IdleBounds, ms) - IdleBounds.begin();
             idle_lengths[bucket].ms += ms;
@@ -146,11 +198,21 @@ void GpuProfiler::Print() {
                 static_cast<unsigned long long>(skipped),
                 static_cast<unsigned long long>(out_of_order));
     skipped = out_of_order = 0;
-    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 30); ++i) {
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), by_shader ? 90 : 30); ++i) {
         const auto& [key, total] = sorted[i];
-        std::printf("  %6.3f ms/frame %5.1f/frame  %s\n", total.ms / frames,
+        std::printf("  %6.3f ms/frame %5.1f/frame  %s", total.ms / frames,
                     double(total.segments) / frames, described[key].c_str());
+        // g2-arm64: the split profile's columns.
+        if (const auto count = counts.find(key); by_shader && count != counts.end()) {
+            std::printf(" | %.1f draws, %.1f k indices", double(count->second.draws) / frames,
+                        double(count->second.indices) / 1e3 / frames);
+        }
+        if (statistics_pool) {
+            std::printf(" | %.3f M fragments", double(total.fragments) / 1e6 / frames);
+        }
+        std::printf("\n");
     }
+    counts.clear();
     std::printf("  idle gaps by length (ms: count/frame, ms/frame):");
     for (size_t b = 0; b < idle_lengths.size(); ++b) {
         if (b < IdleBounds.size()) {

@@ -24,6 +24,8 @@ for ((i = 1; i <= pairs; i++)); do
         mean=$(echo "$line" | sed -n -E 's/.*mean ([0-9.]+) over.*/\1/p'); faults=$(echo "$line" | sed -n -E 's/.*GPU faults ([0-9]+).*/\1/p')
         off=$(echo "$line" | sed -n -E 's/.*off the limit ([0-9.]+)%.*/\1/p')
         echo "$side$i: ${mean:-?} FPS, faults ${faults:-?}${off:+, off the cadence $off%}  ($(date +%H:%M))" | tee -a "$LOG"
+        # A reset or a lost link: no later run can start and the owner's files are not back.
+        if ! device_here; then echo "AB-STOPPED $(date +%H:%M): the device went away in $tag-$side$i (see runs/summary.txt; restore_owner.sh when it is back)" | tee -a "$LOG"; exit 2; fi
         if [ $side = A ]; then A+=("${mean:-nan}"); OA+=("${off:-nan}"); else B+=("${mean:-nan}"); OB+=("${off:-nan}"); fi
         sleep ${COOL:-60}
     done

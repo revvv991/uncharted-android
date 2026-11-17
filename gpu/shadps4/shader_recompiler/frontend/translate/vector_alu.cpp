@@ -7,7 +7,10 @@
 #include "shader_recompiler/profile.h"
 #include <algorithm>
 #include <vector>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 
 namespace Shader::Gcn {
 
@@ -2028,16 +2031,24 @@ void Translator::SetCarryOut(const GcnInst& inst, const IR::U1& carry) {
 // TODO: add range analysis pass to hopefully put an upper bound on m0, and only select one of
 // [src_vgprno, src_vgprno + max_m0]. Same for dst regs we may write back to
 
-namespace {
 /// g2-arm64: how many registers from the base a relative move of a shader can reach (0: all
 /// allocated ones). Each move becomes a select over every candidate register (and a relative
 /// write rewrites them all), inside loops: U1's tiled lighting (cs 43b8ee5e, 18 ms a run on the
 /// G2) indexes a 4-dword light mask (v3..v6 from one DS_READ2_B64, m0 = 3..0) this way, ~120
 /// extra operations per light and pixel. Known bounds are built in; BB_MOVREL_RANGE=
 /// <hash>:<count>,... adds or overrides (count 0: no bound).
+/// U3's spider swarm (chapters 7 and 11; ps 9d681bfe, df0f92d5, cfbb2ab3): a layered material
+/// picks each of its six layers' masks from a table of eight - the four channels of a mask
+/// texture and four ones - by an index from its constants, twice a layer. Unbounded, each of the
+/// twelve reads was a select over every register above the table's (84, 58, 21), and all of
+/// them stayed live to the last read: on Adreno ir3 ran out of its 48 registers and spilled
+/// (436 stores and 663 loads of private memory in 9d681bfe, ~13,300 stalled cycles a fragment),
+/// 52 ms of GPU time a frame for 75,000 fragments - the room at 10-15 FPS on the G2.
+/// (vk_pipeline_serialization.cpp names the bounded shaders' cache entries after the bound.)
 u32 MovRelRange(u64 pgm_hash) {
     static const std::vector<std::pair<u64, u32>> table = [] {
-        std::vector<std::pair<u64, u32>> t{{0x43b8ee5eull, 4}};
+        std::vector<std::pair<u64, u32>> t{
+            {0x43b8ee5eull, 4}, {0x9d681bfeull, 8}, {0xdf0f92d5ull, 8}, {0xcfbb2ab3ull, 8}};
         if (const char* env = std::getenv("BB_MOVREL_RANGE")) {
             for (const char* p = env; *p;) {
                 char* end;
@@ -2060,6 +2071,23 @@ u32 MovRelRange(u64 pgm_hash) {
     }
     return 0;
 }
+
+namespace {
+/// g2-arm64: a shader whose relative moves reach many registers without a known bound is named
+/// in the log, once: a candidate for the table above when its pass is slow.
+void NoteUnboundedMovRel(u64 pgm_hash, u32 registers, bool write) {
+    if (registers <= 16) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> noted;
+    std::scoped_lock lock{mutex};
+    if (noted.insert(pgm_hash).second) {
+        std::printf("Shader %08x: a relative register %s over %u registers, no bound known "
+                    "(BB_MOVREL_RANGE)\n",
+                    static_cast<u32>(pgm_hash), write ? "write" : "read", registers);
+    }
+}
 } // namespace
 
 IR::U32 Translator::VMovRelSHelper(u32 src_vgprno, const IR::U32 m0) {
@@ -2068,6 +2096,9 @@ IR::U32 Translator::VMovRelSHelper(u32 src_vgprno, const IR::U32 m0) {
     const u32 range = MovRelRange(info.pgm_hash);
     const u32 end = range ? std::min(runtime_info.props.num_allocated_vgprs, src_vgprno + range)
                           : runtime_info.props.num_allocated_vgprs;
+    if (!range && end > src_vgprno) {
+        NoteUnboundedMovRel(info.pgm_hash, end - src_vgprno, false);
+    }
     for (u32 i = src_vgprno; i < end; i++) {
         const IR::U1 cond = ir.IEqual(m0, ir.Imm32(i - src_vgprno));
         src_val =
@@ -2080,6 +2111,9 @@ void Translator::VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR:
     const u32 range = MovRelRange(info.pgm_hash);
     const u32 end = range ? std::min(runtime_info.props.num_allocated_vgprs, dst_vgprno + range)
                           : runtime_info.props.num_allocated_vgprs;
+    if (!range && end > dst_vgprno) {
+        NoteUnboundedMovRel(info.pgm_hash, end - dst_vgprno, true);
+    }
     for (u32 i = dst_vgprno; i < end; i++) {
         const IR::U1 cond = ir.IEqual(m0, ir.Imm32(i - dst_vgprno));
         const IR::U32 dst_val =

@@ -229,6 +229,12 @@ std::string Instance::GetDriverVersionName() {
     return GetReadableVersion(version);
 }
 
+// g2-arm64: BB_GPU_PROFILE=3 counts fragment shader invocations (vk_gpu_profiler.h).
+static bool ProfileStatistics() {
+    const char* env = std::getenv("BB_GPU_PROFILE");
+    return env && env[0] == '3';
+}
+
 bool Instance::CreateDevice() {
     const vk::StructureChain feature_chain = physical_device.getFeatures2<
         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
@@ -556,6 +562,7 @@ bool Instance::CreateDevice() {
                 .wideLines = features.wideLines,
                 .multiViewport = features.multiViewport,
                 .samplerAnisotropy = features.samplerAnisotropy,
+                .pipelineStatisticsQuery = features.pipelineStatisticsQuery && ProfileStatistics(),
                 .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,

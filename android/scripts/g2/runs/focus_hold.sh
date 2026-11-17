@@ -16,6 +16,7 @@ value() { $ADB shell "grep -a 'Tiny readback' $G/bb-probe.log | tail -1" | tr -d
 case "${1:-}" in
 start)
     if game_running; then echo "the game is running: abort"; exit 1; fi
+    START=${START:-$(owner_game)}       # the owner's last game: where the menu stands
     stamp=$(date +%Y%m%d-%H%M%S)
     back_up "$stamp" || exit 1
     owner_env=$(owner_extra_env)

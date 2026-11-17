@@ -468,6 +468,164 @@ bool BufferCache::ReadMapped(VAddr addr, u64 size) {
 // bbport: deferred raycaster copies (see landing_gate.h). The guest part of the copy is made at
 // the dispatch; the GPU-written bytes of the source land in the destination on a worker thread
 // once the GPU work that wrote them has completed, in registration order.
+namespace {
+/// g2-arm64 (port 0196, 2026-11-17): GPU data that reaches guest memory late is copied when the
+/// GPU wrote it and written into guest memory when that work is done, milliseconds later: the
+/// late copies beside a guest write (ReadMemoryAsync, DeliverSmallGpuDataLater: up to 64 bytes,
+/// often the last bytes of a page) and the landings of DeferGuestCopy (the raycaster records; the
+/// small compute results of BB_READBACK_SMALL_BUFFERS). Meanwhile the guest may write the same
+/// bytes - the page is its own again, the memory went to something else - and a late copy put
+/// the GPU's older words over the guest's newer ones. On U3's roofs (chapter 2) that broke a
+/// compute indirect buffer (on3-N14: a float 1.0 150 words in, the queues hung) and buffer
+/// descriptors (on3-O16, on3-N15: assertions), about one 90 s run in thirteen, in 0.3.4's code
+/// too; the diagnostic builds caught late copies about to land on a new quaternion, a transform,
+/// zeroed memory, a structure of pointers and a table of (count, pointer) pairs, one copy in a
+/// few thousand. So a late copy lands only on the words the guest has not changed since the copy
+/// was made, by a compare-and-swap each (Core::MemoryManager::LandBacking): the guest's newer
+/// words stay. Words a copy still pending covers too (the port's own earlier copy may land on
+/// them first: the raycaster records land several to a slot in flight) take the newest copy's
+/// bytes, as before. BB_LATE_GPU_GUARD=0: the late copies land on every word, as before;
+/// BB_LANDING_GUARD=1: the landings are guarded too (by default they are only watched: no
+/// landing was seen over the guest's own newer bytes). The conflicts are said either way.
+bool LateGpuGuard() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_LATE_GPU_GUARD");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+bool LandingGuard() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_LANDING_GUARD");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+/// The copies made and not landed yet, by target range.
+struct PendingCopies {
+    struct Range {
+        VAddr start, end;
+        u64 id;
+    };
+    std::mutex mutex;
+    std::vector<Range> ranges;
+    u64 next_id = 1;
+};
+PendingCopies& Pending() {
+    static PendingCopies pending;
+    return pending;
+}
+/// Registers a copy's target and marks in `force` (one byte per 4-byte word from `start`) the words
+/// a copy still pending covers too; the id goes to LandedCopy.
+u64 RegisterCopy(VAddr start, u64 size, std::vector<u8>& force) {
+    auto& pending = Pending();
+    std::scoped_lock lk{pending.mutex};
+    force.assign((size + 3) / 4, 0);
+    for (const auto& range : pending.ranges) {
+        if (range.start >= start + size || range.end <= start) {
+            continue;
+        }
+        const VAddr from = std::max(range.start, start);
+        const VAddr to = std::min(range.end, start + size);
+        for (u64 w = (from - start) / 4; w < (to - start + 3) / 4; ++w) {
+            force[w] = 1;
+        }
+    }
+    const u64 id = pending.next_id++;
+    pending.ranges.push_back({start, start + size, id});
+    return id;
+}
+void LandedCopy(u64 id) {
+    auto& pending = Pending();
+    std::scoped_lock lk{pending.mutex};
+    for (auto it = pending.ranges.begin(); it != pending.ranges.end(); ++it) {
+        if (it->id == id) {
+            pending.ranges.erase(it);
+            return;
+        }
+    }
+}
+
+std::atomic<u64> late_gpu_landings{0};
+std::atomic<u64> late_gpu_conflicts{0};
+
+/// The first sixteen landings that met the guest's newer bytes said (up to sixteen words from the
+/// first: the guest's when the copy was made, the guest's at the landing, the GPU's), then the
+/// count at each power of two.
+void NoteConflict(const char* what, bool guarded, VAddr address, u64 size, const u8* before,
+                  const u8* now, const u8* gpu, u64 first) {
+    const u64 n = late_gpu_conflicts.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 all = late_gpu_landings.load(std::memory_order_relaxed);
+    if (n > 16) {
+        if ((n & (n - 1)) == 0) {
+            std::printf("Late GPU data: %llu of %llu late landings met the guest's newer bytes so far\n",
+                        static_cast<unsigned long long>(n), static_cast<unsigned long long>(all));
+        }
+        return;
+    }
+    const u64 from = (first / 4 > 2 ? first / 4 - 2 : 0) * 4;
+    const u64 to = std::min<u64>(size, from + 64);
+    std::printf("Late GPU data: %s, %llu bytes at %#llx: the guest wrote them since the copy, from "
+                "byte %llu (%s; %llu of %llu late landings so far)\n",
+                what, static_cast<unsigned long long>(size), static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(first),
+                guarded ? "the guest's words kept" : "written over", static_cast<unsigned long long>(n),
+                static_cast<unsigned long long>(all));
+    const auto words = [from, to](const char* label, const u8* bytes) {
+        std::printf("Late GPU data:   %-6s +%llu:", label, static_cast<unsigned long long>(from));
+        for (u64 i = from; i + 4 <= to; i += 4) {
+            u32 word;
+            std::memcpy(&word, bytes + i, 4);
+            std::printf(" %08x", word);
+        }
+        std::printf("\n");
+    };
+    words("before", before);
+    words("now", now);
+    words("gpu", gpu);
+}
+
+/// Lands `size` GPU bytes at `target`. `before`: the guest's bytes when the copy was made (null:
+/// unknown: everything lands); `force`: the words a pending copy covered too (they take the GPU's
+/// bytes whatever they hold). A word the guest changed since - neither its byte then nor the
+/// GPU's - is a conflict: kept when `guard`, written over otherwise.
+void LandGpuBytes(Core::MemoryManager* memory, const char* what, bool guard, VAddr target,
+                  const u8* before, const std::vector<u8>& force, const u8* gpu, u64 size) {
+    late_gpu_landings.fetch_add(1, std::memory_order_relaxed);
+    auto* address = reinterpret_cast<void*>(target);
+    std::vector<u8> now(size);
+    if (!before || !memory->TryReadBacking(address, now.data(), size)) {
+        // Through the backing memory: no write fault on a page the caches track.
+        memory->TryWriteBacking(address, gpu, size);
+        return;
+    }
+    std::vector<u8> expected(before, before + size);
+    u64 first = size;
+    for (u64 i = 0; i < size; ++i) {
+        const u64 w = i / 4;
+        if (w < force.size() && force[w]) {
+            expected[i] = now[i];
+        } else if (now[i] != before[i] && now[i] != gpu[i] && first == size) {
+            first = i;
+        }
+    }
+    const bool conflict = first < size;
+    if (conflict) {
+        NoteConflict(what, guard, target, size, before, now.data(), gpu, first);
+        if (!guard) {
+            memory->TryWriteBacking(address, gpu, size);
+            return;
+        }
+    }
+    // Without a conflict the bytes there now take the GPU's (a word the guest changes in the
+    // meantime still stays its own); with one, the guest's newer words stay.
+    if (memory->LandBacking(address, conflict ? expected.data() : now.data(), gpu, size) < 0) {
+        memory->TryWriteBacking(address, gpu, size); // part without backing: as before
+    }
+}
+} // namespace
+
 struct BufferCache::Landing {
     u64 seq{};
     u64 tick{};
@@ -477,6 +635,12 @@ struct BufferCache::Landing {
     bool ring{};      ///< g2-arm64: the bytes wait in landing_ring (dstOffset: in the ring)
     u64 ring_end{};   ///< the ring's head after this landing's bytes
     u64 bytes{};
+    /// g2-arm64 (0196): the guest's bytes at the targets when the copy was made, in copy
+    /// order (empty when they could not be read); per copy, the words a pending copy
+    /// covers too, and its id among the pending copies (LandGpuBytes, RegisterCopy).
+    std::vector<u8> before;
+    std::vector<std::vector<u8>> force;
+    std::vector<u64> pending_ids;
     std::chrono::steady_clock::time_point registered;
 };
 
@@ -524,6 +688,15 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part
     });
     if (landing->copies.empty() || total > SideQueue::StagingSize) {
         return false;
+    }
+    // g2-arm64 (0196): the guest's bytes where the GPU's will land, as they are now.
+    landing->before.resize(landing->bytes);
+    for (size_t i = 0, at = 0; i < landing->copies.size(); at += landing->copies[i].size, ++i) {
+        if (!memory->TryReadBacking(reinterpret_cast<const void*>(landing->targets[i]),
+                                    landing->before.data() + at, landing->copies[i].size)) {
+            landing->before.clear();
+            break;
+        }
     }
     u64 tick = memory_tracker->LatestGpuWriteTick(src, size);
     if (tick == 0) {
@@ -643,6 +816,12 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part
         } else {
             landing->seq = landing_registered_seq; // no label waits for it
         }
+        // g2-arm64 (0196): the targets are pending until this lands.
+        landing->force.resize(landing->copies.size());
+        for (size_t i = 0; i < landing->copies.size(); ++i) {
+            landing->pending_ids.push_back(RegisterCopy(
+                landing->targets[i], landing->copies[i].size, landing->force[i]));
+        }
         landing_queue.push_back(std::move(landing));
         if (!landing_thread.joinable()) {
             landing_thread = std::thread([this] { LandingWorker(); });
@@ -702,11 +881,16 @@ bool BufferCache::ExecuteLanding(Landing& landing) {
         if (!WaitLandingTick(landing.tick)) {
             return false;
         }
-        for (size_t i = 0; i < landing.copies.size(); ++i) {
+        for (size_t i = 0, at = 0; i < landing.copies.size(); at += landing.copies[i].size, ++i) {
             const auto& copy = landing.copies[i];
             landing_ring->Invalidate(copy.dstOffset, copy.size);
-            memory->TryWriteBacking(reinterpret_cast<void*>(landing.targets[i]),
-                                    landing_ring->mapped_data.data() + copy.dstOffset, copy.size);
+            LandGpuBytes(memory, "a landing", LandingGuard(), landing.targets[i],
+                         landing.before.empty() ? nullptr : landing.before.data() + at,
+                         i < landing.force.size() ? landing.force[i] : std::vector<u8>{},
+                         landing_ring->mapped_data.data() + copy.dstOffset, copy.size);
+        }
+        for (const u64 id : landing.pending_ids) {
+            LandedCopy(id);
         }
         return true;
     }
@@ -767,10 +951,15 @@ bool BufferCache::ExecuteLanding(Landing& landing) {
         }
         Vulkan::Check(side.device.resetFences(*side.fence));
         side.staging.Invalidate(0, total);
-        for (size_t i = 0; i < landing.copies.size(); ++i) {
-            memory->TryWriteBacking(reinterpret_cast<void*>(landing.targets[i]),
-                                    side.staging.mapped_data.data() + landing.copies[i].dstOffset,
-                                    landing.copies[i].size);
+        for (size_t i = 0, at = 0; i < landing.copies.size(); at += landing.copies[i].size, ++i) {
+            LandGpuBytes(memory, "a landing", LandingGuard(), landing.targets[i],
+                         landing.before.empty() ? nullptr : landing.before.data() + at,
+                         i < landing.force.size() ? landing.force[i] : std::vector<u8>{},
+                         side.staging.mapped_data.data() + landing.copies[i].dstOffset,
+                         landing.copies[i].size);
+        }
+        for (const u64 id : landing.pending_ids) {
+            LandedCopy(id);
         }
     }
     return true;
@@ -1324,14 +1513,22 @@ bool BufferCache::ReadMemoryAsync(VAddr device_addr, u32 size) {
     };
     runtime.CopyBuffer(arena, async_readback.get(), std::span{&copy, 1});
     async_slot_busy[slot].store(true, std::memory_order_relaxed);
-    scheduler.DeferPriorityOperation([this, slot, device_addr, size] {
-        const u64 offset = u64{slot} * SlotSize;
-        async_readback->Invalidate(offset, size);
-        // Through the backing memory: no write fault on a page the caches track.
-        memory->TryWriteBacking(reinterpret_cast<void*>(device_addr),
-                                async_readback->mapped_data.data() + offset, size);
-        async_slot_busy[slot].store(false, std::memory_order_release);
-    });
+    // g2-arm64 (0196): the guest's bytes there now; the GPU's land only where they stay so.
+    std::array<u8, SlotSize> before{};
+    const bool have_before =
+        memory->TryReadBacking(reinterpret_cast<const void*>(device_addr), before.data(), size);
+    std::vector<u8> force;
+    const u64 pending_id = RegisterCopy(device_addr, size, force);
+    scheduler.DeferPriorityOperation(
+        [this, slot, device_addr, size, before, have_before, force, pending_id] {
+            const u64 offset = u64{slot} * SlotSize;
+            async_readback->Invalidate(offset, size);
+            LandGpuBytes(memory, "a late copy", LateGpuGuard(), device_addr,
+                         have_before ? before.data() : nullptr, force,
+                         async_readback->mapped_data.data() + offset, size);
+            LandedCopy(pending_id);
+            async_slot_busy[slot].store(false, std::memory_order_release);
+        });
     return true;
 }
 

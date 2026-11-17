@@ -2219,6 +2219,42 @@ bool AscPacketNeedsDrain(PM4ItOpcode opcode, const PM4Header* header) {
 }
 } // namespace
 
+namespace {
+/// g2-arm64: the compute queue's parser met a packet that does not fit what it was given. A
+/// valid stream cuts a packet only where the ring wraps, into two parts. U3 died in this path
+/// three times (2026-11-09 `tax-b-u3-B2`: 16 buffered words whose header said 2, a memcpy of
+/// 16 GiB; 2026-11-16 `rel035-u3` and `on-N1`: 0xffffffff buffered words, a memcpy to 16 GiB past
+/// the queue - queue 2 there, pipe 0 queue 1, whose part began with a valid IndirectBuffer
+/// packet). How the buffered state came about is not known: the ring and its indirect buffers
+/// shared it, a packet cut twice buffered its middle as a header, a merge was not bounded by the
+/// buffer. Each such place is bounded now; this says what was met, the first eight times.
+void NoteComputeStream(const char* what, const char* then, bool indirect, u32 vqid, VAddr base,
+                       size_t size_dw, size_t left_dw, u32 header, u32 buffered_dw,
+                       u32 buffered_header) {
+    static std::atomic<u32> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    std::printf("Compute queue %u: %s (%s %#llx of %zu words, %zu left, header %#x; %u words "
+                "buffered, their header %#x): %s\n",
+                vqid + 1, what, indirect ? "indirect buffer" : "ring part",
+                static_cast<unsigned long long>(base), size_dw, left_dw, header, buffered_dw,
+                buffered_header, then);
+}
+/// g2-arm64: the first eight packets cut by a ring part's end and buffered for the next part (a
+/// packet across the ring's wrap): whether a game's compute rings cut packets in normal play.
+void NoteComputeCut(u32 vqid, VAddr base, size_t size_dw, size_t left_dw, u32 header) {
+    static std::atomic<u32> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    std::printf("Compute queue %u: a packet cut by the part's end, buffered (ring part %#llx of "
+                "%zu words, %zu left, header %#x: %u words)\n",
+                vqid + 1, static_cast<unsigned long long>(base), size_dw, left_dw, header,
+                ((header >> 16) & 0x3fffu) + 2u);
+}
+} // namespace
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -2232,6 +2268,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
+    const size_t acb_dwords = acb.size();
+    // g2-arm64: a packet cut by the ring's end belongs to the ring: one left behind by a parse
+    // that went wrong is not the start of an indirect buffer's first packet.
+    if constexpr (is_indirect) {
+        if (queue.tmp_dwords > 0) [[unlikely]] {
+            NoteComputeStream("a cut packet was left from before", "those words dropped", true,
+                              vqid, base_addr, acb_dwords, acb.size(), acb.empty() ? 0 : acb[0],
+                              queue.tmp_dwords, queue.tmp_packet[0]);
+            queue.tmp_dwords = 0;
+        }
+    }
     while (!acb.empty()) {
         ProcessCommands();
 
@@ -2241,7 +2288,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         // If we have a buffered packet, use it.
         if (queue.tmp_dwords > 0) [[unlikely]] {
             header = reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
-            next_dw_off = header->type3.NumWords() + 1 - queue.tmp_dwords;
+            const u32 packet_dw = header->type3.NumWords() + 1;
+            // g2-arm64: only when the buffered words are the start of a packet that ends in
+            // this part and fits the buffer (see NoteComputeStream).
+            if (queue.tmp_dwords >= packet_dw || packet_dw > queue.tmp_packet.size() ||
+                packet_dw - queue.tmp_dwords > acb.size()) {
+                NoteComputeStream("the buffered start of a packet does not fit its header",
+                                  "those words dropped, this part parsed from its start",
+                                  is_indirect, vqid, base_addr, acb_dwords, acb.size(), acb[0],
+                                  queue.tmp_dwords, queue.tmp_packet[0]);
+                queue.tmp_dwords = 0;
+                continue;
+            }
+            next_dw_off = packet_dw - queue.tmp_dwords;
             std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
                         next_dw_off * sizeof(u32));
             queue.tmp_dwords = 0;
@@ -2249,8 +2308,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         // If the packet is split across ring boundary, buffer until next submission
         if (next_dw_off > acb.size()) [[unlikely]] {
-            std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
-            queue.tmp_dwords = acb.size();
+            // g2-arm64: an indirect buffer has no next submission, and the buffer is 1024 words.
+            if (is_indirect || next_dw_off > queue.tmp_packet.size()) {
+                NoteComputeStream(is_indirect ? "an indirect buffer ends inside a packet"
+                                              : "a cut packet is longer than the queue's buffer",
+                                  "the rest of this part dropped", is_indirect, vqid, base_addr,
+                                  acb_dwords, acb.size(), acb[0], 0, 0);
+            } else {
+                std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
+                queue.tmp_dwords = acb.size();
+                NoteComputeCut(vqid, base_addr, acb_dwords, acb.size(), acb[0]);
+            }
             if constexpr (!is_indirect) {
                 *queue.read_addr += acb.size();
                 *queue.read_addr %= queue.ring_size_dw;
@@ -2613,6 +2681,15 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     ++num_submits;
     work_retired = false;
     submit_cv.notify_one();
+}
+
+size_t Liverpool::PendingAscSubmits(u32 gnm_vqid) {
+    if (gnm_vqid == 0 || gnm_vqid >= NumTotalQueues) {
+        return 0;
+    }
+    auto& queue = mapped_queues[gnm_vqid];
+    std::scoped_lock lock{queue.m_access};
+    return queue.submits.size();
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {

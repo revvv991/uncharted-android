@@ -4,7 +4,7 @@ Uncharted: The Nathan Drake Collection (PS4) on Android handhelds with Snapdrago
 A fork of [uncharted_pc](https://github.com/Supermedo/uncharted_pc) by SuperMedo, the native port
 of the PS4 game, rebuilt for ARM64 Android.
 
-> **Beta (version 0.3.4): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
+> **Beta (version 0.3.5): the three games are playable; expect bugs.** Tested on the Retroid Pocket G2 and a Nothing Phone 3 (Adreno 825).
 > **No game files are included.** You need your own decrypted dump of the collection.
 > This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
 
@@ -78,7 +78,7 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 
 ## Using the app
 
-1. Install the APK (`uncharted-android-0.3.4.apk` from
+1. Install the APK (`uncharted-android-0.3.5.apk` from
    [Releases](https://github.com/revvv991/uncharted-android/releases)) and open it. Allow access to
    all files when the launcher asks: the loader reads the dump from its folder by path.
 2. **Choose folder**: the folder of your decrypted collection - with `eboot.bin` (Uncharted 1),
@@ -137,10 +137,13 @@ as assets; they hold no bytes of the game. The steps one by one are the scripts 
 In the game, L3+R3 opens the port's menu. The first time a place is shown its shaders are compiled
 (stutters). The saves live in the app's folder, which Android deletes with the app: **Back up
 saves** copies them to `Documents/uncharted-android`, **Restore saves** brings them back. For a bug
-report, **Copy the log** puts the game's log (`bb-probe.log`) into the same folder, since other
-apps cannot read the app's own folder on recent Android. When the game stops (no new frame for 10
-seconds with the app in front), the log gets a report of where it waits: leave the game open that
-long before closing it.
+report, **Copy the log** puts the game's log into the same folder, since other apps cannot read
+the app's own folder on recent Android. The copy holds the last three runs (the collection's menu
+and the game it starts are two), so a crash's log is still in it after the game was started
+again. When a run ended with a stop of the port's own or a crash, the launcher's bottom line says
+so, with the reason, the next time it opens. When the game stops (no new frame for 10 seconds with
+the app in front), the log gets a report of where it waits: leave the game open that long before
+closing it.
 
 ## Authors
 

@@ -4,6 +4,12 @@
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -76,6 +82,29 @@ static bool send_init_packet{true}; // initialize HW state before first game's s
 static s32 sdk_version{0};
 
 static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
+
+// g2-arm64 (port 0195): U3 died twice on 2026-11-16 (and once on 2026-11-09) in the compute
+// queue's parser with a state no valid stream makes (liverpool.cpp, NoteComputeStream). Looking
+// for its cause: a queue mapped again at the index of an unmapped one kept that index's doorbell
+// offset, so the new ring's first doorbell submitted it from the old ring's offset (the wrap
+// path: stale or unwritten memory to the ring's end, or the new packets before that offset
+// skipped); and an unmap did not wait for the queue's submissions still in the GPU thread, whose
+// parser kept writing that index's state. U3 maps twelve queues (seven at its start, five at a
+// level's load) and unmaps none, so that was not its cause - but a bug all the same. Now the
+// offset starts at 0 with the ring (BB_ASC_KEEP_OFFSET=1: the old way), the unmap waits up to
+// 500 ms for the queue's work, and the maps, unmaps and odd doorbells go to the log (the first
+// 32).
+static bool AscNoteAllowed() {
+    static std::atomic<u32> said{0};
+    return said.fetch_add(1, std::memory_order_relaxed) < 32;
+}
+static bool KeepAscOffset() {
+    static const bool keep = [] {
+        const char* v = std::getenv("BB_ASC_KEEP_OFFSET");
+        return v && v[0] == '1';
+    }();
+    return keep;
+}
 
 // This address is initialized in sceGnmGetTheTessellationFactorRingBufferBaseAddress
 static VAddr tessellation_factors_ring_addr = -1;
@@ -316,9 +345,29 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     auto vqid = gnm_vqid - 1;
+    // g2-arm64 (port 0195): a doorbell for a queue that is not mapped, or past its ring.
+    if (vqid >= Liverpool::NumComputeRings || !liverpool->asc_queues.is_allocated({vqid})) {
+        if (AscNoteAllowed()) {
+            std::printf("Compute queue %u: a doorbell (offset %u) for a queue that is not "
+                        "mapped: ignored\n",
+                        gnm_vqid, next_offs_dw);
+        }
+        return;
+    }
     auto& asc_queue = liverpool->asc_queues[{vqid}];
 
     auto& offs_dw = asc_next_offs_dw[vqid];
+
+    if (offs_dw > asc_queue.ring_size_dw || next_offs_dw > asc_queue.ring_size_dw) {
+        if (AscNoteAllowed()) {
+            std::printf("Compute queue %u: doorbell %u after %u, past its ring of %u words%s\n",
+                        gnm_vqid, next_offs_dw, offs_dw, asc_queue.ring_size_dw,
+                        offs_dw > asc_queue.ring_size_dw ? ": the old offset dropped" : "");
+        }
+        if (offs_dw > asc_queue.ring_size_dw) {
+            offs_dw = 0;
+        }
+    }
 
     if (next_offs_dw == offs_dw) {
         return;
@@ -1238,6 +1287,23 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
     const auto gnm_vqid = vqid.index + 1;
     LOG_INFO(Lib_GnmDriver, "ASC pipe {} queue {} mapped to vqueue {}", pipe_id, queue_id,
              gnm_vqid);
+    // g2-arm64 (port 0195): the new ring starts at its offset 0 (its read pointer is set to 0
+    // below); an earlier queue's offset at this index is not this ring's.
+    if (vqid.index < Liverpool::NumComputeRings) {
+        const u32 stale = asc_next_offs_dw[vqid.index];
+        if (!KeepAscOffset()) {
+            asc_next_offs_dw[vqid.index] = 0;
+        }
+        if (AscNoteAllowed()) {
+            std::printf("Compute queue %u mapped: pipe %u queue %u, a ring of %u words at %#llx%s",
+                        gnm_vqid, pipe_id, queue_id, ring_size_dw,
+                        static_cast<unsigned long long>(ring_base_addr),
+                        stale ? "; the index's earlier doorbell offset was " : "\n");
+            if (stale) {
+                std::printf("%u%s\n", stale, KeepAscOffset() ? ", kept" : ", now 0");
+            }
+        }
+    }
 
     const auto& queue = liverpool->asc_queues[vqid];
     *queue.read_addr = 0u;
@@ -2407,6 +2473,35 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
 }
 
 int PS4_SYSV_ABI sceGnmUnmapComputeQueue(u32 vqid) {
+    // g2-arm64 (port 0195): the queue's submissions still in the GPU thread are waited for (up
+    // to 500 ms), so its parser does not write the state of a queue mapped again at this index.
+    if (vqid == 0 || vqid > Liverpool::NumComputeRings ||
+        !liverpool->asc_queues.is_allocated(Common::SlotId{vqid - 1})) {
+        if (AscNoteAllowed()) {
+            std::printf("Compute queue %u: unmapped while not mapped: ignored\n", vqid);
+        }
+        return ORBIS_OK;
+    }
+    const size_t pending = liverpool->PendingAscSubmits(vqid);
+    size_t left = pending;
+    const auto start = std::chrono::steady_clock::now();
+    while (left && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        left = liverpool->PendingAscSubmits(vqid);
+    }
+    if (AscNoteAllowed()) {
+        std::printf("Compute queue %u unmapped: doorbell offset %u", vqid,
+                    asc_next_offs_dw[vqid - 1]);
+        if (pending) {
+            std::printf(", %zu submissions were not finished: %s after %lld ms", pending,
+                        left ? "still not" : "finished",
+                        static_cast<long long>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count()));
+        }
+        std::printf("\n");
+    }
     liverpool->asc_queues.erase(Common::SlotId{vqid - 1});
     return ORBIS_OK;
 }

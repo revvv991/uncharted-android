@@ -24,6 +24,10 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "bbport_focus_fix.h"
 
+namespace Shader::Gcn {
+u32 MovRelRange(u64 pgm_hash); // frontend/translate/vector_alu.cpp
+} // namespace Shader::Gcn
+
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // g2-arm64: 10 BB_CS_SPLIT; 11 constant windows per shader and sharps read through them (0047,
@@ -43,12 +47,16 @@ static constexpr u32 PipelineKeyVersion = 8u;
 /// LDS barriers get a new name, so their binaries cached before the fix are not found and only
 /// those shaders recompile.
 /// Shaders with a clamped loop bound (BB_EFFECT_LOOP_CLAMP) get their own names too.
+/// g2-arm64: and so do the shaders whose relative register moves are bounded (_mr<registers>;
+/// not 43b8ee5e, bounded before any cache was shipped).
 static std::string ShaderBinaryName(u64 pgm_hash, size_t perm_idx) {
     const char* clamp = !Shader::Optimization::EffectLoopClamp(pgm_hash) ? ""
                         : pgm_hash == 0x689d1af9                       ? "_lc2"
                                                                        : "_lc1";
-    return fmt::format("{:#018x}_{}{}{}", pgm_hash, perm_idx,
-                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "", clamp);
+    const u32 range = pgm_hash == 0x43b8ee5e ? 0 : Shader::Gcn::MovRelRange(pgm_hash);
+    return fmt::format("{:#018x}_{}{}{}{}", pgm_hash, perm_idx,
+                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "", clamp,
+                       range ? fmt::format("_mr{}", range) : std::string{});
 }
 } // namespace Serialization
 
@@ -271,8 +279,18 @@ void PipelineCache::StartWarmUp() {
         return;
     }
     // BB_WARM_MODE=0: no preload (the pipelines compile as the game needs them).
+    // g2-arm64: and nothing is stored. A session that has not read the store numbers its
+    // permutations from 0 again, and a permutation's record and SPIR-V are named by the program
+    // and that number: it wrote its own over the stored ones wherever it met a program's
+    // specializations in another order. The stored pipeline keys then pointed at other
+    // specializations than the ones they were made with (their vertex inputs are stored with
+    // them), and the same specialization sat under two numbers. Four such runs on the G2
+    // (2026-11-16) rewrote 896 records: 113 conflicts and 382 pipelines skipped at every start
+    // after them, 3,777 of 7,056 keys older than a record they named.
     if (const char* mode = std::getenv("BB_WARM_MODE"); mode && mode[0] == '0') {
         Storage::DataBase::Instance().FinishPreload();
+        Storage::DataBase::Instance().Close();
+        std::printf("Pipeline cache: no preload (BB_WARM_MODE=0), and nothing is stored\n");
         warm_done.store(true, std::memory_order_release);
         return;
     }

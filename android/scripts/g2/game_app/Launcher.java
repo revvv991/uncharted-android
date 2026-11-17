@@ -205,6 +205,8 @@ public class Launcher extends Activity {
     protected void onResume() {
         super.onResume();
         refresh(); // back from the system's "all files access" screen
+        String stop = lastStop();
+        if (stop != null) status(stop);
         // Back from "install unknown apps" with an update waiting for it.
         if (pendingInstall != null && getPackageManager().canRequestPackageInstalls()) installUpdate(pendingInstall);
     }
@@ -722,7 +724,7 @@ public class Launcher extends Activity {
         bar.setOrientation(LinearLayout.VERTICAL);
         bar.setPadding(dp(20), dp(4), dp(20), dp(14));
         statusText = note(bar, "");
-        statusText.setMaxLines(3);
+        statusText.setMaxLines(6); // the reason the last run stopped can be a few lines long
         playButton = primaryButton(bar, "Play", v -> play());
         barColumn.addView(bar);
         screen.addView(barColumn);
@@ -862,6 +864,7 @@ public class Launcher extends Activity {
             folderInfo.setText(problem);
         }
         boolean ready = problem == null && prepared();
+        boolean otherVersion = false;
         String presets = "";
         if (ready) {
             List<String> fit = new ArrayList<>(), not = new ArrayList<>();
@@ -869,14 +872,21 @@ public class Launcher extends Activity {
                 File out = g[2].isEmpty() ? files : new File(files, g[2]);
                 (recipeFits(g[3], new File(out, "boot-linked.bin")) ? fit : not).add(g[0].toUpperCase(Locale.ROOT));
             }
+            // Not 1.02 (issue #36: a dump without the update ran at 1920x1080, 11 FPS, and stalled
+            // in U1's job system - the recipes and the port's 1.02-only fixes were off, and
+            // "without patches" did not say so): what follows and where the update goes.
             presets = not.isEmpty() ? " The resolution recipes fit all three games."
-                    : " The resolution recipes fit " + (fit.isEmpty() ? "none of the games" : String.join(", ", fit))
-                      + " (another version of the executables): " + String.join(", ", not)
-                      + " run at 1920x1080 without patches.";
+                    : " " + String.join(", ", not) + (not.size() == 1 ? " is" : " are")
+                      + " not version 1.02 of the executable, the one this port is made for: 1920x1080 only,"
+                      + " and the port's fixes for the games are off there (a low frame rate and stalls are"
+                      + " likely). The game's update 1.02 goes next to the game folder as \""
+                      + new File(dir).getName() + "-UPDATE\"; then choose the folder again and press Prepare."
+                      + (fit.isEmpty() ? "" : " " + String.join(", ", fit) + ": 1.02, as needed.");
+            otherVersion = !not.isEmpty();
         }
         prepareInfo.setText(problem != null ? "" : ready ? "Ready to play." + presets
                                                       : "Not prepared yet: the app makes the loader's files from the game (a few seconds).");
-        prepareInfo.setTextColor(ready ? accent : muted);
+        prepareInfo.setTextColor(ready ? (otherVersion ? warnColor : accent) : muted);
         folderInfo.setTextColor(problem == null ? textColor : warnColor);
         prepareButton.setEnabled(problem == null && !busy);
         prepareButton.setVisibility(ready ? View.GONE : View.VISIBLE);
@@ -1681,17 +1691,58 @@ public class Launcher extends Activity {
         }
     }
 
-    /** files/bb-probe.log copied to backups() (other apps cannot read the app's folder on recent
-     *  Android); the copy's path, or null. */
+    /** The logs of the last three runs (files/bb-probe-2.log, bb-probe-1.log, bb-probe.log: the
+     *  oldest first, each under a line that names it) copied into one file in backups() (other
+     *  apps cannot read the app's folder on recent Android); the copy's path, or null. A run is one
+     *  process: the collection's menu and the game it started are two, so the run that crashed
+     *  is in the copy even when the game was started again after it (issue #39). */
     private String exportLog() {
-        File log = new File(files, "bb-probe.log");
-        if (!log.isFile()) return null;
+        if (!new File(files, "bb-probe.log").isFile()) return null;
         String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new java.util.Date());
         File to = new File(backups(), "bb-probe-" + stamp + ".log");
+        String[] names = {"bb-probe-2.log", "bb-probe-1.log", "bb-probe.log"};
+        String[] labels = {"two runs before the last", "the run before the last", "the last run"};
+        java.text.SimpleDateFormat time = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
         try {
             backups().mkdirs();
-            copyTree(log, to);
+            try (OutputStream o = new FileOutputStream(to)) {
+                for (int i = 0; i < names.length; ++i) {
+                    File log = new File(files, names[i]);
+                    if (!log.isFile()) continue;
+                    o.write(("==== " + labels[i] + " (" + names[i] + ", last written "
+                             + time.format(new java.util.Date(log.lastModified())) + ") ====\n")
+                                .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    try (InputStream in = new java.io.FileInputStream(log)) {
+                        byte[] buf = new byte[1 << 16];
+                        for (int n; (n = in.read(buf)) > 0;) o.write(buf, 0, n);
+                    }
+                    o.write('\n');
+                }
+            }
             return to.getAbsolutePath();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** Why the last run ended, when its log says so: the port's own stop (a line "STOP: ...", the
+     *  reason in words) or a crash; null after a run that ended by itself. Read from the end of
+     *  files/bb-probe.log. */
+    private String lastStop() {
+        File log = new File(files, "bb-probe.log");
+        if (!log.isFile()) return null;
+        try (java.io.RandomAccessFile f = new java.io.RandomAccessFile(log, "r")) {
+            long size = f.length();
+            byte[] tail = new byte[(int) Math.min(size, 256 * 1024)];
+            f.seek(size - tail.length);
+            f.readFully(tail);
+            String found = null;
+            for (String line : new String(tail, java.nio.charset.StandardCharsets.UTF_8).split("\n")) {
+                if (line.startsWith("STOP: ")) found = "The last run stopped: " + line.substring(6).trim();
+                else if (line.startsWith("Fault (signal"))
+                    found = "The last run crashed. \"Copy the log\" saves its log for a report.";
+            }
+            return found;
         } catch (IOException e) {
             return null;
         }

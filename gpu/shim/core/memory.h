@@ -21,6 +21,11 @@ public:
     bool IsHostMapped(VAddr virtual_addr, u64 size);
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     bool TryWriteBacking(void* address, const void* data, u64 size);
+    /// g2-arm64: guest bytes through the backing view, whatever the page's protection.
+    bool TryReadBacking(const void* address, void* data, u64 size);
+    /// g2-arm64 (0196): `data` lands only on the words still equal to `before` (a
+    /// compare-and-swap each); the bytes kept, or -1 when part had no backing.
+    s64 LandBacking(void* address, const void* before, const void* data, u64 size);
     /// CPU wrote guest memory outside page tracking (e.g. decoded video frames).
     void InvalidateMemory(VAddr address, u64 size);
     Vulkan::Rasterizer* GetRasterizer() const { return rasterizer; }
