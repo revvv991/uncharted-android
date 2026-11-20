@@ -147,6 +147,8 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     auto& cache = large_caches[u32(type)];
     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
 
+    // g2-arm64: under large_mutex (see the header); not while VMA makes a new buffer.
+    std::unique_lock lk{large_mutex};
     LargeBuffer* best{};
     for (LargeBuffer& entry : cache) {
         const u64 entry_size = entry.buffer->SizeBytes();
@@ -160,9 +162,12 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        lk.unlock();
+        auto buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
+                                                          type, "StagingBufferPool:Dedicated");
+        lk.lock();
         best = &cache.emplace_back(LargeBuffer{
-            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
-                                                          type, "StagingBufferPool:Dedicated"),
+            .buffer = std::move(buffer),
             .tick = 0,
             .last_used_frame = frame,
             .held = false,
@@ -197,6 +202,9 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 }
 
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
+    // g2-arm64: on the scheduler's priority-ops thread, while the front thread may grow or trim
+    // the vector.
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(ref.type)];
     const auto it = std::ranges::find_if(
         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
@@ -207,7 +215,10 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 }
 
 void StagingBufferPool::TickFrame() {
-    ++frame;
+    {
+        std::scoped_lock lk{large_mutex}; // g2-arm64: FreeDeferred reads frame
+        ++frame;
+    }
     // bbport: the device-local rings (detiling scratch) hold video memory: on a small card idle
     // blocks go after ~4 s instead of staying (up to 512 MiB) for 30 s.
     const bool tight = instance.GetTotalMemoryBudget() < 5_GB && !Vram::Legacy();
@@ -242,18 +253,28 @@ void StagingBufferPool::TrimRing(Ring& ring, bool eager) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache, bool eager) {
-    std::erase_if(cache, [this, eager](const LargeBuffer& entry) {
-        const bool idle = !entry.held &&
-                          frame - entry.last_used_frame >= (eager ? 240 : LARGE_IDLE_FRAMES) &&
-                          scheduler.IsFree(entry.tick);
-        if (idle && StagingLog()) {
+    // g2-arm64: the idle buffers leave the vector under large_mutex and are freed after it
+    // (vmaDestroyBuffer).
+    std::vector<LargeBuffer> idle_buffers;
+    std::unique_lock lk{large_mutex};
+    for (auto it = cache.begin(); it != cache.end();) {
+        const bool idle = !it->held &&
+                          frame - it->last_used_frame >= (eager ? 240 : LARGE_IDLE_FRAMES) &&
+                          scheduler.IsFree(it->tick);
+        if (!idle) {
+            ++it;
+            continue;
+        }
+        if (StagingLog()) {
             std::printf("Staging: %llu KiB buffer idle for %llu frames, freed at frame %llu\n",
-                        (unsigned long long)(entry.buffer->SizeBytes() >> 10),
-                        (unsigned long long)(frame - entry.last_used_frame),
+                        (unsigned long long)(it->buffer->SizeBytes() >> 10),
+                        (unsigned long long)(frame - it->last_used_frame),
                         (unsigned long long)frame);
         }
-        return idle;
-    });
+        idle_buffers.push_back(std::move(*it));
+        it = cache.erase(it);
+    }
+    lk.unlock();
 }
 
 void StagingBufferPool::PublishStats() const {
@@ -269,8 +290,11 @@ void StagingBufferPool::PublishStats() const {
         for (const Block& block : rings[i].blocks) {
             bytes += block.buffer->SizeBytes();
         }
-        for (const LargeBuffer& entry : large_caches[i]) {
-            bytes += entry.buffer->SizeBytes();
+        {
+            std::scoped_lock lk{large_mutex}; // g2-arm64
+            for (const LargeBuffer& entry : large_caches[i]) {
+                bytes += entry.buffer->SizeBytes();
+            }
         }
         if (bytes != 0) {
             group.rows.push_back({.name = names[i], .bytes = bytes});

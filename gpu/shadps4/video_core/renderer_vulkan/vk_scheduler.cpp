@@ -41,6 +41,7 @@ bool Scheduler::OnRecorderThread() {
 }
 
 extern void (*g_gpu_stall_report)();
+extern void (*g_gpu_stall_audit)(const char* reason); // g2-arm64 (BB_BDA_AUDIT, vk_semaphore.cpp)
 bool (*g_draw_pipe_busy)() = nullptr;
 // g2-arm64: the latest GPU checkpoint recorded (BB_GPU_CHECKPOINTS, vk_rasterizer.cpp).
 u64 (*g_checkpoint_seq)() = nullptr;
@@ -377,6 +378,9 @@ void Scheduler::WaitDeferredSignals() {
                         static_cast<unsigned long long>(
                             deferred_signals_done->load(std::memory_order_relaxed)),
                         static_cast<unsigned long long>(issued));
+            if (g_gpu_stall_audit) {
+                g_gpu_stall_audit("deferred signals stall");
+            }
         }
     }
 }

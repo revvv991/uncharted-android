@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -192,6 +194,9 @@ public:
 
     u64 Flush();
     void Finish();
+    /// bbport: BB_EARLY_SUBMIT=1: the frame's work goes to the GPU in parts while it is
+    /// recorded, so the GPU starts drawing before the frame is complete.
+    void MaybeSubmitEarly();
     void OnSubmit();
 
     PipelineCache& GetPipelineCache() {
@@ -616,6 +621,10 @@ private:
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
+    // g2-arm64: atomics - Flush() also runs on the recording thread (the mid-frame flush,
+    // BB_EARLY_SUBMIT_PIPE) while the command thread counts in MaybeSubmitEarly.
+    std::atomic<u32> draws_since_submit{0};
+    std::atomic<s64> last_submit{0}; ///< steady_clock ticks
 };
 
 } // namespace Vulkan

@@ -95,12 +95,14 @@ screen_awake() {
     return 1
 }
 
-# battery_ok: the charge is at least BATTERY_MIN percent (20) or the device is charging.
+# battery_ok: the charge is at least BATTERY_MIN percent (20), or a charger (AC) feeds the device.
+# The PC's USB does not count: the status says Charging, yet the game takes ~2 A out of the
+# battery (2026-11-18: 47% -> 9% over an A/B of eight runs).
 battery_ok() {
-    local cap status
+    local cap ac
     cap=$($ADB shell cat /sys/class/power_supply/battery/capacity | tr -d '\r')
-    status=$($ADB shell cat /sys/class/power_supply/battery/status | tr -d '\r')
-    [ "${cap:-0}" -ge "${BATTERY_MIN:-20}" ] || [ "$status" = Charging ]
+    ac=$($ADB shell dumpsys battery | grep -c 'AC powered: true')
+    [ "${cap:-0}" -ge "${BATTERY_MIN:-20}" ] || [ "${ac:-0}" -ge 1 ]
 }
 
 # device_here: adb still answers (after a reset or a dropped link every later adb call comes back

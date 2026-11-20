@@ -40,10 +40,12 @@
 #include <dlfcn.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <unordered_map>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -64,6 +66,11 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+namespace VideoCore {
+/// g2-arm64 (BB_SKIN_GUARD): the span of the device addresses handed out (buffer.cpp).
+std::pair<u64, u64> BdaRange();
+} // namespace VideoCore
 
 namespace Vulkan {
 
@@ -206,8 +213,92 @@ struct SkinPush {
     u64 jobs;
     u64 groups;
     u32 num_groups;
-    u32 pad;
+    u32 num_jobs; ///< g2-arm64 (BB_SKIN_GUARD): the jobs in the table
+    u64 low;      ///< the device addresses handed out: [low, high)
+    u64 high;
+    u64 report;   ///< the guard's report (SkinGuardReport), 0 without the guard
+    u32 batch;    ///< the batch's number, for the report
+    u32 check;    ///< g2-arm64 (BB_SKIN_GUARD): SkinPushChecksum of the fields above
 };
+static_assert(sizeof(SkinPush) == 56);
+
+/// g2-arm64 (BB_SKIN_GUARD): FNV-1a over the 32-bit words of the fields before `check`, as the
+/// shaders compute it (PushChecksum). memc-u1-1 (2026-11-19) had a dispatch whose num_jobs was
+/// garbage: a dispatch whose constants arrive changed is caught here or in the shader.
+u32 SkinPushChecksum(const SkinPush& p) {
+    const u32 words[] = {
+        static_cast<u32>(p.jobs),   static_cast<u32>(p.jobs >> 32),
+        static_cast<u32>(p.groups), static_cast<u32>(p.groups >> 32),
+        p.num_groups,               p.num_jobs,
+        static_cast<u32>(p.low),    static_cast<u32>(p.low >> 32),
+        static_cast<u32>(p.high),   static_cast<u32>(p.high >> 32),
+        static_cast<u32>(p.report), static_cast<u32>(p.report >> 32),
+        p.batch,
+    };
+    u32 h = 0x811C9DC5u;
+    for (const u32 w : words) {
+        h = (h ^ w) * 0x01000193u;
+    }
+    return h;
+}
+
+/// g2-arm64 (BB_SKIN_GUARD=1): the shaders' PushReport, 64 bytes into the guard's buffer: the
+/// first mismatching workgroup's view of the constants, word by word in SkinPush's layout.
+struct SkinPushReport {
+    u32 count;
+    u32 check_computed;
+    u32 words[14];
+};
+static_assert(sizeof(SkinPushReport) == 64);
+static_assert(sizeof(SkinPush) == sizeof(SkinPushReport::words));
+constexpr u64 SkinPushReportOffset = 64;
+
+/// g2-arm64 diagnosis BB_SKIN_PUSH_TEST=N (with BB_SKIN_GUARD=1): every Nth batch's dispatch gets
+/// a wrong checksum, alternately in the recording chunk (the recording thread's check skips it)
+/// and only in what is pushed (the shaders' check skips it), so both reports are seen working.
+u32 SkinPushTestEvery() {
+    static const u32 every = [] {
+        const char* env = std::getenv("BB_SKIN_PUSH_TEST");
+        return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    return every;
+}
+
+/// g2-arm64 diagnosis BB_SKIN_JOB_TEST=N (with the guard): every Nth batch's first job reaches the
+/// shaders with buffer 1 at an address of the storms (0x960697069700, memc-u1-2), in the stream's
+/// copy only, so the job check and its report are seen working.
+u32 SkinJobTestEvery() {
+    static const u32 every = [] {
+        const char* env = std::getenv("BB_SKIN_JOB_TEST");
+        return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    return every;
+}
+
+/// g2-arm64 (BB_SKIN_GUARD=1): a recorded skin dispatch whose constants changed in the recording
+/// chunk before the recording thread ran it; it is skipped.
+void NoteRecordedPushChanged(const SkinPush& p) {
+    static std::atomic<u32> count{0};
+    const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 10) {
+        std::printf("Skin guard: a recorded skin dispatch's constants changed before the recording "
+                    "thread ran it (%u so far): batch %u, %u groups, %u jobs, tables 0x%llx "
+                    "0x%llx, checksum 0x%08x, now 0x%08x - skipped\n",
+                    n, p.batch, p.num_groups, p.num_jobs, static_cast<unsigned long long>(p.jobs),
+                    static_cast<unsigned long long>(p.groups), p.check, SkinPushChecksum(p));
+        std::fflush(stdout);
+    }
+}
+
+/// g2-arm64 (BB_SKIN_GUARD=1): the shaders' GuardReport.
+struct SkinGuardReport {
+    u32 count;
+    u32 batch;
+    u32 job;
+    u32 slot;
+    u64 address;
+};
+static_assert(sizeof(SkinGuardReport) == 24);
 
 /// Sorted, disjoint [begin, end) ranges of guest memory; touching ones are merged.
 class RangeSet {
@@ -267,6 +358,47 @@ bool SkinBatchWanted() {
     return wanted;
 }
 
+/// g2-arm64 BB_SKIN_GUARD, on by default since port 0205 (=0 off). The GPU page-fault storms
+/// (2026-11-07 to 11-18: up to ~300 k reads at garbage addresses that look like half-float vertex
+/// data, U1 and U2 only, where this batch is the default; one reset the G2) and memc-u1-1
+/// (2026-11-19), where this guard caught a dispatch whose push constants were garbage. The
+/// shaders check the constants' checksum first (port 0204), then each job's index, skip what
+/// fails and note the first; the log names the batch and says whether its tables' bytes in the
+/// stream buffer are still the ones written. A skipped dispatch costs one frame of those
+/// vertices; a garbage one cost a storm. BB_SKIN_GUARD=2 also checks each job's buffer addresses
+/// against the device addresses handed out (port 0207): about 0.4 FPS in U1 (2026-11-20), and it never
+/// fired outside its test, while the index check caught memc-u1-1's garbage.
+u32 SkinGuardLevel() {
+    static const u32 level = [] {
+        const char* env = std::getenv("BB_SKIN_GUARD");
+        if (env && env[0] == '0') {
+            return 0u;
+        }
+        return env && env[0] == '2' ? 2u : 1u;
+    }();
+    return level;
+}
+
+bool SkinGuardWanted() {
+    return SkinGuardLevel() != 0;
+}
+
+/// A quick hash of a table's bytes (the guard's comparison).
+u64 TableHash(const void* data, size_t bytes) {
+    u64 h = 0xcbf29ce484222325ull;
+    const auto* p = static_cast<const u8*>(data);
+    size_t i = 0;
+    for (; i + 8 <= bytes; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+    }
+    for (; i < bytes; ++i) {
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    }
+    return h;
+}
+
 /// BB_SKIN_BATCH_MV=0: U2's 7d7e7206 dispatches one by one again (with BB_SKIN_BATCH=1).
 bool MvBatchWanted() {
     static const bool wanted = [] {
@@ -323,7 +455,8 @@ struct SkinPipeline {
     vk::UniquePipeline pipeline;
 };
 
-SkinPipeline CreateSkinPipeline(const Instance& instance, std::span<const u32> code) {
+SkinPipeline CreateSkinPipeline(const Instance& instance, std::span<const u32> code,
+                                u64 report) {
     const auto device = instance.GetDevice();
     SkinPipeline p;
     const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -334,11 +467,28 @@ SkinPipeline CreateSkinPipeline(const Instance& instance, std::span<const u32> c
         .pPushConstantRanges = &range,
     }));
     const auto module = CompileSPV(code, device);
+    // g2-arm64 (BB_SKIN_GUARD): the report buffer's address as constants 0 and 1, so a dispatch
+    // with garbage push constants still reports to the right place (0: no guard); constant 2: the
+    // job's buffer addresses checked too (level 2).
+    const std::array<u32, 3> spec_data{static_cast<u32>(report), static_cast<u32>(report >> 32),
+                                       report && SkinGuardLevel() >= 2 ? 1u : 0u};
+    const std::array<vk::SpecializationMapEntry, 3> spec_entries{{
+        {.constantID = 0, .offset = 0, .size = sizeof(u32)},
+        {.constantID = 1, .offset = sizeof(u32), .size = sizeof(u32)},
+        {.constantID = 2, .offset = 2 * sizeof(u32), .size = sizeof(u32)},
+    }};
+    const vk::SpecializationInfo spec_info{
+        .mapEntryCount = static_cast<u32>(spec_entries.size()),
+        .pMapEntries = spec_entries.data(),
+        .dataSize = sizeof(spec_data),
+        .pData = spec_data.data(),
+    };
     p.pipeline = Check(device.createComputePipelineUnique(
         {}, vk::ComputePipelineCreateInfo{
                 .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
                           .module = module,
-                          .pName = "main"},
+                          .pName = "main",
+                          .pSpecializationInfo = &spec_info},
                 .layout = *p.layout,
             }));
     device.destroyShaderModule(module);
@@ -366,6 +516,23 @@ struct Rasterizer::SkinBatch {
     std::array<u64, NumFlush> flushes{};
     std::unordered_map<u64, u64> causes; ///< packets that ended batches
     std::chrono::steady_clock::time_point window{};
+
+    /// g2-arm64 (BB_SKIN_GUARD=1): the report the shaders write and the recent batches' tables.
+    std::unique_ptr<VideoCore::Buffer> guard;
+    u32 guard_seen = 0;  ///< skipped workgroups already logged
+    u32 guard_lines = 0;
+    u32 push_seen = 0;   ///< workgroups with changed constants already logged
+    u32 push_lines = 0;
+    u32 number = 0;      ///< batches recorded (a kind and variant each)
+    struct Recent {
+        u32 number;
+        u64 tick;
+        u64 jobs_offset, groups_offset;
+        u32 jobs, groups;
+        u64 jobs_hash, groups_hash;
+        SkinPush push; ///< g2-arm64 (BB_SKIN_GUARD): the constants as pushed
+    };
+    std::array<Recent, 512> recent{};
 };
 
 void Rasterizer::InitSkinBatch() {
@@ -374,6 +541,26 @@ void Rasterizer::InitSkinBatch() {
     }
     skin_batch = std::make_shared<SkinBatch>();
     skin_batch->window = std::chrono::steady_clock::now();
+    if (SkinGuardWanted()) {
+        skin_batch->guard = std::make_unique<VideoCore::Buffer>(
+            instance, 0, 256, VideoCore::MemoryType::HostCached, "bbport skin guard");
+        std::memset(skin_batch->guard->mapped_data.data(), 0, 256);
+        std::printf("Skin guard: on - the constants' checksum and each job's index%s checked on "
+                    "the GPU\n",
+                    SkinGuardLevel() >= 2 ? " and buffer addresses" : "");
+        if (const u32 every = SkinPushTestEvery()) {
+            std::printf("Skin guard: a wrong checksum every %u batches, alternately for the "
+                        "recording thread and for the shaders (BB_SKIN_PUSH_TEST)\n",
+                        every);
+        }
+        if (const u32 every = SkinJobTestEvery(); every && SkinGuardLevel() >= 2) {
+            std::printf("Skin guard: every %u batches the first job's buffer 1 goes to the GPU at "
+                        "0x960697069700 (BB_SKIN_JOB_TEST)\n",
+                        every);
+        } else if (every) {
+            std::printf("Skin guard: BB_SKIN_JOB_TEST needs BB_SKIN_GUARD=2, off\n");
+        }
+    }
     draw_pipe->SetIdleHandler(&FlushSkinBatchIdle);
     std::printf("Skin batch: dispatches of cs %08x%s%s run in batches%s\n", Kinds[0].hash,
                 MvBatchWanted() ? ", cs 7d7e7206" : "", U3BatchWanted() ? ", cs 0c936dd6" : "",
@@ -640,6 +827,87 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
         return;
     }
     auto& batch = *skin_batch;
+    // g2-arm64 (BB_SKIN_GUARD=1): a job the shaders skipped since the last look.
+    if (batch.guard) {
+        batch.guard->Invalidate(0, SkinPushReportOffset + sizeof(SkinPushReport));
+        SkinGuardReport report;
+        std::memcpy(&report, batch.guard->mapped_data.data(), sizeof(report));
+        if (report.count != batch.guard_seen && batch.guard_lines < 40) {
+            ++batch.guard_lines;
+            const auto& r = batch.recent[report.batch % batch.recent.size()];
+            auto& stream = buffer_cache.GetStreamBuffer();
+            const char* jobs_now = "?";
+            const char* groups_now = "?";
+            u64 now[4]{};
+            const bool known = r.number == report.batch && !stream.mapped_data.empty();
+            if (known) {
+                const u8* base = stream.mapped_data.data();
+                jobs_now = TableHash(base + r.jobs_offset, r.jobs * sizeof(SkinJob)) == r.jobs_hash
+                               ? "as written"
+                               : "CHANGED";
+                groups_now =
+                    TableHash(base + r.groups_offset, r.groups * sizeof(u32)) == r.groups_hash
+                        ? "as written"
+                        : "CHANGED";
+                if (report.job < r.jobs) {
+                    std::memcpy(now, base + r.jobs_offset + u64(report.job) * sizeof(SkinJob),
+                                sizeof(now));
+                }
+            }
+            std::printf("Skin guard: %u workgroups skipped their job since the last line (the "
+                        "first: batch %u, job %u, %s %u at 0x%llx); the batch %s: tick %llu "
+                        "(%s), %u jobs at stream +0x%llx %s, %u groups at +0x%llx %s; that job's "
+                        "first addresses in the stream now 0x%llx 0x%llx 0x%llx 0x%llx\n",
+                        report.count - batch.guard_seen, report.batch, report.job,
+                        report.slot < 12 ? "buffer" : "index", report.slot,
+                        static_cast<unsigned long long>(report.address),
+                        known ? "recorded" : "no longer kept",
+                        static_cast<unsigned long long>(r.tick),
+                        known && scheduler.IsFree(r.tick) ? "done" : "pending", r.jobs,
+                        static_cast<unsigned long long>(r.jobs_offset), jobs_now, r.groups,
+                        static_cast<unsigned long long>(r.groups_offset), groups_now,
+                        static_cast<unsigned long long>(now[0]),
+                        static_cast<unsigned long long>(now[1]),
+                        static_cast<unsigned long long>(now[2]),
+                        static_cast<unsigned long long>(now[3]));
+            std::fflush(stdout);
+        }
+        batch.guard_seen = report.count;
+        // g2-arm64 (BB_SKIN_GUARD=1): dispatches whose constants failed their checksum.
+        SkinPushReport push_report;
+        std::memcpy(&push_report, batch.guard->mapped_data.data() + SkinPushReportOffset,
+                    sizeof(push_report));
+        if (push_report.count != batch.push_seen && batch.push_lines < 40) {
+            ++batch.push_lines;
+            // The words the first one saw and, when its word 12 (the batch's number) still names a
+            // batch kept here, the words that batch pushed and a mask of those that differ.
+            const u32 seen_batch = push_report.words[12];
+            const auto& r = batch.recent[seen_batch % batch.recent.size()];
+            const bool known = r.number == seen_batch && r.push.batch == seen_batch;
+            u32 pushed[14]{};
+            std::memcpy(pushed, &r.push, sizeof(pushed));
+            char seen[14 * 9 + 1]{};
+            char was[14 * 9 + 1]{};
+            u32 differ = 0;
+            for (u32 i = 0; i < 14; ++i) {
+                std::snprintf(seen + i * 9, 10, "%08x ", push_report.words[i]);
+                std::snprintf(was + i * 9, 10, "%08x ", pushed[i]);
+                if (known && push_report.words[i] != pushed[i]) {
+                    differ |= 1u << i;
+                }
+            }
+            seen[14 * 9 - 1] = '\0';
+            was[14 * 9 - 1] = '\0';
+            std::printf("Skin guard: %u workgroups found their dispatch's constants changed since "
+                        "the last line (the first saw: %s; checksum computed 0x%08x); batch %u %s: "
+                        "%s; the words that differ: 0x%04x\n",
+                        push_report.count - batch.push_seen, seen, push_report.check_computed,
+                        seen_batch, known ? "pushed" : "is not kept (no comparison), slot",
+                        was, differ);
+            std::fflush(stdout);
+        }
+        batch.push_seen = push_report.count;
+    }
     if (reason == SkinBatch::Packet && SkinBatchStats()) {
         ++batch.causes[cause];
     }
@@ -658,7 +926,8 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
             continue;
         }
         if (!pipes[k].pipeline) {
-            pipes[k] = CreateSkinPipeline(instance, SkinCode(k / NumVariants, k % NumVariants));
+            pipes[k] = CreateSkinPipeline(instance, SkinCode(k / NumVariants, k % NumVariants),
+                                          batch.guard ? batch.guard->BufferDeviceAddress() : 0);
         }
         if (auto* profiler = GpuProfiler::Get()) {
             profiler->Mark(0x5C1Bull + k, [k] {
@@ -667,17 +936,66 @@ void Rasterizer::FlushSkinBatch(u32 reason, u64 cause) {
             });
         }
         auto& stream = buffer_cache.GetStreamBuffer();
+        // g2-arm64 diagnosis BB_SKIN_JOB_TEST=N: the stream's copy of the first job gets a bad
+        // buffer 1 (the table hashed for the guard's log is the one before, so it says CHANGED).
+        const u32 job_test = batch.guard && SkinGuardLevel() >= 2 ? SkinJobTestEvery() : 0u;
+        const bool test_job = job_test && (batch.number + 1) % job_test == 0;
+        u64 tested_address = 0;
+        if (test_job) {
+            tested_address = batch.jobs[k][0].address[1];
+            batch.jobs[k][0].address[1] = 0x960697069700ull;
+        }
         const u64 jobs_offset =
             stream.Copy(batch.jobs[k].data(), batch.jobs[k].size() * sizeof(SkinJob), 16);
+        if (test_job) {
+            batch.jobs[k][0].address[1] = tested_address;
+        }
         const u64 groups_offset =
             stream.Copy(batch.job_of_group[k].data(), num_groups * sizeof(u32), 16);
         const u64 address = stream.BufferDeviceAddress();
-        const SkinPush push{address + jobs_offset, address + groups_offset, num_groups, 0};
-        scheduler.Record([pipeline = *pipes[k].pipeline, layout = *pipes[k].layout,
-                          push](vk::CommandBuffer cmdbuf) {
+        const u32 num_jobs = static_cast<u32>(batch.jobs[k].size());
+        SkinPush push{address + jobs_offset, address + groups_offset, num_groups, num_jobs};
+        if (batch.guard) {
+            const auto [low, high] = VideoCore::BdaRange();
+            push.low = low;
+            push.high = high;
+            push.report = batch.guard->BufferDeviceAddress();
+            push.batch = ++batch.number;
+            batch.recent[push.batch % batch.recent.size()] = {
+                push.batch,
+                scheduler.CurrentTick(),
+                jobs_offset,
+                groups_offset,
+                num_jobs,
+                num_groups,
+                TableHash(batch.jobs[k].data(), num_jobs * sizeof(SkinJob)),
+                TableHash(batch.job_of_group[k].data(), num_groups * sizeof(u32))};
+        }
+        push.check = SkinPushChecksum(push); // g2-arm64 (BB_SKIN_GUARD)
+        u32 gpu_flip = 0;
+        if (batch.guard) {
+            batch.recent[push.batch % batch.recent.size()].push = push;
+            // g2-arm64 diagnosis BB_SKIN_PUSH_TEST=N: a wrong checksum now and then, alternately
+            // for the recording thread's check and for the shaders'.
+            if (const u32 every = SkinPushTestEvery(); every && push.batch % every == 0) {
+                if ((push.batch / every) % 2 == 1) {
+                    push.check ^= 0x00F0F0F0u;
+                } else {
+                    gpu_flip = 0x0F0F0F0Fu;
+                }
+            }
+        }
+        scheduler.Record([pipeline = *pipes[k].pipeline, layout = *pipes[k].layout, push,
+                          gpu_flip](vk::CommandBuffer cmdbuf) {
+            if (push.report && SkinPushChecksum(push) != push.check) {
+                NoteRecordedPushChanged(push); // g2-arm64 (BB_SKIN_GUARD): the chunk's copy
+                return;
+            }
+            SkinPush pushed = push;
+            pushed.check ^= gpu_flip; // BB_SKIN_PUSH_TEST only
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
-                                 &push);
+            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pushed),
+                                 &pushed);
             cmdbuf.dispatch(push.num_groups, 1, 1);
         });
     }

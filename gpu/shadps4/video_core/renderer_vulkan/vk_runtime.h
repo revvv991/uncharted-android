@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <string>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -21,6 +22,19 @@ class SceneTargets;
 
 class Instance;
 class Scheduler;
+
+// g2-arm64 diagnosis (BB_MEM_CHECK=1, vk_runtime.cpp): the runtime's copies, fills and inline
+// writes and the rasterizer's buffer descriptors checked against the end of their buffer; the
+// pipelines whose descriptors are sets from the descriptor heap named.
+bool MemCheckEnabled();
+bool MemCheckRange(const char* what, const VideoCore::Buffer* buffer, u64 offset, u64 size);
+void NoteHeapPipeline(const std::string& name, u32 bindings);
+/// The bytes a buffer-image copy covers in the buffer from its bufferOffset, by its aspect.
+u64 MemCheckCopyExtent(const vk::BufferImageCopy& copy, vk::Format format);
+/// An image's copies against the region [region_offset, region_offset + region_size) of buffer.
+void MemCheckImageRegion(const char* what, const VideoCore::Buffer* buffer, u64 region_offset,
+                         u64 region_size, std::span<const vk::BufferImageCopy> copies,
+                         vk::Format format, u32 width, u32 height, u32 layers);
 
 class Runtime {
 public:

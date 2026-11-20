@@ -36,7 +36,7 @@ start)
     [ -f "$STATE" ] && { echo "a session is open ($STATE): stop it first"; exit 1; }
     if game_running; then echo "the game is running: not started"; exit 1; fi
     START=${START:-$(owner_game)}       # the owner's last game: where the menu stands
-    if ! battery_ok; then echo "the battery is below ${BATTERY_MIN:-20}% and not charging: not started"; exit 1; fi
+    if ! battery_ok; then echo "the battery is below ${BATTERY_MIN:-20}% with no charger (AC): not started"; exit 1; fi
     screen_awake || { echo "the screen does not wake: not started"; exit 1; }
     for d in SAVEDATA0${n}0 SAVEDATA0${n}0.sce_sys SAVEDATA0${n}P SAVEDATA0${n}P.sce_sys; do
         [ -d "$saves/$d" ] || { echo "no $d in $saves"; exit 1; }

@@ -17,7 +17,7 @@ echo "== queue: waiting for '$marker' in $marker_file $(date +%H:%M)" | tee -a "
 for ((i = 0; i < ${WAIT_MAX:-10800} / 10; i++)); do grep -q -E "$marker" "$marker_file" 2>/dev/null && break; sleep 10; done
 grep -q -E "$marker" "$marker_file" 2>/dev/null || { echo "QUEUE-ABORT: no '$marker' within ${WAIT_MAX:-10800} s $(date +%H:%M)" | tee -a "$log"; exit 1; }
 if game_running; then echo "QUEUE-ABORT: the game is running $(date +%H:%M)" | tee -a "$log"; exit 1; fi
-if ! battery_ok; then echo "QUEUE-ABORT: the battery is low and not charging $(date +%H:%M)" | tee -a "$log"; exit 1; fi
+if ! battery_ok; then echo "QUEUE-ABORT: the battery is low with no charger (AC) $(date +%H:%M)" | tee -a "$log"; exit 1; fi
 sleep ${PAUSE:-120}
 echo "== queue: starting $* $(date +%H:%M)" | tee -a "$log"
 "$@" >> "$log" 2>&1

@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <xxhash.h>
@@ -17,6 +18,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_vram.h"
 #include <vk_mem_alloc.h>
@@ -307,7 +309,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     const bool bpp_match = requested_info.num_bits == cache_image.info.num_bits;
 
     // If an image in the cache has less slices we need to expand it
-    bool recreate = cache_image.info.resources < requested_info.resources;
+    bool recreate = !cache_image.info.resources.Contains(requested_info.resources);
 
     switch (binding) {
     case BindingType::Texture:
@@ -341,7 +343,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
 
     if (recreate) {
         auto new_info = requested_info;
-        new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
+        // Each dimension on its own (zorde23): the max of the pair could drop the other's layers.
+        new_info.resources.levels =
+            std::max(requested_info.resources.levels, cache_image.info.resources.levels);
+        new_info.resources.layers =
+            std::max(requested_info.resources.layers, cache_image.info.resources.layers);
         new_info.UpdateSize();
         const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);
@@ -424,7 +430,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
+            !cache_image.info.resources.Contains(image_info.resources)) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -619,7 +625,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
 namespace {
 /// g2-arm64 diagnosis: BB_POOL_LOG=<hex guest address>: image lookups at that address, the image
-/// handed out, creations and frees, while toggle bit 58 (PoolLog) is set.
+/// handed out, creations and frees, while toggle bit 61 (PoolLog) is set.
 VAddr PoolLogAddress() {
     static const VAddr address = [] {
         const char* env = std::getenv("BB_POOL_LOG");
@@ -766,7 +772,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (!image_resolved.info.resources.Contains(info.resources)) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
@@ -923,12 +929,19 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
         ImageId stencil_id{};
-        ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
-                             [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
-                                     stencil_id = image_id;
-                                 }
-                             });
+        // Only an image whose format can hold stencil (or one not given a format yet, as made below)
+        // is the stencil attachment, not another image the game keeps at that address. From
+        // iannitram's 98c08331 (#136, Pepin208's port of shadPS4 #4818 / #5118).
+        ForEachImageInRegion(
+            desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
+                if (image.info.guest_address != desc.info.stencil_addr) {
+                    return;
+                }
+                if (image.info.pixel_format == vk::Format::eUndefined ||
+                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(image.info.pixel_format)) {
+                    stencil_id = image_id;
+                }
+            });
         if (!stencil_id) {
             ImageInfo info{};
             info.guest_address = desc.info.stencil_addr;
@@ -1212,11 +1225,45 @@ void TextureCache::RefreshImage(Image& image) {
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth, float extra_lod_bias) {
+    // bbport (SamplerMemo): every sampler of every draw came here (U1 chapter 2: ~2 million a
+    // second on the draw recording thread, a hash and a lock each, ~5% of that thread). A small
+    // per-thread table answers repeats. An entry is trusted only within the GC tick it was last
+    // looked up in the map (which touched its LRU entry), so the GC, which frees only samplers
+    // unused for several ticks, cannot have freed it.
+    struct MemoEntry {
+        AmdGpu::Sampler sampler;
+        u32 bias_bits;
+        bool is_depth;
+        const TextureCache* owner;
+        u64 tick;
+        vk::Sampler handle;
+    };
+    static thread_local std::array<MemoEntry, 256> memo{};
+    const u32 bias_bits = std::bit_cast<u32>(extra_lod_bias);
+    const bool use_memo = !BbToggle::Disabled(BbToggle::SamplerMemo);
+    MemoEntry* slot = nullptr;
+    if (use_memo) {
+        u64 words[2];
+        static_assert(sizeof(AmdGpu::Sampler) >= sizeof(words));
+        std::memcpy(words, &sampler, sizeof(words));
+        const u64 mix = (words[0] ^ (words[1] * 0x9E3779B97F4A7C15ull) ^ bias_bits ^ u64(is_depth))
+                        * 0xBF58476D1CE4E5B9ull;
+        slot = &memo[mix >> 56];
+        const u64 tick = gc_tick;
+        if (slot->owner == this && slot->tick == tick && slot->is_depth == is_depth &&
+            slot->bias_bits == bias_bits &&
+            std::memcmp(&slot->sampler, &sampler, sizeof(sampler)) == 0) {
+            return slot->handle;
+        }
+    }
     // Compare and plain uses of one S# need separate samplers; so do extra LOD biases.
     const u64 hash = HashCombine(HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), is_depth),
-                                 u64(std::bit_cast<u32>(extra_lod_bias)));
+                                 u64(bias_bits));
 
     std::scoped_lock lock{samplers_mutex};
+    if (slot) {
+        *slot = {sampler, bias_bits, is_depth, this, gc_tick, {}};
+    }
     const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base,
                                                         is_depth, extra_lod_bias);
     if (new_sampler) {
@@ -1224,7 +1271,9 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     } else {
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
-
+    if (slot) {
+        slot->handle = it->second.Handle();
+    }
     return it->second.Handle();
 }
 

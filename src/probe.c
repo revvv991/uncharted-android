@@ -763,6 +763,7 @@ static void *stall_watch(void *arg) {
  * is removed; write it elsewhere and move it to <file> so that it is read whole. */
 static volatile uint32_t u1_set_job_skips, u1_set_maker_null; /* install_u1_set_job_guard below */
 static volatile uint32_t u3_particle_job_skips; /* install_u3_particle_job_guard below */
+static volatile uint32_t u1_scene_waits, u1_scene_wait_pauses, u1_scene_skips; /* install_u1_scene_guard below */
 /* g2-arm64: patch_job_lock_wait's waits in place that got their counter (count, time, the longest,
  * in us), those that suspended after the full wait, the counter waits that reached it on workers
  * (with a render context open or not), and the render contexts opened (the Begin callback in
@@ -790,7 +791,8 @@ static void *peek_on_request(void *arg) {
     snprintf(out,sizeof(out),"%s.out",path);
     snprintf(part,sizeof(part),"%s.part",path);
     static unsigned char data[1<<20];
-    uint32_t skips_told=0, particle_skips_told=0;
+    uint32_t skips_told=0, particle_skips_told=0, scene_told=0;
+    unsigned scene_tick=0;
     unsigned ticks=0;
     int contexts_told=0;
     for (;;) {
@@ -811,6 +813,18 @@ static void *peek_on_request(void *arg) {
                    particle_skips);
             fflush(stdout);
             particle_skips_told=particle_skips;
+        }
+        /* g2-arm64: and U1's scene guard's waits and skips when they grow, at most every 10 s. */
+        const uint32_t scene_waits=__atomic_load_n(&u1_scene_waits,__ATOMIC_RELAXED);
+        const uint32_t scene_pauses=__atomic_load_n(&u1_scene_wait_pauses,__ATOMIC_RELAXED);
+        const uint32_t scene_skips=__atomic_load_n(&u1_scene_skips,__ATOMIC_RELAXED);
+        if (scene_waits+scene_skips!=scene_told && (!scene_told || ticks-scene_tick>=50)) {
+            printf("Scene guard: U1's scene update found a view field null %u times: filled within the "
+                   "wait %u times (%u pauses in all), the view query skipped %u times\n",
+                   scene_waits+scene_skips,scene_waits,scene_pauses,scene_skips);
+            fflush(stdout);
+            scene_told=scene_waits+scene_skips;
+            scene_tick=ticks;
         }
         /* g2-arm64: and the job wait's waits every 10 s when there were any (the render contexts
          * once, to show that its callbacks run). */
@@ -1095,6 +1109,103 @@ static void install_u1_set_job_guard(uint64_t image_size) {
     site[0] = 0xe8;
     memcpy(site + 1, &rel, 4);
     printf("Set job guard: U1's node set job skips a null set (%zu bytes of stubs at %#" PRIx64 ")\n", k, cave);
+}
+
+/* g2-arm64 (U1's job worker crash at 0x9fd74e, findings 2026-11-19 and 2026-11-20): the scene
+ * update's step 0x9fce80 (called by the update job 0x9fadd0 with its data) reloads the scene object
+ * (the data's +0, tag 0x610ba10) and hands obj+0xb8 and [obj+0x80]+0x18 to a view query (0x6d80e0,
+ * a thunk to 0x6d7450 on the manager at 0xf14b40). Four times in about 11 hours of U1 without the
+ * limit, all with the job workers' 2 spins (port 0163), it found +0x80 and +0xb8 null (+0x88, the
+ * object's counter set, made) and faulted at 0x9fd74e reading [+0x80]+0x18. The object's creator
+ * (0x9f78b0) leaves both zero; their filler is not known yet. The query does nothing when its
+ * manager is off (0xf14b30 zero: the stack canary check and return); the step does not use its
+ * result, and sets its counters and makes its jobs apart from it. A stub replaces the loads and the
+ * call: with both fields set it makes the call as before; with either null it waits for them for up
+ * to 16 pauses (~1.6 ms on the G2, where a pause is a wfe) and skips the query when they stay null.
+ * The peek thread reports the waits and the skips. BB_U1_SCENE_GUARD=0: off; =2: a test - every
+ * call waits the 16 pauses and skips the query. */
+static void install_u1_scene_guard(Segment *segments, uint64_t ns) {
+    const char *env = getenv("BB_U1_SCENE_GUARD");
+    if (env && env[0] == '0') return;
+    const int test = env && env[0] == '2';
+    const uint64_t base = 0x400000, cave = 0xd20080, site = 0x9fd732, query = 0x6d80e0;
+    const size_t cave_size = 160;
+    static const unsigned char site_old[] = {
+        0x48, 0x8b, 0x43, 0x78,                             /* mov rax, [rbx+0x78]: the job's data */
+        0x48, 0x8b, 0x00,                                   /* mov rax, [rax]: the scene object */
+        0x48, 0x8b, 0x90, 0xb8, 0x00, 0x00, 0x00,           /* mov rdx, [rax+0xb8] */
+        0x48, 0x8b, 0x88, 0x80, 0x00, 0x00, 0x00,           /* mov rcx, [rax+0x80] */
+        0x48, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00,           /* mov rax, [rax+0x88] */
+        0x48, 0x8b, 0x49, 0x18,                             /* mov rcx, [rcx+0x18]: the fault */
+        0x48, 0x8b, 0xb0, 0xa8, 0x00, 0x00, 0x00,           /* mov rsi, [rax+0xa8] */
+        0x48, 0x8b, 0x7b, 0x60,                             /* mov rdi, [rbx+0x60] */
+        0xe8, 0x7e, 0xa9, 0xcd, 0xff};                      /* call 0x6d80e0 */
+    int site_in = 0, cave_in = 0;
+    for (uint64_t s = 0; s < ns; ++s) {
+        if (!(segments[s].flags & 1)) continue;
+        const uint64_t lo = segments[s].address, hi = segments[s].address + segments[s].size;
+        if (site - base >= lo && site - base + sizeof(site_old) <= hi) site_in = 1;
+        if (cave - base >= lo && cave - base + cave_size <= hi) cave_in = 1;
+    }
+    if (!site_in || memcmp(image + site - base, site_old, sizeof(site_old))) return; /* not U1 */
+    if (!cave_in) { printf("Scene guard: no room for the stubs in the code segment, off\n"); return; }
+    for (size_t i = 0; i < cave_size; ++i)
+        if (image[cave - base + i]) { printf("Scene guard: the code cave is not empty, off\n"); return; }
+    unsigned char *t = image + cave - base;
+    size_t k = 0;
+    const uint64_t waits = (uint64_t)(uintptr_t)&u1_scene_waits,
+                   pauses = (uint64_t)(uintptr_t)&u1_scene_wait_pauses,
+                   skips = (uint64_t)(uintptr_t)&u1_scene_skips;
+#define B(...) do { const unsigned char b_[] = {__VA_ARGS__}; memcpy(t + k, b_, sizeof(b_)); k += sizeof(b_); } while (0)
+#define IMM64(v) do { note_varying(t + k); memcpy(t + k, &(v), 8); k += 8; } while (0)
+    B(0x48, 0x8b, 0x43, 0x78);                              /* mov rax, [rbx+0x78] */
+    B(0x48, 0x8b, 0x00);                                    /* mov rax, [rax]: the scene object */
+    B(0x31, 0xc9);                                          /* xor ecx, ecx: the pauses */
+    const size_t check = k;
+    B(0x48, 0x83, 0xb8, 0x80, 0x00, 0x00, 0x00, 0x00);      /* check: cmp qword [rax+0x80], 0 */
+    B(test ? 0xeb : 0x74); const size_t j_wait1 = k; B(0x00); /* je wait (the test: jmp wait) */
+    B(0x48, 0x83, 0xb8, 0xb8, 0x00, 0x00, 0x00, 0x00);      /* cmp qword [rax+0xb8], 0 */
+    B(0x74); const size_t j_wait2 = k; B(0x00);             /* je wait */
+    B(0x85, 0xc9);                                          /* test ecx, ecx */
+    B(0x74); const size_t j_go = k; B(0x00);                /* je go: no wait */
+    B(0x48, 0xba); IMM64(waits);                            /* movabs rdx, &waits */
+    B(0xf0, 0xff, 0x02);                                    /* lock inc dword [rdx] */
+    B(0x48, 0xba); IMM64(pauses);                           /* movabs rdx, &pauses */
+    B(0xf0, 0x01, 0x0a);                                    /* lock add dword [rdx], ecx */
+    t[j_go] = (unsigned char)(k - (j_go + 1));
+    B(0x48, 0x8b, 0x90, 0xb8, 0x00, 0x00, 0x00);            /* go: mov rdx, [rax+0xb8] */
+    B(0x48, 0x8b, 0x88, 0x80, 0x00, 0x00, 0x00);            /* mov rcx, [rax+0x80] */
+    B(0x48, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00);            /* mov rax, [rax+0x88] */
+    B(0x48, 0x8b, 0x49, 0x18);                              /* mov rcx, [rcx+0x18] */
+    B(0x48, 0x8b, 0xb0, 0xa8, 0x00, 0x00, 0x00);            /* mov rsi, [rax+0xa8] */
+    B(0x48, 0x8b, 0x7b, 0x60);                              /* mov rdi, [rbx+0x60] */
+    B(0xe9);                                                /* jmp 0x6d80e0: it returns to the site */
+    { const int32_t rel = (int32_t)((int64_t)query - (int64_t)(cave + k + 4)); memcpy(t + k, &rel, 4); k += 4; }
+    t[j_wait1] = (unsigned char)(k - (j_wait1 + 1));
+    t[j_wait2] = (unsigned char)(k - (j_wait2 + 1));
+    B(0xff, 0xc1);                                          /* wait: inc ecx */
+    B(0x83, 0xf9, 0x10);                                    /* cmp ecx, 16 */
+    B(0x77); const size_t j_skip = k; B(0x00);              /* ja skip */
+    B(0xf3, 0x90);                                          /* pause */
+    B(0x48, 0x8b, 0x43, 0x78);                              /* mov rax, [rbx+0x78] */
+    B(0x48, 0x8b, 0x00);                                    /* mov rax, [rax] */
+    B(0xeb); t[k] = (unsigned char)(check - (k + 1)); k++;  /* jmp check */
+    t[j_skip] = (unsigned char)(k - (j_skip + 1));
+    B(0x48, 0xb8); IMM64(skips);                            /* skip: movabs rax, &skips */
+    B(0xf0, 0xff, 0x00);                                    /* lock inc dword [rax] */
+    B(0xc3);                                                /* ret: to the site, past the query */
+#undef IMM64
+#undef B
+    if (k > cave_size) fail("the scene guard's stubs outgrew their cave");
+    unsigned char *s = image + site - base;                 /* call the stub, then jmp past the old call */
+    const int32_t rel = (int32_t)((int64_t)cave - (int64_t)(site + 5));
+    s[0] = 0xe8;
+    memcpy(s + 1, &rel, 4);
+    s[5] = 0xeb;
+    s[6] = (unsigned char)(sizeof(site_old) - 7);
+    memset(s + 7, 0x90, sizeof(site_old) - 7);
+    printf("Scene guard: U1's scene update waits for its view fields, else skips the view query%s "
+           "(%zu bytes of stubs at %#" PRIx64 ")\n", test ? " - the test: always" : "", k, cave);
 }
 
 /* g2-arm64 (the games' jumps, findings 2026-11-02 and 2026-11-03): each game moves its world every
@@ -2689,18 +2800,40 @@ static void patch_job_sleep(uint64_t image_size) {
             printf("Job workers: %s at %#" PRIx64 " (idle workers sleep)\n",builds[b][i].name,
                    (uint64_t)at[i]+builds[b][i].offset);
         }
+        /* After the re-check an idle worker waits up to 10 ms (mov edx, 10: milliseconds; 10000 in
+         * code that takes microseconds) without looking at the queue again. A job resumed by a
+         * counter wakes nobody (on the PS4 the workers never sleep), so some of a frame's work
+         * waited for that timeout and frames started up to ~10 ms late, by a different amount each:
+         * uneven steps and drops on CPUs where the workers sleep. From Mevlock's dev builds
+         * (f4c3054d: U1 ch7, 8-thread laptop, step spread 5.1 ms at 10 ms, 1.1 ms at 1 ms). The
+         * wait is BB_JOB_SLEEP_MS (default 1; 10: the game's). */
+        unsigned char *wait=image+at[1]+builds[b][1].offset+13; /* the cmp is at offset-4, mov edx 17 after it */
+        const char *ms_env=getenv("BB_JOB_SLEEP_MS");
+        const int ms=ms_env ? atoi(ms_env) : 1;
+        int32_t wait_value=0;
+        if (wait[0]==0xba) memcpy(&wait_value,wait+1,4);
+        if (ms>0 && ms<128 && wait_value==10) { const int32_t v=ms; memcpy(wait+1,&v,4); }
+        else if (ms>0 && ms<128 && wait_value==10000) { const int32_t v=ms*1000; memcpy(wait+1,&v,4); }
+        if (wait_value==10 || wait_value==10000)
+            printf("Job workers: idle wait %d ms (the game's: 10 ms; BB_JOB_SLEEP_MS)\n",ms>0 && ms<128 ? ms : 10);
+        else
+            printf("Job workers: idle wait not found at %#" PRIx64 ", left at the game's\n",(uint64_t)(wait-image));
         /* g2-arm64: BB_JOB_SPINS=<n> (1..999): an idle worker spins n pauses instead of 1000 before
-         * it waits, and the wait times out after BB_JOB_WAIT_US (1000) instead of 10 ms - what U2's
-         * recipe does ("2 spins, a 1 ms wait"). A guest pause is a wfe of ~100 us on the G2, so the
-         * 1000 spins held each of the six workers' cores for ~100 ms after every job: in U3's market
-         * chase the workers sat in that spin 70-90% of the time (the guest profiler, 2026-11-07) and
+         * it waits, as U2's recipe does ("2 spins, a 1 ms wait"). A guest pause is a wfe of ~100 us
+         * on the G2, so the 1000 spins held each of the six workers' cores for ~100 ms after every
+         * job: in U3's market chase the workers sat in that spin 70-90% of the time (the guest
+         * profiler, 2026-11-07) and
          * the command thread, which shares the big cores with them, was preempted 68 times a frame
          * (its 23 ms of decoding a frame took 29 ms). The A/Bs of 2026-11-07 (the G2, 4 pairs of 120 s,
          * the limit off) with 2: the chase 25.4 -> 29.0 FPS, every pair +3.3 or more, the p99 frame
          * 64 -> 44 ms, at the 30 limit 27.3 -> 29.7; U1 41.2 -> 43.2 and its frames over 40 ms
          * 620-642 -> 7-12 a run. So 2 by default on Android, as U2's recipe has; BB_JOB_SPINS=0 keeps
-         * the game's 1000 and 10 ms. One U1 run at the limit with 2 had a GPU page-fault storm that
-         * 75 minutes of the same did not repeat (findings 2026-11-07): BB_JOB_SPINS=0 if it comes back. */
+         * the game's 1000. One U1 run at the limit with 2 had a GPU page-fault storm that
+         * 75 minutes of the same did not repeat (findings 2026-11-07): BB_JOB_SPINS=0 if it comes back.
+         * The wait after the spins is upstream's BB_JOB_SLEEP_MS since the 0.3.15 merge (above: the
+         * mov edx our BB_JOB_WAIT_US patched, and the same 1 ms by default); BB_JOB_WAIT_US=<us>
+         * (100..10000) still sets it in microseconds where the code takes them. The game's spinning
+         * and wait: BB_JOB_SPINS=0 BB_JOB_SLEEP_MS=10. */
         const char *spins_env=getenv("BB_JOB_SPINS");
 #ifdef __ANDROID__
         const long spins=spins_env?strtol(spins_env,NULL,10):2;
@@ -2710,15 +2843,15 @@ static void patch_job_sleep(uint64_t image_size) {
         if (spins>0 && spins<1000) {
             const uint32_t n=(uint32_t)spins;
             memcpy(image+at[0]+13,&n,4);                         /* cmp r8, 1000 -> cmp r8, n */
-            const char *wait_env=getenv("BB_JOB_WAIT_US");
-            long wait_us=wait_env?strtol(wait_env,NULL,10):1000;
+            printf("Job workers: %ld spins before the wait (BB_JOB_SPINS)\n",spins);
+        }
+        const char *wait_env=getenv("BB_JOB_WAIT_US");
+        if (wait_env && wait_value==10000) {
+            long wait_us=strtol(wait_env,NULL,10);
             if (wait_us<100 || wait_us>10000) wait_us=1000;
-            /* add rax,0x60; mov edx,10000; mov rsi,rax; call CondTimedwait; mov ecx,eax; cmp ecx,ETIMEDOUT */
-            const int64_t w=find_unique_pattern(image_size,"4883c060 ba10270000 4889c6 e8???????? 89c1 81f93c000280");
-            if (w>=0) { const uint32_t us=(uint32_t)wait_us; memcpy(image+w+5,&us,4); }
-            printf("Job workers: %ld spins before the wait (BB_JOB_SPINS); the wait times out after %s\n",
-                   spins,w>=0?"":"10 ms (the timed wait not found; BB_JOB_WAIT_US ignored)");
-            if (w>=0) printf("Job workers: the idle wait times out after %ld us (BB_JOB_WAIT_US)\n",wait_us);
+            const uint32_t us=(uint32_t)wait_us;
+            memcpy(wait+1,&us,4);
+            printf("Job workers: the idle wait times out after %ld us (BB_JOB_WAIT_US)\n",wait_us);
         }
         patch_job_resume_wake(image_size,at[2]);
         return;
@@ -2731,7 +2864,7 @@ static void patch_job_sleep(uint64_t image_size) {
  * (it keeps its int 0x41 first); a null pointer ends the job at the function's own exit, otherwise the
  * loads run and it jumps back. 1.02 code (US CUSA02320, EU/Russian CUSA02344, EU 1.02): the same bytes
  * in those dumps. Both sites are found by their exact bytes and patched only together, at the distance
- * the jumps were made for (1.00 is compiled differently and is left alone). BB_JOB_GUARD=0: off. */
+ * the jumps were made for (1.00 has its own sites, below). BB_JOB_GUARD=0: off. */
 static void patch_job_descriptor_guard(uint64_t image_size) {
     const char *env=getenv("BB_JOB_GUARD");
     const int off=env && env[0]=='0';
@@ -2769,9 +2902,43 @@ static void patch_job_descriptor_guard(uint64_t image_size) {
      * U1's job system, read out of four logs' missing lines): none of the three 1.02 executables,
      * said in words once at the start. */
     printf("Version: this executable is not version 1.02, the one this port is made for: the render sizes "
-           "below 1920x1080 and the port's fixes for the games' job system are off (a low frame rate and "
+           "below 1920x1080 and some of the port's fixes for the games' job system are off (a low frame rate and "
            "stalls are likely). The game's update 1.02 goes next to the game folder as \"<game folder>-UPDATE\"; "
            "then choose the folder again in the launcher and press Prepare.\n");
+    if (off) return;
+    /* 1.00 code (EU CUSA02343 and US CUSA02320 1.00, Mevlock 726f47db): the job function is not inlined
+     * there; the same two loads follow its descriptor copy (mov rax, [rbx+8]; mov rcx, [rax+0x20]) and
+     * jump to a stub in the dead assert path of a nearby job type check (int 0x41 kept first); a null
+     * pointer goes to the function's profiler scope pop and exit. */
+    static const struct {
+        const char *game, *loads, *cave;
+        unsigned char jump[21], stub[24];
+        int64_t distance;
+    } builds_100[]={
+        {"U1","48895348e870dcf0ff48894310488b4308488b4820","e85866e7ff4885c07427488d3dd8d03200488d35fad03200",
+         {0x48,0x89,0x53,0x48,0xe8,0x70,0xdc,0xf0,0xff,0x48,0x89,0x43,0x10,0xe9,0x8c,0x05,0x00,0x00,0x90,0x90,0x90},
+         {0xcd,0x41,0x48,0x8b,0x43,0x08,0x48,0x85,0xc0,0x0f,0x84,0xc8,0xfb,0xff,0xff,0x48,0x8b,0x48,0x20,0xe9,0x61,0xfa,0xff,0xff},0x59c},
+        {"U2","48895348e8109ef0ff48894310488b4308488b4820","e858d6e6ff4885c07427488d3df8fd5600488d351afe5600",
+         {0x48,0x89,0x53,0x48,0xe8,0x10,0x9e,0xf0,0xff,0x48,0x89,0x43,0x10,0xe9,0x9c,0x05,0x00,0x00,0x90,0x90,0x90},
+         {0xcd,0x41,0x48,0x8b,0x43,0x08,0x48,0x85,0xc0,0x0f,0x84,0xb8,0xfb,0xff,0xff,0x48,0x8b,0x48,0x20,0xe9,0x51,0xfa,0xff,0xff},0x5ac},
+        {"U3","48895348e8306cf0ff48894310488b4308488b4820","e8c824e7ff4885c07427488d3dd8df9c00488d35fadf9c00",
+         {0x48,0x89,0x53,0x48,0xe8,0x30,0x6c,0xf0,0xff,0x48,0x89,0x43,0x10,0xe9,0x8c,0x05,0x00,0x00,0x90,0x90,0x90},
+         {0xcd,0x41,0x48,0x8b,0x43,0x08,0x48,0x85,0xc0,0x0f,0x84,0xc8,0xfb,0xff,0xff,0x48,0x8b,0x48,0x20,0xe9,0x61,0xfa,0xff,0xff},0x59c},
+    };
+    for (size_t b=0;b<sizeof(builds_100)/sizeof(*builds_100);++b) {
+        const int64_t loads=find_unique_pattern(image_size,builds_100[b].loads);
+        if (loads<0) continue;
+        const int64_t cave=find_unique_pattern(image_size,builds_100[b].cave);
+        if (cave-loads!=builds_100[b].distance) {
+            printf("Job descriptor guard: %s 1.00 loads found, its stub site not where expected; not patched\n",builds_100[b].game);
+            return;
+        }
+        memcpy(image+cave,builds_100[b].stub,sizeof(builds_100[b].stub));
+        memcpy(image+loads,builds_100[b].jump,sizeof(builds_100[b].jump));
+        printf("Job descriptor guard: %s 1.00 job runner skips a job without its descriptor (%#" PRIx64 ", stub %#" PRIx64 ")\n",
+               builds_100[b].game,(uint64_t)loads,(uint64_t)cave);
+        return;
+    }
 }
 /* U2 chapter 21 (convoy): Elena's truck sinks 2-4 m into the snow for ~0.5 s after a bump. The bump
  * plays an animation on the truck by adding a node to its animation blend (US 0x399700, EU 0x102330:
@@ -3164,6 +3331,7 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         install_u1_view_lock(image_end);
         install_u1_set_job_guard(image_end);
+        install_u1_scene_guard(segments, ns);
         install_dt_smooth(image_end);
         install_u3_particle_job_guard(image_end);
         install_u3_hud_guard(image_end);

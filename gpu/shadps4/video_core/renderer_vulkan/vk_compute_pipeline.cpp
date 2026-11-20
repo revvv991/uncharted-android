@@ -10,6 +10,10 @@
 
 namespace Vulkan {
 
+// g2-arm64 diagnosis (BB_MEM_CHECK=1, vk_runtime.cpp).
+bool MemCheckEnabled();
+void NoteHeapPipeline(const std::string& name, u32 bindings);
+
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
@@ -80,6 +84,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
 
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    if (!uses_push_descriptors && MemCheckEnabled()) { // g2-arm64 diagnosis
+        NoteHeapPipeline(GetDebugString(), binding);
+    }
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

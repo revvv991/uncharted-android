@@ -14,6 +14,8 @@
 # the port and the APK are rebuilt on every run.
 # The resolution recipes (scripts/g2/recipes, no bytes of the game) go into the APK as assets.
 # KEYSTORE, KEYSTORE_PASS: the signing key; by default a debug key made in WORK.
+# EXTRA_APK_LIBS: more libraries for the APK's lib/arm64-v8a, for test builds only (the Khronos
+# validation layer for BB_VK_VALIDATION=1). Empty for a release.
 # Result: WORK/apk/uncharted-android.apk.
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -128,7 +130,7 @@ PUBLIC=1 APP_ID=$APP_ID ASSETS_DIR=$ASSETS GAME_APP_DIR=$WORK/apk BUILD=$WORK/bu
     DEPS=$WORK/deps/prefix SDLJAVA=$WORK/deps/src/sdl3/android-project/app/src/main/java \
     KEYSTORE=$KEYSTORE KEYSTORE_PASS=${KEYSTORE_PASS:-pass:android} \
     EXTRA_LIBS="$WORK/turnip-android/libvulkan_freedreno.so $HOOKS/libmain_hook.so $HOOKS/libfile_redirect_hook.so
-                $HOOKS/libgsl_alloc_hook.so $HOOKS/libhook_impl.so" \
+                $HOOKS/libgsl_alloc_hook.so $HOOKS/libhook_impl.so ${EXTRA_APK_LIBS:-}" \
     bash "$HERE/g2/game_app/build.sh" > "$WORK/apk.log" 2>&1 || { tail -20 "$WORK/apk.log"; exit 1; }
 ls -la "$WORK/apk/uncharted-android.apk"
 # What the binaries still say about this machine (should be nothing)

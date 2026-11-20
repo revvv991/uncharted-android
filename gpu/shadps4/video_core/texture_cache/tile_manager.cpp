@@ -337,6 +337,11 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         for (auto& copy : buffer_copies) {
             copy.bufferOffset += out_offset;
         }
+        if (Vulkan::MemCheckEnabled()) { // g2-arm64 diagnosis: the guest image's own range
+            Vulkan::MemCheckImageRegion("an untiled image download", out_buffer, out_offset,
+                                        info.guest_size, buffer_copies, info.pixel_format,
+                                        info.size.width, info.size.height, info.resources.layers);
+        }
         runtime.DownloadImage(&in_image, out_buffer, buffer_copies);
         return;
     }
@@ -364,6 +369,11 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
+    }
+    if (Vulkan::MemCheckEnabled()) { // g2-arm64 diagnosis: the staging region asked for
+        Vulkan::MemCheckImageRegion("a tiled image download", staging.buffer, staging.offset,
+                                    info.guest_size, buffer_copies, info.pixel_format,
+                                    info.size.width, info.size.height, info.resources.layers);
     }
 
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);

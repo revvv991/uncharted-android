@@ -294,6 +294,11 @@ private:
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
+    /// g2-arm64 diagnosis (BB_BDA_AUDIT=1): a thread that checks the page table's entries against
+    /// the arenas' addresses (buffer_cache.cpp). Declared after the table, so it ends first.
+    struct BdaAudit;
+    std::unique_ptr<BdaAudit> bda_audit;
+    void NoteArenaForAudit(const Buffer* arena);
 
     /// g2-arm64: num_arena_pages entries (up to 128 Ki with the 2 MiB pages of arenas that own
     /// their memory).

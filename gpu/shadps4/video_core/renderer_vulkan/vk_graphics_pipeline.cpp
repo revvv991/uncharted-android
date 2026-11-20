@@ -16,6 +16,10 @@
 
 namespace Vulkan {
 
+// g2-arm64 diagnosis (BB_MEM_CHECK=1, vk_runtime.cpp).
+bool MemCheckEnabled();
+void NoteHeapPipeline(const std::string& name, u32 bindings);
+
 using Shader::Backend::SPIRV::AuxShaderType;
 
 static constexpr std::array LogicalStageToStageBit = {
@@ -569,6 +573,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     // g2-arm64 experiment: BB_NO_PUSH_DESCRIPTORS=1 binds descriptor sets instead.
     static const bool no_push_descriptors = std::getenv("BB_NO_PUSH_DESCRIPTORS") != nullptr;
     uses_push_descriptors = binding < instance.MaxPushDescriptors() && !no_push_descriptors;
+    if (!uses_push_descriptors && MemCheckEnabled()) { // g2-arm64 diagnosis
+        NoteHeapPipeline(GetDebugString(), binding);
+    }
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

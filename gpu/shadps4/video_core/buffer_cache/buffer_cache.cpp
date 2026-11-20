@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <magic_enum/magic_enum.hpp>
 #include "bbport_copy.h"
 #include "bbport_owner_wait.h"
@@ -43,6 +44,7 @@ using Vulkan::PrintHostBacktrace;
 
 namespace Vulkan {
 extern void (*g_gpu_crash_context)();
+extern void (*g_gpu_stall_audit)(const char* reason);
 }
 
 namespace VideoCore {
@@ -116,6 +118,434 @@ static bool WantNonSparseArenas(const Vulkan::Instance& instance) {
     }
     return !instance.HasSparseBuffers();
 }
+
+/// g2-arm64 diagnosis (BB_BDA_AUDIT=1): a check of the BDA page table. The rare GPU page-fault
+/// storms on the Adreno 735 are reads by the shader processor at garbage addresses outside every
+/// buffer; the dynamic ReadConst loads through an entry of this table plus the offset in its block
+/// (get_bda_pointer) with no bound, so a corrupted entry is one candidate. An entry is 0 (not
+/// resident) or an arena's device address plus an offset: a non-zero entry below the lowest arena
+/// address or at or past the highest arena end ever made, or not a multiple of the alignment all
+/// arena addresses share, is bad. With the switch the table is in host-visible cached memory,
+/// mapped, and a thread of its own reads it every 2 s from the lowest to the highest block ever
+/// made resident, and a margin. The thread reads only the mapped table and the atomics below,
+/// which are updated wherever arenas and resident blocks are made; it never touches the cache's
+/// own state. The GPU stall reports and a device loss run one scan too (g_gpu_stall_audit).
+struct BufferCache::BdaAudit {
+    using Clock = std::chrono::steady_clock;
+    static constexpr auto Period = std::chrono::seconds{2};
+    static constexpr auto SummaryPeriod = std::chrono::seconds{30};
+    static constexpr u64 Margin = 4096;        ///< blocks read past the resident span, each side
+    static constexpr u64 ChunkEntries = 4096;  ///< entries copied out of the mapping at a time
+    static constexpr size_t MaxTracked = 4096; ///< bad entries remembered from scan to scan
+    static constexpr u32 MaxLines = 100;       ///< lines about single entries, in all
+    static constexpr u64 Neighbours = 4;       ///< entries shown on each side of a bad one
+    static constexpr size_t StallEntries = 8;  ///< bad entries a stall report shows
+    static constexpr u32 WholeEvery = 15;      ///< BB_BDA_AUDIT=2: the whole table every 15 scans
+
+    struct Bounds {
+        u64 low, high, align_mask;
+    };
+    struct Bad {
+        u64 block, value;
+        Clock::time_point since;
+    };
+    struct Result {
+        u64 first{}, last{}; ///< the blocks read: [first, last)
+        u64 bad{};
+        std::vector<Bad> found; ///< the first MaxTracked bad entries, in block order
+    };
+    struct Outside {
+        u64 first{}, last{}; ///< the periodic scan's span, not read here
+        u64 nonzero{};       ///< non-zero entries outside it
+        std::vector<std::pair<u64, u64>> found; ///< (block, value), the first eight
+        double ms{};
+    };
+
+    BdaAudit(const Vulkan::Instance& instance, Buffer& table_, u32 block_shift_)
+        : table{table_}, entries{reinterpret_cast<const u64*>(table_.mapped_data.data())},
+          num_entries{table_.mapped_data.size() / sizeof(u64)}, block_shift{block_shift_},
+          chunk(ChunkEntries) {
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(table.buffer.allocator, table.buffer.allocation, &info);
+        const auto flags =
+            instance.GetMemoryProperties().memoryTypes[info.memoryType].propertyFlags;
+        std::printf("BDA audit: on: the page table (%llu MiB, %llu entries for blocks of %u KiB) "
+                    "in memory type %u (%s, %s), mapped; a scan every %lld s of the blocks made "
+                    "resident and %llu more on each side\n",
+                    static_cast<unsigned long long>(table.size_bytes >> 20),
+                    static_cast<unsigned long long>(num_entries), (1u << block_shift) >> 10,
+                    info.memoryType,
+                    (flags & vk::MemoryPropertyFlagBits::eHostCached) ? "cached" : "uncached",
+                    table.is_coherent ? "coherent" : "non-coherent",
+                    static_cast<long long>(Period.count()), static_cast<unsigned long long>(Margin));
+        std::fflush(stdout);
+        {
+            std::scoped_lock lk{hook_mutex};
+            hook_target = this;
+        }
+        {
+            const char* env = std::getenv("BB_BDA_AUDIT");
+            whole = env && env[0] == '2';
+        }
+        if (whole) {
+            std::printf("BDA audit: and the whole table every %lld s (BB_BDA_AUDIT=2): an entry "
+                        "outside the blocks made resident must be 0\n",
+                        static_cast<long long>(Period.count() * WholeEvery));
+            std::fflush(stdout);
+        }
+        Vulkan::g_gpu_stall_audit = &StallHook;
+        thread = std::thread([this] { Worker(); });
+    }
+
+    ~BdaAudit() {
+        {
+            std::scoped_lock lk{hook_mutex};
+            hook_target = nullptr;
+        }
+        {
+            std::scoped_lock lk{wake_mutex};
+            stop = true;
+        }
+        wake_cv.notify_all();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    /// An arena was made: its addresses widen the plausible range (atomics: any thread).
+    void NoteArena(u64 address, u64 size) {
+        AtomicMin(arena_low, address);
+        AtomicMax(arena_high, address + size);
+        arena_bits.fetch_or(address, std::memory_order_release);
+    }
+
+    /// Blocks [first, end) are resident from now on (atomics: any thread).
+    void NoteResident(u64 first, u64 end) {
+        AtomicMin(block_low, first);
+        AtomicMax(block_end, end);
+    }
+
+private:
+    static void AtomicMin(std::atomic<u64>& value, u64 x) {
+        u64 old = value.load(std::memory_order_relaxed);
+        while (x < old && !value.compare_exchange_weak(old, x, std::memory_order_release,
+                                                       std::memory_order_relaxed)) {
+        }
+    }
+
+    static void AtomicMax(std::atomic<u64>& value, u64 x) {
+        u64 old = value.load(std::memory_order_relaxed);
+        while (x > old && !value.compare_exchange_weak(old, x, std::memory_order_release,
+                                                       std::memory_order_relaxed)) {
+        }
+    }
+
+    Bounds LoadBounds() const {
+        // The lowest bit set in any arena address (or the block size) is the alignment they share.
+        const u64 bits = arena_bits.load(std::memory_order_acquire) | (u64{1} << block_shift);
+        return {arena_low.load(std::memory_order_acquire),
+                arena_high.load(std::memory_order_acquire), (bits & (~bits + 1)) - 1};
+    }
+
+    static bool IsBad(u64 value, const Bounds& bounds) {
+        return value < bounds.low || value >= bounds.high || (value & bounds.align_mask) != 0;
+    }
+
+    u64 ReadEntry(u64 block) const {
+        u64 value;
+        std::memcpy(&value, entries + block, sizeof(value));
+        return value;
+    }
+
+    /// Reads the table from the lowest resident block - Margin to the highest + Margin, a chunk at
+    /// a time (scan_mutex held).
+    Result Scan() {
+        Result result;
+        const u64 low = block_low.load(std::memory_order_acquire);
+        const u64 end = block_end.load(std::memory_order_acquire);
+        if (low >= end) {
+            return result; // nothing resident yet
+        }
+        result.first = low > Margin ? low - Margin : 0;
+        result.last = std::min(num_entries, end + Margin);
+        if (result.first >= result.last) {
+            return result;
+        }
+        table.Invalidate(result.first * sizeof(u64), (result.last - result.first) * sizeof(u64));
+        const auto now = Clock::now();
+        for (u64 base = result.first; base < result.last; base += ChunkEntries) {
+            const u64 count = std::min(ChunkEntries, result.last - base);
+            std::memcpy(chunk.data(), entries + base, count * sizeof(u64));
+            // The bounds after the copy: an arena is noted before any entry of it is written.
+            const Bounds bounds = LoadBounds();
+            for (u64 i = 0; i < count; ++i) {
+                const u64 value = chunk[i];
+                if (value == 0 || !IsBad(value, bounds)) {
+                    continue;
+                }
+                ++result.bad;
+                if (result.found.size() < MaxTracked) {
+                    result.found.push_back({base + i, value, now});
+                }
+            }
+        }
+        return result;
+    }
+
+    /// BB_BDA_AUDIT=2: the whole table outside the periodic scan's span. Those blocks were never
+    /// made resident, so each entry must be 0 (scan_mutex held).
+    Outside ScanWhole() {
+        Outside out;
+        const auto begin = Clock::now();
+        const u64 low = block_low.load(std::memory_order_acquire);
+        const u64 end = block_end.load(std::memory_order_acquire);
+        if (low < end) {
+            out.first = low > Margin ? low - Margin : 0;
+            out.last = std::min(num_entries, end + Margin);
+        }
+        table.Invalidate(0, num_entries * sizeof(u64));
+        for (u64 base = 0; base < num_entries; base += ChunkEntries) {
+            const u64 count = std::min(ChunkEntries, num_entries - base);
+            if (base >= out.first && base + count <= out.last) {
+                continue;
+            }
+            std::memcpy(chunk.data(), entries + base, count * sizeof(u64));
+            for (u64 i = 0; i < count; ++i) {
+                const u64 block = base + i;
+                if (chunk[i] == 0 || (block >= out.first && block < out.last)) {
+                    continue;
+                }
+                ++out.nonzero;
+                if (out.found.size() < 8) {
+                    out.found.emplace_back(block, chunk[i]);
+                }
+            }
+        }
+        out.ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        return out;
+    }
+
+    void PrintWhole(const char* tag, const Outside& out) {
+        std::printf("BDA audit (whole table%s): %llu non-zero entries outside the resident span "
+                    "(blocks 0x%llx-0x%llx not read here), %.1f ms\n",
+                    tag, static_cast<unsigned long long>(out.nonzero),
+                    static_cast<unsigned long long>(out.first),
+                    static_cast<unsigned long long>(out.last), out.ms);
+        for (const auto& [block, value] : out.found) {
+            std::printf("BDA audit (whole table%s):   block 0x%llx (guest 0x%llx) = 0x%llx\n", tag,
+                        static_cast<unsigned long long>(block),
+                        static_cast<unsigned long long>(block << block_shift),
+                        static_cast<unsigned long long>(value));
+        }
+        std::fflush(stdout);
+    }
+
+    /// The budget of lines about single entries (scan_mutex held).
+    bool TakeLine() {
+        if (lines < MaxLines) {
+            ++lines;
+            return true;
+        }
+        if (lines == MaxLines) {
+            ++lines;
+            std::printf("BDA audit: %u lines about entries printed, the rest is only counted\n",
+                        MaxLines);
+        }
+        return false;
+    }
+
+    /// A bad entry: its block, guest address and value, why it is bad, and the entries around it
+    /// as they are now (that one in brackets).
+    void PrintBad(const char* tag, const char* what, const Bad& entry, const Bounds& bounds) {
+        char why[80];
+        if (entry.value < bounds.low || entry.value >= bounds.high) {
+            std::snprintf(why, sizeof(why), "outside the arenas' 0x%llx-0x%llx",
+                          static_cast<unsigned long long>(bounds.low),
+                          static_cast<unsigned long long>(bounds.high));
+        } else {
+            std::snprintf(why, sizeof(why), "not a multiple of %llu",
+                          static_cast<unsigned long long>(bounds.align_mask + 1));
+        }
+        const u64 from = entry.block > Neighbours ? entry.block - Neighbours : 0;
+        const u64 to = std::min(num_entries, entry.block + Neighbours + 1);
+        char around[256] = "";
+        size_t used = 0;
+        for (u64 block = from; block < to && used < sizeof(around); ++block) {
+            const int n = std::snprintf(around + used, sizeof(around) - used,
+                                        block == entry.block ? " [0x%llx]" : " 0x%llx",
+                                        static_cast<unsigned long long>(ReadEntry(block)));
+            used += n > 0 ? static_cast<size_t>(n) : 0;
+        }
+        std::printf("BDA audit%s: entry %llu (guest 0x%llx) %s: 0x%llx, %s; entries %llu-%llu:%s\n",
+                    tag, static_cast<unsigned long long>(entry.block),
+                    static_cast<unsigned long long>(entry.block << block_shift), what,
+                    static_cast<unsigned long long>(entry.value), why,
+                    static_cast<unsigned long long>(from), static_cast<unsigned long long>(to - 1),
+                    around);
+    }
+
+    void PrintGood(const Bad& entry, Clock::time_point now) {
+        std::printf("BDA audit: entry %llu (guest 0x%llx) good again after %.1f s: 0x%llx (was "
+                    "0x%llx)\n",
+                    static_cast<unsigned long long>(entry.block),
+                    static_cast<unsigned long long>(entry.block << block_shift),
+                    std::chrono::duration<double>(now - entry.since).count(),
+                    static_cast<unsigned long long>(ReadEntry(entry.block)),
+                    static_cast<unsigned long long>(entry.value));
+    }
+
+    /// The thread's scan: an entry is printed when it goes bad (or to another bad value) and when
+    /// it is good again; both lists are in block order. Past the last entry tracked (more bad
+    /// ones than MaxTracked) nothing is known.
+    void Periodic() {
+        std::scoped_lock lk{scan_mutex};
+        const auto begin = Clock::now();
+        Result result = Scan();
+        const auto now = Clock::now();
+        const u64 ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - begin).count());
+        ++scans;
+        scan_ns += ns;
+        max_scan_ns = std::max(max_scan_ns, ns);
+        last_first = result.first;
+        last_last = result.last;
+        bad_now = result.bad;
+        const u64 horizon = result.bad > result.found.size() ? result.found.back().block : ~u64{0};
+        const Bounds bounds = LoadBounds();
+        bool printed = false;
+        size_t old = 0;
+        const auto good_before = [&](u64 block) {
+            for (; old < previous.size() && previous[old].block < block; ++old) {
+                if (previous[old].block <= horizon && TakeLine()) {
+                    PrintGood(previous[old], now);
+                    printed = true;
+                }
+            }
+        };
+        for (Bad& entry : result.found) {
+            good_before(entry.block);
+            if (old < previous.size() && previous[old].block == entry.block) {
+                const Bad& was = previous[old++];
+                if (was.value == entry.value) {
+                    entry.since = was.since;
+                    continue;
+                }
+            }
+            ++went_bad;
+            if (TakeLine()) {
+                PrintBad("", "went bad", entry, bounds);
+                printed = true;
+            }
+        }
+        good_before(~u64{0});
+        previous = std::move(result.found);
+        if (printed) {
+            std::fflush(stdout);
+        }
+    }
+
+    void Summary(Clock::duration period) {
+        std::scoped_lock lk{scan_mutex};
+        std::printf("BDA audit: %llu scans in %lld s, the last one %llu entries (guest "
+                    "0x%llx-0x%llx): %llu bad, %llu went bad since the start; a scan %.2f ms mean, "
+                    "%.2f ms max\n",
+                    static_cast<unsigned long long>(scans),
+                    static_cast<long long>(
+                        std::chrono::duration_cast<std::chrono::seconds>(period).count()),
+                    static_cast<unsigned long long>(last_last - last_first),
+                    static_cast<unsigned long long>(last_first << block_shift),
+                    static_cast<unsigned long long>(last_last << block_shift),
+                    static_cast<unsigned long long>(bad_now),
+                    static_cast<unsigned long long>(went_bad),
+                    scans ? static_cast<double>(scan_ns) / 1e6 / static_cast<double>(scans) : 0.0,
+                    static_cast<double>(max_scan_ns) / 1e6);
+        std::fflush(stdout);
+        scans = 0;
+        scan_ns = 0;
+        max_scan_ns = 0;
+    }
+
+    /// One scan for a stall or crash report, on the reporting thread.
+    void ReportNow(const char* reason) {
+        std::scoped_lock lk{scan_mutex};
+        const auto begin = Clock::now();
+        const Result result = Scan();
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        std::printf("BDA audit (%s): %llu entries (guest 0x%llx-0x%llx) read in %.2f ms: %llu bad\n",
+                    reason, static_cast<unsigned long long>(result.last - result.first),
+                    static_cast<unsigned long long>(result.first << block_shift),
+                    static_cast<unsigned long long>(result.last << block_shift), ms,
+                    static_cast<unsigned long long>(result.bad));
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), " (%s)", reason);
+        const Bounds bounds = LoadBounds();
+        for (size_t i = 0; i < std::min(result.found.size(), StallEntries) && TakeLine(); ++i) {
+            PrintBad(tag, "is bad", result.found[i], bounds);
+        }
+        if (whole) {
+            PrintWhole(tag, ScanWhole());
+        }
+        std::fflush(stdout);
+    }
+
+    static void StallHook(const char* reason) {
+        std::scoped_lock lk{hook_mutex};
+        if (hook_target) {
+            hook_target->ReportNow(reason);
+        }
+    }
+
+    void Worker() {
+        Common::SetCurrentThreadName("bb:BdaAudit");
+        auto last_summary = Clock::now();
+        std::unique_lock lk{wake_mutex};
+        while (!wake_cv.wait_for(lk, Period, [this] { return stop; })) {
+            lk.unlock();
+            Periodic();
+            if (whole && ++periodic_count % WholeEvery == 0) {
+                std::scoped_lock scan_lk{scan_mutex};
+                const Outside out = ScanWhole();
+                if (out.nonzero != last_outside) {
+                    PrintWhole("", out);
+                    last_outside = out.nonzero;
+                }
+            }
+            const auto now = Clock::now();
+            if (now - last_summary >= SummaryPeriod) {
+                Summary(now - last_summary);
+                last_summary = now;
+            }
+            lk.lock();
+        }
+    }
+
+    Buffer& table;
+    const u64* entries;
+    u64 num_entries;
+    u32 block_shift;
+    std::atomic<u64> arena_low{~u64{0}};
+    std::atomic<u64> arena_high{0};
+    std::atomic<u64> arena_bits{0};
+    std::atomic<u64> block_low{~u64{0}};
+    std::atomic<u64> block_end{0};
+
+    std::mutex scan_mutex; ///< one scan at a time (the thread's, a report's); held for all below
+    std::vector<u64> chunk;
+    std::vector<Bad> previous; ///< the bad entries of the thread's last scan
+    u64 scans{}, scan_ns{}, max_scan_ns{}, last_first{}, last_last{}, bad_now{}, went_bad{};
+    u32 lines{};
+    bool whole{};              ///< BB_BDA_AUDIT=2: the whole table every WholeEvery scans
+    u32 periodic_count{};
+    u64 last_outside{~u64{0}}; ///< non-zero entries outside the span at the last whole scan
+
+    std::mutex wake_mutex;
+    std::condition_variable wake_cv;
+    bool stop{};
+    std::thread thread;
+
+    static inline std::mutex hook_mutex; ///< the stall hook against the audit's end
+    static inline BdaAudit* hook_target{};
+};
 
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -219,9 +649,23 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         (blocks_per_arena_page * num_arena_pages) * sizeof(vk::DeviceAddress);
     fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
                                                    blocks_per_arena_page * num_arena_pages);
+    // g2-arm64 diagnosis (BB_BDA_AUDIT=1): the table in host-visible cached memory, mapped, for
+    // the audit's thread to read (BdaAudit); device-local as before without the switch.
+    const bool bda_audit_on = [] {
+        const char* env = std::getenv("BB_BDA_AUDIT");
+        return env && (env[0] == '1' || env[0] == '2');
+    }();
     bda_pagetable_buffer = std::make_unique<Buffer>(
-        instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
+        instance, 0, bda_pagetable_size,
+        bda_audit_on ? MemoryType::HostCached : MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+    if (bda_audit_on) {
+        if (bda_pagetable_buffer->mapped_data.empty()) {
+            std::printf("BDA audit: the page table could not be mapped: off\n");
+        } else {
+            bda_audit = std::make_unique<BdaAudit>(instance, *bda_pagetable_buffer, block_shift);
+        }
+    }
     static BufferCache* crash_report_cache;
     crash_report_cache = this;
     Vulkan::g_gpu_crash_context = [] { crash_report_cache->DumpArenas(); };
@@ -1843,6 +2287,68 @@ void BufferCache::CheckStableBindings() {
     }
 }
 
+// g2-arm64 diagnosis: BB_STREAM_REUSE_CHECK=1. Upstream's StreamCopyReuse (0.3.15) binds a guest
+// range copied earlier in the same submission again ("none of those repeats had other bytes",
+// measured on the PC, where a submission is a frame or, with the early submit, a millisecond).
+// Here a submission holds up to 10 guest submissions (BB_MIDFRAME_FLUSH). The check hashes the
+// guest bytes at each copy and at each reuse, and counts the reuses whose bytes changed since the
+// copy: there the reuse binds other bytes than a new copy would.
+static bool StreamReuseCheckEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_STREAM_REUSE_CHECK");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+static void NoteStreamReuse(size_t index, VAddr address, u32 size, bool reused, bool valid) {
+    struct Check {
+        std::array<u64, 4096> hashes{};
+        u64 copies = 0, reuses = 0, changed = 0, unchecked = 0;
+        std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+    };
+    static thread_local Check check;
+    static std::atomic<u32> printed{0};
+    u64 hash = 1469598103934665603ull;
+    if (valid) {
+        const auto* bytes = reinterpret_cast<const u8*>(address);
+        for (u32 i = 0; i < size; ++i) {
+            hash = (hash ^ bytes[i]) * 1099511628211ull;
+        }
+    }
+    if (index >= check.hashes.size()) {
+        return;
+    }
+    if (!reused) {
+        ++check.copies;
+        check.hashes[index] = hash;
+    } else if (!valid) {
+        ++check.reuses;
+        ++check.unchecked;
+    } else {
+        ++check.reuses;
+        if (hash != check.hashes[index]) {
+            ++check.changed;
+            if (printed.fetch_add(1, std::memory_order_relaxed) < 20) {
+                std::printf("Stream copy reuse: %#llx (%u bytes) changed since its copy in this "
+                            "submission\n",
+                            static_cast<unsigned long long>(address), size);
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - check.window >= std::chrono::seconds(5)) {
+        std::printf("Stream copy reuse check over 5.0 s: %llu copies, %llu reuses, %llu of them "
+                    "with other bytes, %llu unchecked\n",
+                    static_cast<unsigned long long>(check.copies),
+                    static_cast<unsigned long long>(check.reuses),
+                    static_cast<unsigned long long>(check.changed),
+                    static_cast<unsigned long long>(check.unchecked));
+        check.copies = check.reuses = check.changed = check.unchecked = 0;
+        check.window = now;
+    }
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     const bool stats = BufferStatsEnabled();
@@ -1870,7 +2376,37 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         // guest-visible fences wait for it (Scheduler::WaitHostCopies).
         if (!stream_buffer.mapped_data.empty() &&
             !BbToggle::Disabled(BbToggle::DeferredStreamCopies)) {
+            // bbport (StreamCopyReuse): a range copied earlier in the same submission is bound
+            // again instead of copied again. U1: ~680k copies a second (2.1 GB/s through the
+            // BAR, ~30% of the recording thread), half of them repeats within a submission,
+            // and none of those had other bytes (measured, "Stream copies" diagnostics). The
+            // earlier region is reserved at this tick, so the ring keeps it until the GPU is
+            // past it; its copy is recorded before this binding.
+            struct Reuse {
+                VAddr address;
+                u32 size;
+                u64 tick;
+                u64 offset;
+            };
+            static thread_local std::array<Reuse, 4096> reuse{};
+            const bool reusing = !BbToggle::Disabled(BbToggle::StreamCopyReuse);
+            const u64 tick = scheduler.CurrentTick();
+            auto& slot = reuse[((device_addr >> 4) ^ (device_addr >> 17) ^ size) % reuse.size()];
+            if (reusing && slot.tick == tick && slot.address == device_addr && slot.size == size) {
+                if (StreamReuseCheckEnabled()) { // g2-arm64 diagnosis
+                    NoteStreamReuse(static_cast<size_t>(&slot - reuse.data()), device_addr, size,
+                                    true, memory->IsValidGpuMapping(device_addr, size));
+                }
+                return {&stream_buffer, slot.offset};
+            }
             if (const auto offset = stream_buffer.Reserve(size, instance.UniformMinAlignment())) {
+                if (reusing) {
+                    slot = {device_addr, size, tick, *offset};
+                    if (StreamReuseCheckEnabled()) { // g2-arm64 diagnosis
+                        NoteStreamReuse(static_cast<size_t>(&slot - reuse.data()), device_addr,
+                                        size, false, memory->IsValidGpuMapping(device_addr, size));
+                    }
+                }
                 SmallGuestCopy({
                     .run = &RunGuestCopy,
                     .context = this,
@@ -1986,6 +2522,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             const auto* new_arena =
                 &arenas.emplace_back(instance, base_block << block_shift,
                                      num_pages << arena_page_bits, MemoryType::Sparse);
+            NoteArenaForAudit(new_arena);
             address_space[first_page] = new_arena;
             address_space[last_page] = new_arena;
         }
@@ -2004,6 +2541,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 total_size = first_size + last_size;
     const u64 end_block = (first_addr + total_size) >> block_shift;
     auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
+    NoteArenaForAudit(new_arena);
     auto* bind = BindsForArena(new_arena);
     resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
         const u64 start = std::max(base_block, backing.start);
@@ -2096,6 +2634,7 @@ const Buffer* BufferCache::GetBackedArena(u64 first_block, u64 last_block) {
     }
     const auto* new_arena = &arenas.emplace_back(instance, start_page << arena_page_bits, size,
                                                  MemoryType::Backed);
+    NoteArenaForAudit(new_arena);
     NoteBackedArena(new_arena, merged);
     if (merged) {
         MigrateBackedArenas(new_arena, start_page << blocks_per_arena_page_shift,
@@ -2135,6 +2674,12 @@ void BufferCache::ReleaseRetiredArenas() {
         std::printf("Buffer cache: %llu MiB of replaced arenas released; %llu MiB in use\n",
                     static_cast<unsigned long long>(released >> 20),
                     static_cast<unsigned long long>(backed_arena_bytes >> 20));
+    }
+}
+
+void BufferCache::NoteArenaForAudit(const Buffer* arena) {
+    if (bda_audit) {
+        bda_audit->NoteArena(arena->BufferDeviceAddress(), arena->size_bytes);
     }
 }
 
@@ -2343,6 +2888,10 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     if (bind_ranges.Empty()) {
         return;
+    }
+    if (bda_audit) {
+        // g2-arm64 diagnosis (BB_BDA_AUDIT=1): the audit reads the table up to these blocks.
+        bda_audit->NoteResident(first_block, last_block + 1);
     }
     // g2-arm64 diagnosis: BB_SPARSE_FLUSH=1 waits for the commands recorded so far before the
     // first bind of a batch (=2: submits them without waiting), so the submission that waits

@@ -201,41 +201,11 @@ union Regs {
 struct RegDirty {
     static constexpr u32 BlockWords = 32;
     static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
-    // g2-arm64: bit words with a set-bit scan. std::bitset has no find-next outside libstdc++:
-    // on Android (libc++) PostDraw tested all NumBlocks bits for every packet.
-    struct BlockSet {
-        static constexpr u32 NumWords = (NumBlocks + 63) / 64;
-        std::array<u64, NumWords> words{};
-
-        void set(u32 block) {
-            words[block / 64] |= u64{1} << (block % 64);
-        }
-        bool test(u32 block) const {
-            return (words[block / 64] >> (block % 64)) & 1;
-        }
-        bool any() const {
-            u64 all = 0;
-            for (const u64 word : words) {
-                all |= word;
-            }
-            return all != 0;
-        }
-        void reset() {
-            words.fill(0);
-        }
-        static constexpr size_t size() {
-            return NumBlocks;
-        }
-        template <typename F>
-        void ForEach(F&& f) const {
-            for (u32 w = 0; w < NumWords; ++w) {
-                for (u64 bits = words[w]; bits != 0; bits &= bits - 1) {
-                    f(w * 64 + static_cast<u32>(std::countr_zero(bits)));
-                }
-            }
-        }
-    };
-    BlockSet blocks;
+    // bbport: 64 blocks per word, so the marked ones are found with countr_zero. A std::bitset
+    // has no "next set bit" outside libstdc++ (_Find_next): on Windows every draw tested all
+    // 1664 blocks one by one on the GPU thread.
+    static constexpr u32 NumWords = (NumBlocks + 63) / 64;
+    std::array<u64, NumWords> blocks{};
     bool reset = false; ///< ClearState: defaults, then only the blocks marked after it
 
     void Mark(u32 word, u32 count) {
@@ -244,7 +214,16 @@ struct RegDirty {
         }
         const u32 last = std::min(word + count, Regs::NumRegs) - 1;
         for (u32 block = word / BlockWords; block <= last / BlockWords; ++block) {
-            blocks.set(block);
+            blocks[block / 64] |= u64(1) << (block % 64);
+        }
+    }
+    /// Calls func(block) for every marked block, in ascending order.
+    template <typename Func>
+    void ForEachBlock(Func&& func) const {
+        for (u32 w = 0; w < NumWords; ++w) {
+            for (u64 bits = blocks[w]; bits != 0; bits &= bits - 1) {
+                func(w * 64 + u32(std::countr_zero(bits)));
+            }
         }
     }
     template <typename T>
@@ -254,7 +233,7 @@ struct RegDirty {
         Mark(u32(offset / sizeof(u32)), u32((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
     }
     void Clear() {
-        blocks.reset();
+        blocks.fill(0);
         reset = false;
     }
 };
@@ -268,7 +247,7 @@ struct RegDelta {
         reset = dirty.reset;
         blocks.clear();
         words.clear();
-        dirty.blocks.ForEach([&](u32 block) {
+        dirty.ForEachBlock([&](u32 block) {
             blocks.push_back(u16(block));
             const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
             words.insert(words.end(), src, src + RegDirty::BlockWords);

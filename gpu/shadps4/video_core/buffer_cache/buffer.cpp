@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -80,6 +81,9 @@ struct BdaRecord {
 };
 std::mutex bda_mutex;
 std::vector<BdaRecord> bda_records;
+// g2-arm64 (BB_SKIN_GUARD): the span of every device address handed out, never shrinking.
+std::atomic<u64> bda_low{~0ull};
+std::atomic<u64> bda_high{0};
 
 void RecordBda(u64 address, u64 size) {
     std::scoped_lock lk{bda_mutex};
@@ -87,6 +91,12 @@ void RecordBda(u64 address, u64 size) {
         bda_records.erase(bda_records.begin(), bda_records.begin() + 1024);
     }
     bda_records.push_back({address, size, true, {}});
+    if (address < bda_low.load(std::memory_order_relaxed)) {
+        bda_low.store(address, std::memory_order_release);
+    }
+    if (address + size > bda_high.load(std::memory_order_relaxed)) {
+        bda_high.store(address + size, std::memory_order_release);
+    }
 }
 
 void ForgetBda(u64 address) {
@@ -99,6 +109,10 @@ void ForgetBda(u64 address) {
     }
 }
 } // namespace
+
+std::pair<u64, u64> BdaRange() {
+    return {bda_low.load(std::memory_order_acquire), bda_high.load(std::memory_order_acquire)};
+}
 
 void NameBda(u64 address, std::string_view name) {
     std::scoped_lock lk{bda_mutex};

@@ -49,7 +49,7 @@ if ! device_here; then echo "$tag: no device (adb) - skipped"; exit 1; fi
 run_lock "$tag" || exit 1               # one run at a time; its EXIT trap stops the live record
 START=${START:-$(owner_game)}       # the owner's last game: where the menu stands
 if game_running; then echo "$tag: the game is running - skipped"; exit 1; fi
-if ! battery_ok; then echo "$tag: the battery is below ${BATTERY_MIN:-20}% and not charging - skipped"; exit 1; fi
+if ! battery_ok; then echo "$tag: the battery is below ${BATTERY_MIN:-20}% with no charger (AC) - skipped"; exit 1; fi
 if ! screen_awake; then echo "$tag: the screen does not wake - skipped"; exit 1; fi
 cooled=$(cool_wait)                     # a warm device starts its play that much nearer the limits
 # The wait can take minutes: the owner may have started the game meanwhile.

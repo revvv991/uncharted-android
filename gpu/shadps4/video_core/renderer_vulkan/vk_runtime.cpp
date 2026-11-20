@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -111,9 +115,130 @@ void Runtime::TickFrame() {
     staging_pool.TickFrame();
 }
 
+// g2-arm64 diagnosis (BB_MEM_CHECK=1): the GPU does not bound a copy, a fill or an inline write,
+// so one past its buffer's end lands in whatever memory follows the buffer; a buffer descriptor
+// whose range runs past the buffer lets shaders do the same. The page fault storms read
+// descriptors or pointers made of data (findings 2026-11-19 12:15): these are ways to get one.
+// The first 20 are printed with the caller.
+#ifndef _WIN32
+void PrintHostBacktrace(const char* prefix);
+#endif
+
+bool MemCheckEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_MEM_CHECK");
+        const bool enabled = env && env[0] == '1';
+        if (enabled) {
+            std::printf("Memory check: on - the runtime's copies, fills and inline writes and the "
+                        "buffer descriptors checked against their buffers\n");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
+bool MemCheckRange(const char* what, const VideoCore::Buffer* buffer, u64 offset, u64 size) {
+    if (!buffer || (offset <= buffer->SizeBytes() && size <= buffer->SizeBytes() - offset)) {
+        return true;
+    }
+    static std::atomic<u32> count{0};
+    const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20) {
+        std::printf("Memory check: %s past its buffer's end: +0x%llx size 0x%llx in a buffer of "
+                    "0x%llx (guest 0x%llx, device 0x%llx)\n",
+                    what, static_cast<unsigned long long>(offset),
+                    static_cast<unsigned long long>(size),
+                    static_cast<unsigned long long>(buffer->SizeBytes()),
+                    static_cast<unsigned long long>(buffer->CpuAddr()),
+                    static_cast<unsigned long long>(buffer->BufferDeviceAddress()));
+#ifndef _WIN32
+        PrintHostBacktrace("Memory check:   at");
+#endif
+        std::fflush(stdout);
+    } else if (n == 21) {
+        std::printf("Memory check: more than 20 - the rest not printed\n");
+    }
+    return false;
+}
+
+// A depth or stencil aspect copies as its own component: D16 depth 2 bytes a texel, D24 and D32
+// depth 4, stencil 1 (the format's block size would count both aspects: 5 for D32S8).
+u64 MemCheckCopyExtent(const vk::BufferImageCopy& copy, vk::Format format) {
+    const auto aspect = copy.imageSubresource.aspectMask;
+    const auto extent = vk::blockExtent(format);
+    u64 block_w = extent[0], block_h = extent[1], texel = vk::blockSize(format);
+    if (aspect == vk::ImageAspectFlagBits::eStencil) {
+        block_w = block_h = 1;
+        texel = 1;
+    } else if (aspect == vk::ImageAspectFlagBits::eDepth) {
+        block_w = block_h = 1;
+        texel = (format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint) ? 2 : 4;
+    }
+    const u64 row_length = copy.bufferRowLength ? copy.bufferRowLength : copy.imageExtent.width;
+    const u64 height = copy.bufferImageHeight ? copy.bufferImageHeight : copy.imageExtent.height;
+    const u64 row_pitch = (row_length + block_w - 1) / block_w * texel;
+    const u64 slice_pitch = (height + block_h - 1) / block_h * row_pitch;
+    const u64 width_blocks = (copy.imageExtent.width + block_w - 1) / block_w;
+    const u64 height_blocks = (copy.imageExtent.height + block_h - 1) / block_h;
+    const u64 slices = u64(copy.imageExtent.depth) * copy.imageSubresource.layerCount;
+    if (slices == 0 || height_blocks == 0 || width_blocks == 0) {
+        return 0;
+    }
+    return (slices - 1) * slice_pitch + (height_blocks - 1) * row_pitch + width_blocks * texel;
+}
+
+void MemCheckImageRegion(const char* what, const VideoCore::Buffer* buffer, u64 region_offset,
+                         u64 region_size, std::span<const vk::BufferImageCopy> copies,
+                         vk::Format format, u32 width, u32 height, u32 layers) {
+    u64 end = region_offset;
+    for (const auto& copy : copies) {
+        end = std::max<u64>(end, copy.bufferOffset + MemCheckCopyExtent(copy, format));
+    }
+    if (end <= region_offset + region_size) {
+        return;
+    }
+    static std::atomic<u32> count{0};
+    const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20) {
+        std::printf("Memory check: %s writes 0x%llx bytes into a region of 0x%llx at +0x%llx of a "
+                    "buffer of 0x%llx (device 0x%llx): %s %ux%u, %u layers, %zu copies, aspect %s\n",
+                    what, static_cast<unsigned long long>(end - region_offset),
+                    static_cast<unsigned long long>(region_size),
+                    static_cast<unsigned long long>(region_offset),
+                    static_cast<unsigned long long>(buffer ? buffer->SizeBytes() : 0),
+                    static_cast<unsigned long long>(buffer ? buffer->BufferDeviceAddress() : 0),
+                    vk::to_string(format).c_str(), width, height, layers, copies.size(),
+                    copies.empty() ? "-"
+                                   : vk::to_string(copies[0].imageSubresource.aspectMask).c_str());
+#ifndef _WIN32
+        if (n <= 3) {
+            PrintHostBacktrace("Memory check:   at");
+        }
+#endif
+        std::fflush(stdout);
+    } else if (n == 21) {
+        std::printf("Memory check: more than 20 region overruns - the rest not printed\n");
+    }
+}
+
+void NoteHeapPipeline(const std::string& name, u32 bindings) {
+    static std::atomic<u32> count{0};
+    const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20) {
+        std::printf("Memory check: pipeline %s has %u bindings: its descriptors are sets from the "
+                    "descriptor heap (%u so far)\n", name.c_str(), bindings, n);
+    }
+}
+
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
     scheduler.EndRendering();
+    if (MemCheckEnabled()) { // g2-arm64 diagnosis
+        for (const auto& copy : copies) {
+            MemCheckRange("a copy reads", src, copy.srcOffset, copy.size);
+            MemCheckRange("a copy writes", dst, copy.dstOffset, copy.size);
+        }
+    }
 
     // bbport: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
     // conservative for barriers, and two tree lookups instead of two per region.
@@ -164,6 +289,9 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
     scheduler.EndRendering();
+    if (MemCheckEnabled()) { // g2-arm64 diagnosis
+        MemCheckRange("a fill writes", dst, offset, size == VK_WHOLE_SIZE ? 0 : size);
+    }
 
     if (IsBufferAccessed(dst, offset, size, true)) {
         FlushBarriers();
@@ -179,6 +307,9 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
 
 void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
     scheduler.EndRendering();
+    if (MemCheckEnabled()) { // g2-arm64 diagnosis
+        MemCheckRange("an inline write", dst, offset, sizeof(value));
+    }
 
     if (IsBufferAccessed(dst, offset, sizeof(value), true)) {
         FlushBarriers();
@@ -238,6 +369,10 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     for (const auto& copy : upload_copies) {
         const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
         needs_flush |= IsBufferAccessed(src, copy.bufferOffset, copy_size);
+        if (MemCheckEnabled()) { // g2-arm64 diagnosis
+            MemCheckRange("an image upload reads", src, copy.bufferOffset,
+                          MemCheckCopyExtent(copy, dst->info.pixel_format));
+        }
     }
     if (needs_flush) {
         FlushBarriers();
@@ -270,6 +405,10 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     for (const auto& copy : download_copies) {
         const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
         needs_flush |= IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
+        if (MemCheckEnabled()) { // g2-arm64 diagnosis
+            MemCheckRange("an image download writes", dst, copy.bufferOffset,
+                          MemCheckCopyExtent(copy, src->info.pixel_format));
+        }
     }
     if (needs_flush) {
         FlushBarriers();

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "common/types.h"
@@ -83,6 +84,12 @@ private:
 
     std::array<Ring, NUM_TYPES> rings;
     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed
+    /// g2-arm64: large_caches is reached from two threads: the front thread requests and trims
+    /// (RequestLarge, TickFrame), the scheduler's priority-ops thread releases a deferred tiny
+    /// readback (FreeDeferred), and emplace_back and erase move the vectors. Every access holds
+    /// this lock, and so does frame's increment (FreeDeferred reads it); the buffers are made and
+    /// freed outside it.
+    mutable std::mutex large_mutex;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
 };

@@ -1220,16 +1220,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
-    static const bool bit_scan = std::getenv("BB_REGS_BITSCAN") != nullptr; // A/B: as before
-    if (bit_scan) {
-        for (u32 block = 0; block < dirty.blocks.size(); ++block) {
-            if (dirty.blocks.test(block)) {
-                blocks[num_blocks++] = static_cast<u16>(block);
-            }
-        }
-    } else {
-        dirty.blocks.ForEach([&](u32 block) { blocks[num_blocks++] = static_cast<u16>(block); });
-    }
+    dirty.ForEachBlock([&](u32 block) { blocks[num_blocks++] = static_cast<u16>(block); });
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
     // Constants: copied here into the ring, the recording thread only binds them.
@@ -1770,6 +1761,7 @@ bool Rasterizer::FilterDrawPasses() const {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    MaybeSubmitEarly();
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
@@ -1974,6 +1966,12 @@ const char* LiveShaderDebugFile() {
 LiveShaderDebug& LiveDebug() {
     static LiveShaderDebug state;
     const char* path = LiveShaderDebugFile();
+    // Called for every draw (SkipShader): the clock is read once every 256 calls of a thread
+    // (U1 chapter 2: QueryPerformanceCounter per draw was 1.6% of the draw recording thread).
+    static thread_local u32 calls = 0;
+    if (!path || (++calls & 255) != 1) {
+        return state;
+    }
     const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
     if (!path || now < state.next_read_ns.load(std::memory_order_relaxed) ||
         !state.read_mutex.try_lock()) {
@@ -2723,6 +2721,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    MaybeSubmitEarly();
     // bbport: like direct draws, handed to the recording thread after the pipeline selection
     // (else the GPU thread waited here for a whole frame of queued draws).
     const bool pipelined = UseDrawPipe() && FilterDrawPasses() &&
@@ -3403,8 +3402,92 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     SyncCheckpoint(scheduler);
 }
 
+namespace {
+/// g2-arm64: an early submit's part, run on the recording thread (BB_EARLY_SUBMIT_PIPE).
+void RunEarlySubmit(Rasterizer& rasterizer, const u8*) {
+    rasterizer.Flush();
+}
+} // namespace
+
+void Rasterizer::MaybeSubmitEarly() {
+    // bbport (from the Bloodborne port, 5571243 and 453c6c5): the GPU thread submitted a frame's
+    // work once, at its end, so the GPU began only after the whole frame was recorded, and the
+    // read backs of Uncharted 2's fixes waited for all of it. Now what is recorded goes at least
+    // every millisecond and 48 draws. Off on AMD, where it was slower in Bloodborne (RX 9070 XT:
+    // 106 -> 90 FPS); BB_EARLY_SUBMIT=force turns it on there too, 0 off everywhere. On by
+    // default: U3 Cartagena square (RTX 5080) 94.7 -> 102.4 FPS median, slowest 5 s 59.7 -> 94.3;
+    // U2 on an RTX 4070 Laptop 56.3 -> 67.9 (mato215).
+    static const bool enabled = [this] {
+        const char* env = std::getenv("BB_EARLY_SUBMIT");
+        const bool force = env && std::strcmp(env, "force") == 0;
+        if (env && env[0] == '0') {
+            std::printf("Early submit: off (BB_EARLY_SUBMIT=0)\n");
+            return false;
+        }
+#ifdef __ANDROID__
+        // g2-arm64: off by default on Android (BB_EARLY_SUBMIT=1 or force: on). A Flush from the
+        // command thread drains the draw pipe first, so each part makes the command thread wait
+        // for the recording thread; here the mid-frame flush (BB_MIDFRAME_FLUSH, the launcher's
+        // 10) already sends the frame in parts, in order on the recording thread.
+        if (!env || (env[0] != '1' && !force)) {
+            std::printf("Early submit: off on Android (the mid-frame flush sends the frame in "
+                        "parts; BB_EARLY_SUBMIT=1 turns it on)\n");
+            return false;
+        }
+#endif
+        if (instance.GetVendorID() == 0x1002 && !force) {
+            std::printf("Early submit: off on AMD (slower there; BB_EARLY_SUBMIT=force turns it on)\n");
+            return false;
+        }
+        std::printf("Early submit: on\n");
+        return true;
+    }();
+    if (!enabled) {
+        return;
+    }
+    // g2-arm64: BB_EARLY_SUBMIT_PIPE=1: the part goes to the recording thread in order with the
+    // draws (RunInOrder, as the mid-frame flush does) instead of this thread draining the draw
+    // pipe and submitting it here; the command thread goes on decoding meanwhile.
+    static const bool through_pipe = [] {
+        const char* env = std::getenv("BB_EARLY_SUBMIT_PIPE");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::printf("Early submit: through the draw pipe (BB_EARLY_SUBMIT_PIPE=1)\n");
+        }
+        return on;
+    }();
+    // At least a millisecond of recording and a few draws per part: each submission waits for
+    // the recording thread, so many small ones would cost more than the GPU gains.
+    constexpr u32 MinDraws = 48;
+    constexpr auto MinTime = std::chrono::microseconds(1000);
+    // g2-arm64: only this thread counts; a reset from the recording thread lost between the
+    // load and the store only moves a part.
+    const u32 draws = draws_since_submit.load(std::memory_order_relaxed) + 1;
+    draws_since_submit.store(draws, std::memory_order_relaxed);
+    if (draws < MinDraws) {
+        return;
+    }
+    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (now - last_submit.load(std::memory_order_relaxed) <
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(MinTime).count()) {
+        return;
+    }
+    if (through_pipe) {
+        // The recording thread's Flush() resets the counters again when it runs the part.
+        draws_since_submit.store(0, std::memory_order_relaxed);
+        last_submit.store(now, std::memory_order_relaxed);
+        const u8 unused = 0;
+        RunInOrder(&RunEarlySubmit, &unused, sizeof(unused));
+        return;
+    }
+    Flush();
+}
+
 u64 Rasterizer::Flush() {
     BbSubmitStats::Steps steps{"rasterizer flush"}; // g2-arm64 diagnosis: BB_SUBMIT_STATS
+    draws_since_submit.store(0, std::memory_order_relaxed);
+    last_submit.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                      std::memory_order_relaxed);
     DrainDrawPipe();
     steps.Step("drain");
     const u64 current_tick = scheduler.CurrentTick();
@@ -3931,7 +4014,16 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    // bbport (UntrackedStreamReads): the stream buffer is written by the host only, at a new
+    // offset every time, and never by the GPU; its reads need no barrier tracking (U1 chapter 2:
+    // the read inserts were ~7% of the draw recording thread).
+    const VideoCore::Buffer* stream =
+        BbToggle::Disabled(BbToggle::UntrackedStreamReads) ? nullptr
+                                                           : &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        if (buffer == stream && !is_written) {
+            continue;
+        }
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
@@ -4263,6 +4355,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 std::memset(data, 0, lds_size);
                 lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                if (MemCheckEnabled()) { // g2-arm64 diagnosis
+                    MemCheckRange("a shared memory binding", &lds_buffer, offset, lds_size);
+                }
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
@@ -4315,6 +4410,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                if (MemCheckEnabled()) { // g2-arm64 diagnosis
+                    MemCheckRange(desc.is_written ? "a written buffer binding" : "a buffer binding",
+                                  buffer, offset_aligned, size + adjust);
+                }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 if (g_gpu_checkpoints && num_checkpoint_buffers < std::size(checkpoint_buffers)) {
                     checkpoint_buffers[num_checkpoint_buffers++] = {
@@ -4324,7 +4423,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                // The stream buffer holds no GPU writes (UntrackedStreamReads, ResetBindings).
+                if (desc.is_written || BbToggle::Disabled(BbToggle::UntrackedStreamReads) ||
+                    buffer != &buffer_cache.GetStreamBuffer()) {
+                    needs_barrier |=
+                        runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
                 if (const VAddr watch = WatchedGpuWrite();
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {
@@ -4614,10 +4718,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        // Same as image_desc.NumBindings(stage), without fetching the T# again.
+        // Same as image_desc.NumBindings(stage), without fetching the T# again. Levels reversed (a
+        // broken T#): 1, not the ~4e9 the unsigned difference gives (BilalReloaded's port 0.8.3, via
+        // El Dorado 778cc70c; like layout_count above).
         const u32 num_bindings =
             mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
-                ? static_cast<u32>(tsharp.last_level - tsharp.base_level + 1)
+                ? Shader::ImageResource::MipBindingCount(tsharp)
                 : 1u;
         const bool proxy_candidate = sample_proxies && num_bindings == 1 &&
                                      !image_desc.needs_native && !image_desc.is_written &&

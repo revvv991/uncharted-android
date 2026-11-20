@@ -54,6 +54,9 @@ constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
 void (*g_gpu_stall_report)() = nullptr;
 // bbport: more context for a GPU crash (the buffer cache's address ranges).
 void (*g_gpu_crash_context)() = nullptr;
+// g2-arm64 diagnosis (BB_BDA_AUDIT=1): one scan of the buffer cache's BDA page table, printed in a
+// stall report and in a crash report (buffer_cache.cpp, BdaAudit).
+void (*g_gpu_stall_audit)(const char* reason) = nullptr;
 // bbport: the draws and dispatches the GPU last reached (BB_GPU_CHECKPOINTS=1).
 void (*g_gpu_checkpoint_report)() = nullptr;
 extern bool g_device_fault_ext;
@@ -117,6 +120,9 @@ namespace Vulkan {
     }
     if (g_gpu_crash_context) {
         g_gpu_crash_context();
+    }
+    if (g_gpu_stall_audit) {
+        g_gpu_stall_audit("device lost");
     }
     if (g_gpu_stall_report) {
         g_gpu_stall_report();
@@ -199,6 +205,9 @@ void Semaphore::Wait(u64 tick) {
                         static_cast<unsigned long long>(tick),
                         reinterpret_cast<void*>(static_cast<VkSemaphore>(Handle())));
             g_gpu_stall_report();
+            if (g_gpu_stall_audit) {
+                g_gpu_stall_audit("GPU stall");
+            }
         }
         reported = true;
     }

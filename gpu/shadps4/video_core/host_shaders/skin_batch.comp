@@ -30,6 +30,7 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_ballot : require // g2-arm64 (BB_SKIN_GUARD)
 
 // As the translated shader: 32-bit denormals flushed, signed zeros, infinities and NaNs kept.
 spirv_execution_mode(capabilities = [4465], 4460, 32); // DenormFlushToZero
@@ -59,10 +60,27 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Gro
     uint job_of_group[];
 };
 
+// g2-arm64 (BB_SKIN_GUARD=1; the GPU page-fault storms of 2026-11-18 read at garbage addresses
+// that look like half-float vertex data): a workgroup whose job index or buffer address is not
+// one the CPU can have written skips its job, and the first such job is noted here for the log.
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer GuardReport {
+    uint count;       // workgroups that skipped their job
+    uint batch;       // the first one's batch (push.batch)
+    uint job;         // its job index
+    uint slot;        // its buffer whose address was outside; 12: the index itself
+    uint64_t address; // that address (the index for slot 12)
+};
+
 layout(push_constant) uniform Push {
     JobTable job_table;
     GroupTable group_table;
     uint num_groups;
+    uint num_jobs;   // g2-arm64 (BB_SKIN_GUARD): the jobs in the table
+    uint64_t low;    // the device addresses the port handed out: [low, high)
+    uint64_t high;
+    uint64_t report; // the GuardReport, 0: no guard
+    uint batch;      // the batch's number, for the report
+    uint check;      // g2-arm64 (BB_SKIN_GUARD): the CPU's checksum of the above
 } push;
 
 uint Load(uint64_t base, uint size, uint dword) {
@@ -91,12 +109,155 @@ shared uint rows_out[64 * 10];
 shared uint rows_out[64 * 7];
 #endif
 
+// g2-arm64 (BB_SKIN_GUARD): the guard's report buffer, fixed when the pipeline is made, so a
+// dispatch whose constants arrive garbage still reports to the right place.
+layout(constant_id = 0) const uint REPORT_LO = 0u;
+layout(constant_id = 1) const uint REPORT_HI = 0u;
+// g2-arm64 (BB_SKIN_GUARD=2): the job's buffer addresses checked too (BuffersSane).
+layout(constant_id = 2) const uint GUARD_BUFFERS = 0u;
+
+uint64_t ReportAddress() {
+    return (uint64_t(REPORT_HI) << 32) | uint64_t(REPORT_LO);
+}
+
+// g2-arm64 (BB_SKIN_GUARD): what the first workgroup whose constants failed their checksum saw,
+// 64 bytes into the report buffer: all 14 words, so the log can tell which of them changed.
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer PushReport {
+    uint count;          // workgroups that found their dispatch's constants changed
+    uint check_computed; // the first one's checksum of what it saw
+    uint words[14];      // what it saw, in the Push block's order (SkinPush on the CPU)
+};
+
+uint MixWord(uint h, uint w) {
+    return (h ^ w) * 0x01000193u;
+}
+
+// FNV-1a over the 32-bit words of the constants before `check` (SkinPushChecksum on the CPU).
+uint PushChecksum() {
+    const uint64_t jt = uint64_t(push.job_table);
+    const uint64_t gt = uint64_t(push.group_table);
+    uint h = 0x811C9DC5u;
+    h = MixWord(h, uint(jt));
+    h = MixWord(h, uint(jt >> 32));
+    h = MixWord(h, uint(gt));
+    h = MixWord(h, uint(gt >> 32));
+    h = MixWord(h, push.num_groups);
+    h = MixWord(h, push.num_jobs);
+    h = MixWord(h, uint(push.low));
+    h = MixWord(h, uint(push.low >> 32));
+    h = MixWord(h, uint(push.high));
+    h = MixWord(h, uint(push.high >> 32));
+    h = MixWord(h, uint(push.report));
+    h = MixWord(h, uint(push.report >> 32));
+    h = MixWord(h, push.batch);
+    return h;
+}
+
+// g2-arm64 (BB_SKIN_GUARD): false, and noted, when the constants are not the ones the CPU pushed
+// (checked before anything is read through them).
+bool PushSane() {
+    if (ReportAddress() == 0ul) {
+        return true;
+    }
+    const uint computed = PushChecksum();
+    if (computed == push.check) {
+        return true;
+    }
+    if (gl_LocalInvocationID.x == 0u) {
+        PushReport report = PushReport(ReportAddress() + 64ul);
+        if (atomicAdd(report.count, 1u) == 0u) {
+            const uint64_t jt = uint64_t(push.job_table);
+            const uint64_t gt = uint64_t(push.group_table);
+            report.check_computed = computed;
+            report.words[0] = uint(jt);
+            report.words[1] = uint(jt >> 32);
+            report.words[2] = uint(gt);
+            report.words[3] = uint(gt >> 32);
+            report.words[4] = push.num_groups;
+            report.words[5] = push.num_jobs;
+            report.words[6] = uint(push.low);
+            report.words[7] = uint(push.low >> 32);
+            report.words[8] = uint(push.high);
+            report.words[9] = uint(push.high >> 32);
+            report.words[10] = uint(push.report);
+            report.words[11] = uint(push.report >> 32);
+            report.words[12] = push.batch;
+            report.words[13] = push.check;
+        }
+    }
+    return false;
+}
+
+// g2-arm64 (BB_SKIN_GUARD): notes a workgroup that skips its job, the first one in full: slot is
+// its buffer whose address was outside, 12 the job index itself. Rare, so it reads the address
+// to report again.
+void NoteJob(uint job_index, uint slot) {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    GuardReport report = GuardReport(ReportAddress());
+    if (atomicAdd(report.count, 1u) == 0u) {
+        report.batch = push.batch;
+        report.job = job_index;
+        report.slot = slot;
+        report.address =
+            slot < 12u ? push.job_table.jobs[job_index].address[slot] : uint64_t(job_index);
+    }
+}
+
+// g2-arm64 (BB_SKIN_GUARD): false, with the job noted, when the job index is not one of the
+// table's (checked before the job is read; uniform in a workgroup: one job each).
+bool IndexSane(uint job_index) {
+    if (ReportAddress() == 0ul || job_index < push.num_jobs) {
+        return true;
+    }
+    NoteJob(job_index, 12u);
+    return false;
+}
+
+// g2-arm64 (BB_SKIN_GUARD): whether a buffer of the job is null or inside the device addresses
+// handed out, its bound included ([low, high)).
+bool InSpan(uint64_t a, uint s) {
+    const uint64_t d = a - push.low; // below low it wraps past the span
+    const uint64_t span = push.high - push.low;
+    return a == 0ul || (d < span && uint64_t(s) <= span - d);
+}
+
+// g2-arm64 (BB_SKIN_GUARD): false, with the job noted, when one of the job's n buffers is outside
+// the device addresses handed out. The lanes share the work: lane i loads and checks buffer i mod
+// n (every subgroup of n lanes or more sees them all and reaches the same verdict), and a ballot
+// gathers it. Port 0202 read all 12 slots again in every lane, in a loop that stopped at the
+// first bad one: a dozen dependent loads ahead of the job's own, 0.6-0.7 FPS in U1 and U2
+// (2026-11-20). ir3's statistics for the A735, the common path of U1's shader: 0202 about 540
+// instructions a wave and the loads, the buffers checked in every lane 266, this 63. Even so it
+// cost about 0.4 FPS in U1 and never fired outside its test (BB_SKIN_JOB_TEST), so it runs only with
+// BB_SKIN_GUARD=2; the default keeps the checksum and the index check (memc-u1-1's catch).
+bool BuffersSane(uint job_index, uint n) {
+    if (ReportAddress() == 0ul || GUARD_BUFFERS == 0u) {
+        return true;
+    }
+    const uint slot = gl_SubgroupInvocationID % n;
+    const uvec4 bad = subgroupBallot(!InSpan(push.job_table.jobs[job_index].address[slot],
+                                             push.job_table.jobs[job_index].size[slot]));
+    if (bad == uvec4(0u)) {
+        return true;
+    }
+    NoteJob(job_index, subgroupBallotFindLSB(bad) % n);
+    return false;
+}
+
 void main() {
+    if (!PushSane()) {
+        return;
+    }
     const uint group = gl_WorkGroupID.x;
     if (group >= push.num_groups) {
         return;
     }
     const uint job_index = push.group_table.job_of_group[group];
+    if (!IndexSane(job_index)) {
+        return;
+    }
     const Job job = push.job_table.jobs[job_index];
     const uint local = gl_LocalInvocationID.x;
     const uint vertex = (group - job.first_group) * 64u + local;
@@ -106,6 +267,10 @@ void main() {
     const uint s0 = job.size[0], s1 = job.size[1], s2 = job.size[2], s3 = job.size[3];
     const uint s4 = job.size[4], s5 = job.size[5], s6 = job.size[6], s7 = job.size[7];
     const uint s8 = job.size[8];
+    // g2-arm64 (BB_SKIN_GUARD): the buffers this shader uses, 0..8.
+    if (!BuffersSane(job_index, 9u)) {
+        return;
+    }
     // g2-arm64: when the three output V#s interleave (the normal at +12, the tangent at +20, the
     // same size: stride times records, as in U1 and U2), a vertex's outputs are 7 consecutive
     // dwords of buffer 6, and the workgroup stores its vertices through shared memory as whole

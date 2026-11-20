@@ -1191,6 +1191,12 @@ public class Launcher extends Activity {
             // 30.1/29.9/30.0, a thermal fourth pair - within 0.1 FPS. More environment overrides.
             if (u3 && !envNames("BB_COPY64_EOP_READBACK"))
                 env[i] += "BB_COPY64_EOP_READBACK=1\n";
+            // Upstream 0.3.15's early submit (the command thread sends the frame's work on every 48
+            // draws and 1 ms), off on Android since the merge: on the G2 (the limit off, 4 pairs of
+            // 90 s) +1.0 FPS in U3's roofs, all four pairs, and -0.2 in U1 and in U2 (findings
+            // 2026-11-18), so U3 only. More environment overrides.
+            if (u3 && !envNames("BB_EARLY_SUBMIT"))
+                env[i] += "BB_EARLY_SUBMIT=1\n";
         }
         StringBuilder e = new StringBuilder();
         e.append("# Written by the launcher on every start; edit the settings there.\n");

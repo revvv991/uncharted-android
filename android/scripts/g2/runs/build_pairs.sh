@@ -55,7 +55,9 @@ one() {         # one <run tag>: a run, its line and notes; 1 when it was skippe
     first_wait=900
     [ -n "$waited" ] && say "$run: $waited"
     out=$(bash "$RUNS/continue_run.sh" "$run" "$game" "$secs" $extra 2>&1 < /dev/null)
-    printf '%s\n' "$out" | grep -a -E "^$run |DIFFERS|WRONG" | cut -c1-360 | tee -a "$LOG"
+    # the 5 s samples are in the runs' summary; without them the counts at the end fit the line
+    printf '%s\n' "$out" | grep -a -E "^$run |DIFFERS|WRONG" | sed -E 's/\): [0-9. ]+\|/): ... |/' \
+        | cut -c1-480 | tee -a "$LOG"
     if printf '%s\n' "$out" | grep -q -E '^RUN-DONE'; then
         skips=0
         L=$RUNDIR/$run.log
