@@ -149,7 +149,7 @@ static int64_t *map_slot(Ctx *c, Map *m, const char *key, int insert) {
     }
 }
 
-/* ---- SELF -> ELF (prepare.py parse_self) ---- */
+/* ---- SELF or plain ELF -> ELF (prepare.py parse_self) ---- */
 typedef struct { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz, memsz, align; } Phdr;
 
 typedef struct { const char *name; unsigned version; } Ident; /* a library or module */
@@ -177,12 +177,9 @@ typedef struct {
     size_t nidents;
 } Module;
 
-static void parse_self(Ctx *c, const Buf *src, Module *m) {
-    const uint8_t *d = src->data;
-    uint64_t n = src->size;
-    if (memcmp(span(c, d, n, 0, 4), "O\x15=\x1d", 4)) fail(c, "expected PS4 SELF");
-    unsigned count = rd16(span(c, d, n, 24, 2));
-    uint64_t base = 32 + (uint64_t)count * 32;
+/* prepare.py parse_elf_headers: the ELF header and program headers at base, and the image (the
+ * headers copied, the rest zero until the segments are copied in). Returns the headers' end. */
+static uint64_t elf_image(Ctx *c, const uint8_t *d, uint64_t n, uint64_t base, Module *m) {
     const uint8_t *h = span(c, d, n, base, 64);
     if (memcmp(h, "\x7f" "ELF\x02\x01\x01", 7) || rd16(h + 18) != 62) fail(c, "expected little-endian x86-64 ELF");
     m->entry = rd64(h + 24);
@@ -196,6 +193,8 @@ static void parse_self(Ctx *c, const Buf *src, Module *m) {
         Phdr *q = &m->ph[i];
         q->type = rd32(p); q->flags = rd32(p + 4); q->offset = rd64(p + 8); q->vaddr = rd64(p + 16);
         q->paddr = rd64(p + 24); q->filesz = rd64(p + 32); q->memsz = rd64(p + 40); q->align = rd64(p + 48);
+        /* g2-arm64: a wrapped offset + size is past any limit (Python's integers do not wrap). */
+        if (q->filesz > UINT64_MAX - q->offset) fail(c, "probe image exceeds 512 MiB limit");
         if (q->offset + q->filesz > end) end = q->offset + q->filesz;
     }
     if (end > MAX_IMAGE) fail(c, "probe image exceeds 512 MiB limit");
@@ -203,6 +202,40 @@ static void parse_self(Ctx *c, const Buf *src, Module *m) {
     m->elf.size = end > header_end ? end : header_end;
     m->elf.data = zalloc(c, (size_t)m->elf.size);
     memcpy(m->elf.data, span(c, d, n, base, header_end), (size_t)header_end);
+    return header_end;
+}
+
+static int required_segment(uint32_t type) {
+    return type == 1 || type == 2 || type == 0x61000000 || type == 0x61000010;
+}
+
+/* g2-arm64 (issue #40): an executable or module that is already a decrypted ELF64, as Itemzflow
+ * dumps them - prepare.py parse_plain_elf (upstream 988e388): each segment from its own offset. */
+static void parse_plain_elf(Ctx *c, const Buf *src, Module *m) {
+    elf_image(c, src->data, src->size, 0, m);
+    for (int i = 0; i < m->nph; ++i) {
+        const Phdr *p = &m->ph[i];
+        if (!p->filesz) continue;
+        if (p->offset > src->size || p->filesz > src->size - p->offset) {
+            if (required_segment(p->type)) fail(c, "required segment %d is unavailable", i);
+            continue;
+        }
+        memcpy(m->elf.data + p->offset, src->data + p->offset, (size_t)p->filesz);
+    }
+}
+
+static void parse_self(Ctx *c, const Buf *src, Module *m) {
+    const uint8_t *d = src->data;
+    uint64_t n = src->size;
+    if (!memcmp(span(c, d, n, 0, 4), "\x7f" "ELF", 4)) {
+        parse_plain_elf(c, src, m);
+        return;
+    }
+    if (memcmp(span(c, d, n, 0, 4), "O\x15=\x1d", 4)) fail(c, "expected PS4 SELF or ELF64");
+    unsigned count = rd16(span(c, d, n, 24, 2));
+    uint64_t base = 32 + (uint64_t)count * 32;
+    uint64_t header_end = elf_image(c, d, n, base, m);
+    unsigned phnum = (unsigned)m->nph;
     uint64_t (*covered)[2] = zalloc(c, (count + 1) * sizeof(*covered));
     size_t ncovered = 0;
     covered[ncovered][0] = 0; covered[ncovered++][1] = header_end;
@@ -224,8 +257,7 @@ static void parse_self(Ctx *c, const Buf *src, Module *m) {
         int inside = 0;
         for (size_t k = 0; k < ncovered && !inside; ++k)
             inside = covered[k][0] <= p->offset && p->offset + p->filesz <= covered[k][1];
-        if (!inside && (p->type == 1 || p->type == 2 || p->type == 0x61000000 || p->type == 0x61000010))
-            fail(c, "required segment %d is unavailable", i);
+        if (!inside && required_segment(p->type)) fail(c, "required segment %d is unavailable", i);
     }
 }
 

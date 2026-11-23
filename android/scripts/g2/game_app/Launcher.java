@@ -739,21 +739,31 @@ public class Launcher extends Activity {
 
     private void setFolder(String path) {
         while (path.length() > 1 && path.endsWith("/")) path = path.substring(0, path.length() - 1);
-        // The update folder picked (CUSAxxxxx-UPDATE, issue #10): the game is the folder next to it.
+        // The update folder picked (CUSAxxxxx-UPDATE, issue #10, or Itemzflow's CUSAxxxxx-patch,
+        // issue #40): the game is the folder next to it.
         File f = new File(path);
-        if (f.getName().toUpperCase(Locale.ROOT).endsWith("-UPDATE") && f.getParentFile() != null) {
-            File game = new File(f.getParentFile(), f.getName().substring(0, f.getName().length() - "-UPDATE".length()));
-            if (game.isDirectory()) path = game.getAbsolutePath();
+        for (String suffix : UPDATE_SUFFIXES) {
+            if (f.getName().toUpperCase(Locale.ROOT).endsWith(suffix.toUpperCase(Locale.ROOT)) && f.getParentFile() != null) {
+                File game = new File(f.getParentFile(), f.getName().substring(0, f.getName().length() - suffix.length()));
+                if (game.isDirectory()) { path = game.getAbsolutePath(); break; }
+            }
         }
         prefs.edit().putString("game_dir", path).apply();
     }
 
-    /** The game's update as a folder of its own: <game folder>-UPDATE next to it (the layout PS4
-     *  emulators use; issue #10), or null. Its files take precedence over the game's. */
+    /** The update folder's name after the game folder's: -UPDATE (the layout PS4 emulators use;
+     *  issue #10), -patch (Itemzflow's dumps of the update; issue #40). */
+    private static final String[] UPDATE_SUFFIXES = {"-UPDATE", "-patch"};
+
+    /** The game's update as a folder of its own: <game folder>-UPDATE or -patch next to it, or
+     *  null. Its files take precedence over the game's. */
     private static File updateFolder(String dir) {
         if (dir.isEmpty()) return null;
-        File f = new File(dir + "-UPDATE");
-        return f.isDirectory() ? f : null;
+        for (String suffix : UPDATE_SUFFIXES) {
+            File f = new File(dir + suffix);
+            if (f.isDirectory()) return f;
+        }
+        return null;
     }
 
     /** The folders prepareGame and sfoValue read: the update folder first, when there is one. */
@@ -880,7 +890,8 @@ public class Launcher extends Activity {
                       + " not version 1.02 of the executable, the one this port is made for: 1920x1080 only,"
                       + " and the port's fixes for the games are off there (a low frame rate and stalls are"
                       + " likely). The game's update 1.02 goes next to the game folder as \""
-                      + new File(dir).getName() + "-UPDATE\"; then choose the folder again and press Prepare."
+                      + new File(dir).getName() + "-UPDATE\" (or \"" + new File(dir).getName() + "-patch\","
+                      + " as Itemzflow names it); then choose the folder again and press Prepare."
                       + (fit.isEmpty() ? "" : " " + String.join(", ", fit) + ": 1.02, as needed.");
             otherVersion = !not.isEmpty();
         }
