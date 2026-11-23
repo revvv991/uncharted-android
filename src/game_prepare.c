@@ -845,7 +845,22 @@ static void content_profile(Ctx *c, const char *game_dir, const char *out_dir) {
         snprintf(key, sizeof(key), "USER_DEFINED_PARAM_%d", i);
         SfoValue v = sfo_lookup(c, &b, key);
         if (v.found && !v.number) fail(c, "invalid user-defined parameter");
-        put32(c, &o, v.found ? v.value : 0);
+        uint32_t value = v.found ? v.value : 0;
+        if (i == 1 && !v.found) {
+            /* g2-arm64: upstream 750bb93 (content_profile.py only until now). The collection's
+             * param.sfo has no USER_DEFINED_PARAM_1, and each game makes its title ID string
+             * "CUSA%05d" from sceAppContentAppParamGetInt(1); with 0 it took a placeholder
+             * (CUSA09999). The digits of TITLE_ID give the console's answer (CUSA02344 -> 2344). */
+            SfoValue title = sfo_lookup(c, &b, "TITLE_ID");
+            uint64_t number = 0;
+            for (const char *p = title.found ? title.text : ""; *p; ++p) {
+                if (*p < '0' || *p > '9') continue;
+                number = number * 10 + (uint64_t)(*p - '0');
+                if (number > 0xffffffffu) fail(c, "invalid user-defined parameter");
+            }
+            value = (uint32_t)number;
+        }
+        put32(c, &o, value);
     }
     write_file(c, out_dir, "content.bin", o.data, o.size);
 }

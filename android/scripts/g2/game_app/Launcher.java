@@ -198,6 +198,8 @@ public class Launcher extends Activity {
         }
         if (intent.getBooleanExtra("controller_setup", false)) ControllerSetup.show(this);
         if (intent.getBooleanExtra("prepare", false)) prepare(intent.getBooleanExtra("play", false));
+        // g2-arm64: after an update that changed the preparation's files, then the play asked for.
+        else if (preparedByOlderApp()) prepare(intent.getBooleanExtra("play", false));
         else if (intent.getBooleanExtra("play", false) && prepared()) play();
     }
 
@@ -835,8 +837,14 @@ public class Launcher extends Activity {
         return null;
     }
 
-    /** The stamp of a preparation: the folder, the update folder next to it if any, and the
-     *  executables' sizes and times (adding or removing the update folder means preparing again). */
+    /** The version of what the preparation writes (libbbprepare's boot-linked.bin and content.bin),
+     *  raised whenever those files change for the same game: 1 until 0.3.7 (no line), 2 since
+     *  content.bin's parameter 1 is the title number (port 0209). */
+    private static final String PREPARE_FORMAT = "format 2";
+
+    /** The stamp of a preparation: the folder, the update folder next to it if any, the
+     *  executables' sizes and times (adding or removing the update folder means preparing again)
+     *  and the format. */
     private String stamp(String dir) {
         StringBuilder b = new StringBuilder(dir).append('\n');
         File update = updateFolder(dir);
@@ -845,17 +853,34 @@ public class Launcher extends Activity {
             File f = gameFile(dir, g[1]);
             b.append(g[1]).append(' ').append(f.length()).append(' ').append(f.lastModified()).append('\n');
         }
-        return b.toString();
+        return b.append(PREPARE_FORMAT).append('\n').toString();
     }
 
-    private boolean prepared() {
-        String dir = folder();
-        if (dir.isEmpty()) return false;
+    private static String withoutFormat(String stamp) {
+        return stamp == null ? null : stamp.replaceAll("(?m)^format .*\n", "");
+    }
+
+    private boolean preparedFiles() {
         for (String[] g : GAMES) {
             File out = g[2].isEmpty() ? files : new File(files, g[2]);
             if (!new File(out, "boot-linked.bin").isFile() || !new File(out, "content.bin").isFile()) return false;
         }
+        return true;
+    }
+
+    private boolean prepared() {
+        String dir = folder();
+        if (dir.isEmpty() || !preparedFiles()) return false;
         return stamp(dir).equals(readText(new File(files, "prepared.txt")));
+    }
+
+    /** The same folder prepared by an older version of the app (another PREPARE_FORMAT): the
+     *  update prepares it again by itself, so its fixes reach the files without a tap. */
+    private boolean preparedByOlderApp() {
+        String dir = folder();
+        if (dir.isEmpty() || !preparedFiles() || problems(dir) != null) return false;
+        String now = stamp(dir), was = readText(new File(files, "prepared.txt"));
+        return was != null && !now.equals(was) && withoutFormat(now).equals(withoutFormat(was));
     }
 
     private void refresh() {
